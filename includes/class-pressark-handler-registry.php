@@ -56,8 +56,8 @@ class PressArk_Handler_Registry {
 			throw new \UnexpectedValueException(
 				sprintf(
 					'Handler "%s" does not implement callable method "%s".',
-					$operation->handler,
-					$method
+					esc_html( (string) $operation->handler ),
+					esc_html( $method )
 				)
 			);
 		}
@@ -77,7 +77,7 @@ class PressArk_Handler_Registry {
 		$class = self::HANDLER_CLASSES[ $key ] ?? '';
 
 		if ( '' === $class ) {
-			throw new \InvalidArgumentException( sprintf( 'Unknown handler key: %s', $key ) );
+			throw new \InvalidArgumentException( sprintf( 'Unknown handler key: %s', esc_html( $key ) ) );
 		}
 
 		$handler = new $class( $this->logger );

@@ -52,7 +52,7 @@ class PressArk_Admin_Automations {
 		// Verify nonce for all actions.
 		$nonce = sanitize_text_field( wp_unslash( $_POST['_wpnonce'] ?? '' ) );
 		if ( ! wp_verify_nonce( $nonce, 'pressark_automation_' . $action ) ) {
-			wp_die( __( 'Security check failed.', 'pressark' ) );
+			wp_die( esc_html__( 'Security check failed.', 'pressark' ) );
 		}
 
 		$store   = new PressArk_Automation_Store();
@@ -464,9 +464,9 @@ class PressArk_Admin_Automations {
 						</span>
 						<?php if ( $a['failure_streak'] > 0 ) : ?>
 							<br><small style="color:#dc2626;"><?php printf(
-								/* translators: %d: number of consecutive automation failures. */
-								esc_html__( '%d failures', 'pressark' ),
-								$a['failure_streak']
+								/* translators: %s: number of consecutive automation failures. */
+								esc_html__( '%s failures', 'pressark' ),
+								esc_html( number_format_i18n( absint( $a['failure_streak'] ) ) )
 							); ?></small>
 						<?php endif; ?>
 					</td>

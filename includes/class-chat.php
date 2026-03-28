@@ -571,7 +571,7 @@ class PressArk_Chat {
 				'pressark_can_access_chat',
 				'4.2.0',
 				'pressark_can_use',
-				__( 'Use the pressark_can_use filter instead.', 'pressark' )
+				esc_html__( 'Use the pressark_can_use filter instead.', 'pressark' )
 			);
 			$can = (bool) apply_filters( 'pressark_can_access_chat', $can, '' );
 		}

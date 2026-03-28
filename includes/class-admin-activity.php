@@ -510,7 +510,7 @@ class PressArk_Admin_Activity {
 
 	private function detail_row_html( string $label, string $html ): void {
 		echo '<tr><th scope="row">' . esc_html( $label ) . '</th>'
-			. '<td>' . $html . '</td></tr>';
+			. '<td>' . wp_kses_post( $html ) . '</td></tr>';
 	}
 
 	private function render_status_filters( array $counts, string $active, string $view, bool $support_mode ): void {
@@ -520,12 +520,12 @@ class PressArk_Admin_Activity {
 		echo '<ul class="subsubsub" style="margin-top:8px;clear:both;">';
 		echo '<li><a href="' . esc_url( $base_url ) . '"'
 			. ( '' === $active ? ' class="current"' : '' ) . '>'
-			. esc_html__( 'All', 'pressark' ) . ' <span class="count">(' . number_format_i18n( $total ) . ')</span></a></li>';
+			. esc_html__( 'All', 'pressark' ) . ' <span class="count">(' . esc_html( number_format_i18n( $total ) ) . ')</span></a></li>';
 
 		foreach ( $counts as $status => $count ) {
 			echo ' | <li><a href="' . esc_url( add_query_arg( 'status', $status, $base_url ) ) . '"'
 				. ( $status === $active ? ' class="current"' : '' ) . '>'
-				. esc_html( $status ) . ' <span class="count">(' . number_format_i18n( $count ) . ')</span></a></li>';
+				. esc_html( $status ) . ' <span class="count">(' . esc_html( number_format_i18n( $count ) ) . ')</span></a></li>';
 		}
 
 		echo '</ul>';
@@ -543,7 +543,7 @@ class PressArk_Admin_Activity {
 			. sprintf(
 				/* translators: %s: total number of items. */
 				esc_html__( '%s items', 'pressark' ),
-				number_format_i18n( $total )
+				esc_html( number_format_i18n( $total ) )
 			)
 			. '</span>';
 

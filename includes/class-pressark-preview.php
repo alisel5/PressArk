@@ -903,7 +903,7 @@ class PressArk_Preview {
 					</div>";
 				}
 
-				echo "<div id='pressark-seo-overlay' style='
+				$overlay_html = "<div id='pressark-seo-overlay' style='
 					position:fixed; top:0; left:0; right:0; z-index:99998;
 					background:linear-gradient(135deg,#f0f4ff 0%,#e8f0fe 100%);
 					border-bottom:2px solid #4F8CFF;
@@ -917,6 +917,22 @@ class PressArk_Preview {
 					</div>
 					{$panels_html}
 				</div>";
+
+				echo wp_kses(
+					$overlay_html,
+					array(
+						'div'    => array(
+							'id'    => true,
+							'style' => true,
+						),
+						'span'   => array(
+							'style' => true,
+						),
+						'strong' => array(
+							'style' => true,
+						),
+					)
+				);
 			}, 1 );
 		}
 

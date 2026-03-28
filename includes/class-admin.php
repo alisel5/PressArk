@@ -971,8 +971,8 @@ class PressArk_Admin {
 			echo '<strong style="display:block;color:#0f172a;margin-bottom:6px;">' . esc_html( $pack['label'] ) . '</strong>';
 			echo '<p style="margin:0 0 12px;color:#64748b;">$' . esc_html( number_format( $pack['price_cents'] / 100, 0 ) ) . '</p>';
 			printf(
-				'<button type="button" class="button button-secondary pressark-buy-credits" data-pricing-id="%d" data-pack="%s">%s</button>',
-				$pricing_id,
+				'<button type="button" class="button button-secondary pressark-buy-credits" data-pricing-id="%s" data-pack="%s">%s</button>',
+				esc_attr( (string) $pricing_id ),
 				esc_attr( $pack_type ),
 				esc_html__( 'Buy Credits', 'pressark' )
 			);
@@ -1245,8 +1245,8 @@ class PressArk_Admin {
 	public function render_retention_log_field(): void {
 		$value = (int) get_option( 'pressark_retention_log_days', 90 );
 		printf(
-			'<input type="number" name="pressark_retention_log_days" value="%d" min="7" step="1" class="small-text" /> %s',
-			$value,
+			'<input type="number" name="pressark_retention_log_days" value="%s" min="7" step="1" class="small-text" /> %s',
+			esc_attr( (string) $value ),
 			esc_html__( 'days', 'pressark' )
 		);
 		echo '<p class="description">' . esc_html__( 'Action log entries older than this are deleted. Default: 90 days.', 'pressark' ) . '</p>';
@@ -1255,8 +1255,8 @@ class PressArk_Admin {
 	public function render_retention_chat_field(): void {
 		$value = (int) get_option( 'pressark_retention_chat_days', 180 );
 		printf(
-			'<input type="number" name="pressark_retention_chat_days" value="%d" min="7" step="1" class="small-text" /> %s',
-			$value,
+			'<input type="number" name="pressark_retention_chat_days" value="%s" min="7" step="1" class="small-text" /> %s',
+			esc_attr( (string) $value ),
 			esc_html__( 'days', 'pressark' )
 		);
 		echo '<p class="description">' . esc_html__( 'Chat conversations not updated within this period are deleted. Default: 180 days.', 'pressark' ) . '</p>';
@@ -1265,8 +1265,8 @@ class PressArk_Admin {
 	public function render_retention_ledger_field(): void {
 		$value = (int) get_option( 'pressark_retention_ledger_days', 365 );
 		printf(
-			'<input type="number" name="pressark_retention_ledger_days" value="%d" min="7" step="1" class="small-text" /> %s',
-			$value,
+			'<input type="number" name="pressark_retention_ledger_days" value="%s" min="7" step="1" class="small-text" /> %s',
+			esc_attr( (string) $value ),
 			esc_html__( 'days', 'pressark' )
 		);
 		echo '<p class="description">' . esc_html__( 'Credit usage records older than this are deleted. In-progress requests are never deleted. Default: 365 days.', 'pressark' ) . '</p>';
@@ -1275,8 +1275,8 @@ class PressArk_Admin {
 	public function render_retention_runs_field(): void {
 		$value = (int) get_option( 'pressark_retention_runs_days', 30 );
 		printf(
-			'<input type="number" name="pressark_retention_runs_days" value="%d" min="7" step="1" class="small-text" /> %s',
-			$value,
+			'<input type="number" name="pressark_retention_runs_days" value="%s" min="7" step="1" class="small-text" /> %s',
+			esc_attr( (string) $value ),
 			esc_html__( 'days', 'pressark' )
 		);
 		echo '<p class="description">' . esc_html__( 'Completed and failed execution runs older than this are deleted. Default: 30 days.', 'pressark' ) . '</p>';
@@ -1285,8 +1285,8 @@ class PressArk_Admin {
 	public function render_retention_tasks_field(): void {
 		$value = (int) get_option( 'pressark_retention_tasks_days', 30 );
 		printf(
-			'<input type="number" name="pressark_retention_tasks_days" value="%d" min="7" step="1" class="small-text" /> %s',
-			$value,
+			'<input type="number" name="pressark_retention_tasks_days" value="%s" min="7" step="1" class="small-text" /> %s',
+			esc_attr( (string) $value ),
 			esc_html__( 'days', 'pressark' )
 		);
 		echo '<p class="description">' . esc_html__( 'Completed and failed tasks older than this are deleted. Default: 30 days.', 'pressark' ) . '</p>';
@@ -1295,8 +1295,8 @@ class PressArk_Admin {
 	public function render_retention_automations_field(): void {
 		$value = (int) get_option( 'pressark_retention_automations_days', 90 );
 		printf(
-			'<input type="number" name="pressark_retention_automations_days" value="%d" min="7" step="1" class="small-text" /> %s',
-			$value,
+			'<input type="number" name="pressark_retention_automations_days" value="%s" min="7" step="1" class="small-text" /> %s',
+			esc_attr( (string) $value ),
 			esc_html__( 'days', 'pressark' )
 		);
 		echo '<p class="description">' . esc_html__( 'Archived one-shot automations older than this are deleted. Active, paused, and failed automations are retained. Default: 90 days.', 'pressark' ) . '</p>';
@@ -1340,10 +1340,10 @@ class PressArk_Admin {
 				<?php
 				printf(
 					/* translators: 1: credits used 2: billing-cycle credit budget 3: percentage */
-					esc_html__( '%1$s / %2$s credits used this billing cycle (%3$d%%)', 'pressark' ),
-					number_format( $used ),
-					number_format( $monthly ),
-					$pct
+					esc_html__( '%1$s / %2$s credits used this billing cycle (%3$s%%)', 'pressark' ),
+					esc_html( number_format_i18n( $used ) ),
+					esc_html( number_format_i18n( $monthly ) ),
+					esc_html( number_format_i18n( $pct ) )
 				);
 				?>
 			</p>
@@ -1462,7 +1462,7 @@ class PressArk_Admin {
 						</span>
 					</div>
 					<div style="background:#e2e8f0;border-radius:6px;height:8px;overflow:hidden;">
-						<div style="background:<?php echo esc_attr( $exhausted ? '#ef4444' : '#3b82f6' ); ?>;height:100%;border-radius:6px;width:<?php echo $total_limit > 0 ? min( 100, round( $total_used / $total_limit * 100 ) ) : 0; ?>%;"></div>
+						<div style="background:<?php echo esc_attr( $exhausted ? '#ef4444' : '#3b82f6' ); ?>;height:100%;border-radius:6px;width:<?php echo esc_attr( (string) ( $total_limit > 0 ? min( 100, round( $total_used / $total_limit * 100 ) ) : 0 ) ); ?>%;"></div>
 					</div>
 				</div>
 				<?php if ( ! empty( $per_group ) ) : ?>
@@ -1566,11 +1566,18 @@ class PressArk_Admin {
 					<td style="padding:14px 0; border-bottom:1px solid #f1f5f9; color:#0f172a; font-size:14px; font-weight:600;">
 						<?php
 						if ( $stats['is_pro'] ) {
-							/* translators: %d: number of edits used */
-							printf( esc_html__( '%d (unlimited)', 'pressark' ), $stats['edits_used'] );
+							printf(
+								/* translators: %s: number of edits used. */
+								esc_html__( '%s (unlimited)', 'pressark' ),
+								esc_html( number_format_i18n( absint( $stats['edits_used'] ) ) )
+							);
 						} else {
-							/* translators: 1: edits used 2: edits limit */
-							printf( esc_html__( '%1$d / %2$d', 'pressark' ), $stats['edits_used'], $stats['edits_limit'] );
+							printf(
+								/* translators: 1: edits used, 2: edits limit. */
+								esc_html__( '%1$s / %2$s', 'pressark' ),
+								esc_html( number_format_i18n( absint( $stats['edits_used'] ) ) ),
+								esc_html( number_format_i18n( absint( $stats['edits_limit'] ) ) )
+							);
 						}
 						?>
 					</td>

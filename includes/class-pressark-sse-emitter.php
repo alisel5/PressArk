@@ -61,9 +61,11 @@ class PressArk_SSE_Emitter {
 			return;
 		}
 
-		$json = is_string( $data ) ? $data : wp_json_encode( $data );
+		$event_type = preg_replace( '/[^A-Za-z0-9_-]/', '', $type );
+		$json       = is_string( $data ) ? $data : wp_json_encode( $data );
 
-		echo "event: {$type}\ndata: {$json}\n\n";
+		// phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- SSE responses are plain-text event streams, not HTML.
+		echo "event: {$event_type}\ndata: {$json}\n\n";
 
 		if ( ob_get_level() ) {
 			ob_flush();

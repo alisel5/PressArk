@@ -450,11 +450,11 @@ class PressArk_Insights {
 				<p style="margin:8px 0 0;">
 					<?php
 					printf(
-						/* translators: 1: log days 2: chat days 3: ledger days */
-						esc_html__( 'Action log: %1$d days · Chat history: %2$d days · Cost telemetry: %3$d days', 'pressark' ),
-						$ret['log'],
-						$ret['chats'],
-						$ret['ledger']
+						/* translators: 1: action log retention in days, 2: chat retention in days, 3: ledger retention in days. */
+						esc_html__( 'Action log: %1$s days · Chat history: %2$s days · Cost telemetry: %3$s days', 'pressark' ),
+						esc_html( number_format_i18n( absint( $ret['log'] ) ) ),
+						esc_html( number_format_i18n( absint( $ret['chats'] ) ) ),
+						esc_html( number_format_i18n( absint( $ret['ledger'] ) ) )
 					);
 					?>
 					&middot;
