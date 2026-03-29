@@ -202,6 +202,7 @@ class PressArk_Task_Store {
 	 */
 	public function find_in_flight_by_idempotency_key( string $idempotency_key ): string {
 		global $wpdb;
+		$table = self::table_name();
 
 		$idempotency_key = sanitize_text_field( $idempotency_key );
 		if ( '' === $idempotency_key ) {
@@ -210,7 +211,7 @@ class PressArk_Task_Store {
 
 		$existing = $wpdb->get_var(
 			$wpdb->prepare(
-				"SELECT task_id FROM " . self::table_name() . "
+				"SELECT task_id FROM {$table}
 				 WHERE idempotency_key = %s
 				   AND idempotency_active = 1
 				   AND status IN ('queued', 'running')
@@ -229,10 +230,11 @@ class PressArk_Task_Store {
 	 */
 	public function get( string $task_id ): ?array {
 		global $wpdb;
+		$table = self::table_name();
 
 		$row = $wpdb->get_row(
 			$wpdb->prepare(
-				"SELECT * FROM " . self::table_name() . " WHERE task_id = %s",
+				"SELECT * FROM {$table} WHERE task_id = %s",
 				$task_id
 			),
 			ARRAY_A

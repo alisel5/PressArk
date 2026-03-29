@@ -1622,25 +1622,51 @@ class PressArk_Handler_WooCommerce extends PressArk_Handler_Base {
 
 		// wc_customer_lookup includes both registered and guest customers
 		// and doesn't require N+1 WC_Customer instantiation.
-		// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- Dynamic ORDER BY from sanitized whitelist.
-		$query = "SELECT
-				cl.customer_id, cl.user_id, cl.email,
-				cl.first_name, cl.last_name,
-				cl.city, cl.state, cl.country,
-				cl.date_registered, cl.date_last_active,
-				COUNT( os.order_id ) as order_count,
-				SUM( os.total_sales ) as total_spent
-			 FROM {$wpdb->prefix}wc_customer_lookup cl
-			 LEFT JOIN {$wpdb->prefix}wc_order_stats os
-				ON cl.customer_id = os.customer_id
-				AND os.status IN ( 'wc-completed', 'wc-processing' )
-			 {$where}
-			 GROUP BY cl.customer_id
-			 ORDER BY {$order_sql}
-			 LIMIT %d OFFSET %d";
-
-		$prepare_args = array_merge( $where_args, array( $limit, $offset ) );
-		$customers = $wpdb->get_results( $wpdb->prepare( $query, ...$prepare_args ) );
+		if ( $search ) {
+			// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- Dynamic ORDER BY comes from a sanitized whitelist.
+			$customers = $wpdb->get_results( $wpdb->prepare(
+				"SELECT
+					cl.customer_id, cl.user_id, cl.email,
+					cl.first_name, cl.last_name,
+					cl.city, cl.state, cl.country,
+					cl.date_registered, cl.date_last_active,
+					COUNT( os.order_id ) as order_count,
+					SUM( os.total_sales ) as total_spent
+				 FROM {$wpdb->prefix}wc_customer_lookup cl
+				 LEFT JOIN {$wpdb->prefix}wc_order_stats os
+					ON cl.customer_id = os.customer_id
+					AND os.status IN ( 'wc-completed', 'wc-processing' )
+				 WHERE (cl.first_name LIKE %s OR cl.last_name LIKE %s OR cl.email LIKE %s)
+				 GROUP BY cl.customer_id
+				 ORDER BY {$order_sql}
+				 LIMIT %d OFFSET %d",
+				$where_args[0],
+				$where_args[1],
+				$where_args[2],
+				$limit,
+				$offset
+			) );
+		} else {
+			// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- Dynamic ORDER BY comes from a sanitized whitelist.
+			$customers = $wpdb->get_results( $wpdb->prepare(
+				"SELECT
+					cl.customer_id, cl.user_id, cl.email,
+					cl.first_name, cl.last_name,
+					cl.city, cl.state, cl.country,
+					cl.date_registered, cl.date_last_active,
+					COUNT( os.order_id ) as order_count,
+					SUM( os.total_sales ) as total_spent
+				 FROM {$wpdb->prefix}wc_customer_lookup cl
+				 LEFT JOIN {$wpdb->prefix}wc_order_stats os
+					ON cl.customer_id = os.customer_id
+					AND os.status IN ( 'wc-completed', 'wc-processing' )
+				 GROUP BY cl.customer_id
+				 ORDER BY {$order_sql}
+				 LIMIT %d OFFSET %d",
+				$limit,
+				$offset
+			) );
+		}
 
 		// Total count (with search filter).
 		if ( $search ) {

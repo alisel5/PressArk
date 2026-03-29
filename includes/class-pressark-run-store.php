@@ -106,10 +106,11 @@ class PressArk_Run_Store {
 	 */
 	public function get( string $run_id ): ?array {
 		global $wpdb;
+		$table = self::table_name();
 
 		$row = $wpdb->get_row(
 			$wpdb->prepare(
-				"SELECT * FROM " . self::table_name() . " WHERE run_id = %s",
+				"SELECT * FROM {$table} WHERE run_id = %s",
 				$run_id
 			),
 			ARRAY_A
@@ -132,10 +133,11 @@ class PressArk_Run_Store {
 	 */
 	public function get_status( string $run_id ): ?string {
 		global $wpdb;
+		$table = self::table_name();
 
 		$status = $wpdb->get_var(
 			$wpdb->prepare(
-				"SELECT status FROM " . self::table_name() . " WHERE run_id = %s",
+				"SELECT status FROM {$table} WHERE run_id = %s",
 				$run_id
 			)
 		);
@@ -195,10 +197,11 @@ class PressArk_Run_Store {
 	 */
 	public function get_by_preview_session( string $session_id ): ?array {
 		global $wpdb;
+		$table = self::table_name();
 
 		$row = $wpdb->get_row(
 			$wpdb->prepare(
-				"SELECT * FROM " . self::table_name() . " WHERE preview_session_id = %s AND status = 'awaiting_preview'",
+				"SELECT * FROM {$table} WHERE preview_session_id = %s AND status = 'awaiting_preview'",
 				$session_id
 			),
 			ARRAY_A

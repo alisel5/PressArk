@@ -114,10 +114,11 @@ class PressArk_Automation_Store {
 	 */
 	public function get( string $automation_id ): ?array {
 		global $wpdb;
+		$table = self::table_name();
 
 		$row = $wpdb->get_row(
 			$wpdb->prepare(
-				"SELECT * FROM " . self::table_name() . " WHERE automation_id = %s",
+				"SELECT * FROM {$table} WHERE automation_id = %s",
 				$automation_id
 			),
 			ARRAY_A

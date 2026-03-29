@@ -491,22 +491,38 @@ class PressArk_Content_Index {
 		}
 
 		$query = sanitize_text_field( $query );
-
-		$sql    = "SELECT id, post_id, post_type, chunk_index, title, content, meta_data, indexed_at,
-					MATCH(title, content) AGAINST(%s IN NATURAL LANGUAGE MODE) AS relevance
-				FROM {$this->table}
-				WHERE MATCH(title, content) AGAINST(%s IN NATURAL LANGUAGE MODE)";
-		$params = array( $query, $query );
-
+		$table = $this->table;
 		if ( $post_type ) {
-			$sql     .= ' AND post_type = %s';
-			$params[] = sanitize_text_field( $post_type );
+			$results = $wpdb->get_results(
+				$wpdb->prepare(
+					"SELECT id, post_id, post_type, chunk_index, title, content, meta_data, indexed_at,
+						MATCH(title, content) AGAINST(%s IN NATURAL LANGUAGE MODE) AS relevance
+					FROM {$table}
+					WHERE MATCH(title, content) AGAINST(%s IN NATURAL LANGUAGE MODE)
+						AND post_type = %s
+					ORDER BY relevance DESC
+					LIMIT %d",
+					$query,
+					$query,
+					sanitize_text_field( $post_type ),
+					intval( $limit )
+				)
+			);
+		} else {
+			$results = $wpdb->get_results(
+				$wpdb->prepare(
+					"SELECT id, post_id, post_type, chunk_index, title, content, meta_data, indexed_at,
+						MATCH(title, content) AGAINST(%s IN NATURAL LANGUAGE MODE) AS relevance
+					FROM {$table}
+					WHERE MATCH(title, content) AGAINST(%s IN NATURAL LANGUAGE MODE)
+					ORDER BY relevance DESC
+					LIMIT %d",
+					$query,
+					$query,
+					intval( $limit )
+				)
+			);
 		}
-
-		$sql     .= ' ORDER BY relevance DESC LIMIT %d';
-		$params[] = intval( $limit );
-
-		$results = $wpdb->get_results( $wpdb->prepare( $sql, ...$params ) );
 
 		if ( empty( $results ) ) {
 			return $this->fallback_search( $query, $limit, $post_type );

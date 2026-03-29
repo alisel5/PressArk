@@ -731,16 +731,22 @@ class PressArk_Checkpoint {
 
 		global $wpdb;
 		$table = $wpdb->prefix . 'pressark_chats';
-
-		$sql    = "SELECT checkpoint FROM {$table} WHERE id = %d";
-		$params = array( $chat_id );
-
 		if ( $user_id > 0 ) {
-			$sql     .= ' AND user_id = %d';
-			$params[] = $user_id;
+			$json = $wpdb->get_var(
+				$wpdb->prepare(
+					"SELECT checkpoint FROM {$table} WHERE id = %d AND user_id = %d",
+					$chat_id,
+					$user_id
+				)
+			);
+		} else {
+			$json = $wpdb->get_var(
+				$wpdb->prepare(
+					"SELECT checkpoint FROM {$table} WHERE id = %d",
+					$chat_id
+				)
+			);
 		}
-
-		$json = $wpdb->get_var( $wpdb->prepare( $sql, ...$params ) );
 
 		if ( empty( $json ) ) {
 			return null;
