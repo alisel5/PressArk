@@ -41,6 +41,9 @@ class PressArk_Automation_Store {
 			timezone VARCHAR(64) NOT NULL DEFAULT 'UTC',
 			cadence_type VARCHAR(20) NOT NULL DEFAULT 'once',
 			cadence_value INT UNSIGNED NOT NULL DEFAULT 0,
+			event_trigger VARCHAR(64) DEFAULT NULL,
+			event_trigger_cooldown INT UNSIGNED DEFAULT 3600,
+			last_triggered_at DATETIME DEFAULT NULL,
 			first_run_at DATETIME NOT NULL,
 			next_run_at DATETIME DEFAULT NULL,
 			status VARCHAR(20) NOT NULL DEFAULT 'active',
@@ -63,7 +66,8 @@ class PressArk_Automation_Store {
 			UNIQUE KEY idx_automation_id (automation_id),
 			KEY idx_user_status (user_id, status),
 			KEY idx_next_run (status, next_run_at),
-			KEY idx_claimed (claimed_at)
+			KEY idx_claimed (claimed_at),
+			KEY idx_event_trigger (status, event_trigger)
 		) {$charset_collate};";
 	}
 
@@ -81,27 +85,33 @@ class PressArk_Automation_Store {
 		$automation_id = $data['automation_id'] ?? wp_generate_uuid4();
 		$first_run_at  = $data['first_run_at'] ?? current_time( 'mysql', true );
 
+		$event_trigger = isset( $data['event_trigger'] ) && '' !== $data['event_trigger']
+			? sanitize_key( $data['event_trigger'] )
+			: null;
+
 		$wpdb->insert(
 			self::table_name(),
 			array(
-				'automation_id'        => $automation_id,
-				'user_id'              => absint( $data['user_id'] ?? get_current_user_id() ),
-				'chat_id'              => absint( $data['chat_id'] ?? 0 ),
-				'name'                 => sanitize_text_field( $data['name'] ?? '' ),
-				'prompt'               => wp_kses_post( $data['prompt'] ?? '' ),
-				'timezone'             => sanitize_text_field( $data['timezone'] ?? 'UTC' ),
-				'cadence_type'         => sanitize_key( $data['cadence_type'] ?? 'once' ),
-				'cadence_value'        => absint( $data['cadence_value'] ?? 0 ),
-				'first_run_at'         => $first_run_at,
-				'next_run_at'          => $data['next_run_at'] ?? $first_run_at,
-				'status'               => 'active',
-				'approval_policy'      => sanitize_key( $data['approval_policy'] ?? 'editorial' ),
-				'allowed_groups'       => ! empty( $data['allowed_groups'] ) ? wp_json_encode( $data['allowed_groups'] ) : null,
-				'notification_channel' => sanitize_key( $data['notification_channel'] ?? 'telegram' ),
-				'notification_target'  => sanitize_text_field( $data['notification_target'] ?? '' ),
-				'execution_hints'      => ! empty( $data['execution_hints'] ) ? wp_json_encode( $data['execution_hints'] ) : null,
+				'automation_id'          => $automation_id,
+				'user_id'                => absint( $data['user_id'] ?? get_current_user_id() ),
+				'chat_id'                => absint( $data['chat_id'] ?? 0 ),
+				'name'                   => sanitize_text_field( $data['name'] ?? '' ),
+				'prompt'                 => wp_kses_post( $data['prompt'] ?? '' ),
+				'timezone'               => sanitize_text_field( $data['timezone'] ?? 'UTC' ),
+				'cadence_type'           => sanitize_key( $data['cadence_type'] ?? 'once' ),
+				'cadence_value'          => absint( $data['cadence_value'] ?? 0 ),
+				'event_trigger'          => $event_trigger,
+				'event_trigger_cooldown' => absint( $data['event_trigger_cooldown'] ?? 3600 ),
+				'first_run_at'           => $first_run_at,
+				'next_run_at'            => $data['next_run_at'] ?? $first_run_at,
+				'status'                 => 'active',
+				'approval_policy'        => sanitize_key( $data['approval_policy'] ?? 'editorial' ),
+				'allowed_groups'         => ! empty( $data['allowed_groups'] ) ? wp_json_encode( $data['allowed_groups'] ) : null,
+				'notification_channel'   => sanitize_key( $data['notification_channel'] ?? 'telegram' ),
+				'notification_target'    => sanitize_text_field( $data['notification_target'] ?? '' ),
+				'execution_hints'        => ! empty( $data['execution_hints'] ) ? wp_json_encode( $data['execution_hints'] ) : null,
 			),
-			array( '%s', '%d', '%d', '%s', '%s', '%s', '%s', '%d', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s' )
+			array( '%s', '%d', '%d', '%s', '%s', '%s', '%s', '%d', '%s', '%d', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s' )
 		);
 
 		return $automation_id;
@@ -166,6 +176,7 @@ class PressArk_Automation_Store {
 
 		$allowed_fields = array(
 			'name', 'prompt', 'timezone', 'cadence_type', 'cadence_value',
+			'event_trigger', 'event_trigger_cooldown', 'last_triggered_at',
 			'first_run_at', 'next_run_at', 'status', 'approval_policy',
 			'allowed_groups', 'last_run_id', 'last_task_id', 'last_success_at',
 			'last_failure_at', 'last_error', 'failure_streak', 'claimed_at',
@@ -374,6 +385,58 @@ class PressArk_Automation_Store {
 		) );
 	}
 
+	// ── Event Trigger Queries ────────────────────────────────────────
+
+	/**
+	 * Find automations matching an event trigger type.
+	 *
+	 * @param string $event_type Event trigger value (e.g. 'negative_review').
+	 * @param string $status     Filter by status (default: 'active').
+	 * @return array Matching automation rows.
+	 */
+	public function find_by_event_trigger( string $event_type, string $status = 'active' ): array {
+		global $wpdb;
+		$table = self::table_name();
+
+		$rows = $wpdb->get_results( $wpdb->prepare(
+			"SELECT * FROM {$table}
+			 WHERE status = %s
+			 AND event_trigger = %s",
+			$status,
+			$event_type
+		), ARRAY_A );
+
+		return array_map( array( $this, 'decode_row' ), $rows ?: array() );
+	}
+
+	/**
+	 * Atomically update last_triggered_at to NOW (UTC) with cooldown guard.
+	 *
+	 * Uses UPDATE ... WHERE to prevent double-dispatch when two events
+	 * of the same type fire concurrently.
+	 *
+	 * @param string $automation_id Automation ID.
+	 * @param int    $cooldown_seconds Minimum seconds between triggers.
+	 * @return bool True if the update succeeded (cooldown passed).
+	 */
+	public function claim_event_trigger( string $automation_id, int $cooldown_seconds ): bool {
+		global $wpdb;
+		$table = self::table_name();
+
+		$rows = $wpdb->query( $wpdb->prepare(
+			"UPDATE {$table}
+			 SET last_triggered_at = UTC_TIMESTAMP(),
+			     updated_at = UTC_TIMESTAMP()
+			 WHERE automation_id = %s
+			 AND status = 'active'
+			 AND (last_triggered_at IS NULL OR last_triggered_at < DATE_SUB(UTC_TIMESTAMP(), INTERVAL %d SECOND))",
+			$automation_id,
+			$cooldown_seconds
+		) );
+
+		return (int) $rows === 1;
+	}
+
 	// ── Cleanup ──────────────────────────────────────────────────────
 
 	/**
@@ -391,12 +454,13 @@ class PressArk_Automation_Store {
 	// ── Internal ─────────────────────────────────────────────────────
 
 	private function decode_row( array $row ): array {
-		$row['user_id']         = (int) $row['user_id'];
-		$row['chat_id']         = (int) $row['chat_id'];
-		$row['cadence_value']   = (int) $row['cadence_value'];
-		$row['failure_streak']  = (int) $row['failure_streak'];
-		$row['allowed_groups']  = json_decode( $row['allowed_groups'] ?? 'null', true );
-		$row['execution_hints'] = json_decode( $row['execution_hints'] ?? 'null', true );
+		$row['user_id']                = (int) $row['user_id'];
+		$row['chat_id']                = (int) $row['chat_id'];
+		$row['cadence_value']          = (int) $row['cadence_value'];
+		$row['event_trigger_cooldown'] = (int) ( $row['event_trigger_cooldown'] ?? 3600 );
+		$row['failure_streak']         = (int) $row['failure_streak'];
+		$row['allowed_groups']         = json_decode( $row['allowed_groups'] ?? 'null', true );
+		$row['execution_hints']        = json_decode( $row['execution_hints'] ?? 'null', true );
 		return $row;
 	}
 }

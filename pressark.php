@@ -111,6 +111,7 @@ spl_autoload_register( static function ( string $class ): void {
 		'PressArk_Admin'                 => 'includes/class-admin.php',
 		'PressArk_Admin_Activity'        => 'includes/class-admin-activity.php',
 		'PressArk_Admin_Automations'     => 'includes/class-admin-automations.php',
+		'PressArk_Admin_Watchdog'        => 'includes/class-admin-watchdog.php',
 		'PressArk_Agent'                 => 'includes/class-pressark-agent.php',
 		'PressArk_AI_Connector'          => 'includes/class-ai-connector.php',
 		'PressArk_Automation_Dispatcher' => 'includes/class-pressark-automation-dispatcher.php',
@@ -152,9 +153,10 @@ spl_autoload_register( static function ( string $class ): void {
 		'PressArk_Log_Analyzer'          => 'includes/class-pressark-log-analyzer.php',
 		'PressArk_Migrator'              => 'includes/class-pressark-migrator.php',
 		'PressArk_Model_Policy'          => 'includes/class-pressark-model-policy.php',
+		'PressArk_Notification_Email'    => 'includes/class-pressark-notification-email.php',
 		'PressArk_Notification_Manager'  => 'includes/class-pressark-notification-manager.php',
-		'PressArk_Onboarding'            => 'includes/class-pressark-onboarding.php',
 		'PressArk_Notification_Telegram' => 'includes/class-pressark-notification-telegram.php',
+		'PressArk_Onboarding'            => 'includes/class-pressark-onboarding.php',
 		'PressArk_Operation'             => 'includes/class-pressark-operation.php',
 		'PressArk_Operation_Registry'    => 'includes/class-pressark-operation-registry.php',
 		'PressArk_PAL_Parser'            => 'includes/class-pressark-pal-parser.php',
@@ -188,6 +190,9 @@ spl_autoload_register( static function ( string $class ): void {
 		'PressArk_Tool_Loader'           => 'includes/class-pressark-tool-loader.php',
 		'PressArk_Tools'                 => 'includes/class-pressark-tools.php',
 		'PressArk_Usage_Tracker'         => 'includes/class-usage-tracker.php',
+		'PressArk_Watchdog_Alerter'      => 'includes/class-pressark-watchdog-alerter.php',
+		'PressArk_Watchdog_Preferences'  => 'includes/class-pressark-watchdog-preferences.php',
+		'PressArk_Watchdog_Templates'    => 'includes/class-pressark-watchdog-templates.php',
 		'PressArk_WC_Events'             => 'includes/class-pressark-wc-events.php',
 		'PressArk_Workflow_Content_Create' => 'includes/class-pressark-workflow-content-create.php',
 		'PressArk_Workflow_Content_Edit' => 'includes/class-pressark-workflow-content-edit.php',
@@ -220,6 +225,59 @@ function pressark_get_upgrade_url(): string {
 	$url      = (string) get_option( 'pressark_upgrade_url', $fallback );
 
 	return '' !== $url ? $url : $fallback;
+}
+
+/**
+ * Return an inline SVG icon wrapped in a .pw-icon span.
+ *
+ * All icons use stroke-based design with currentColor for consistency.
+ *
+ * @param string $name  Icon key (e.g. 'zap', 'shield', 'check').
+ * @param int    $size  Icon pixel size (default 16).
+ * @return string HTML string.
+ */
+function pressark_icon( string $name, int $size = 16 ): string {
+	static $icons = null;
+	if ( null === $icons ) {
+		$s = 'xmlns="http://www.w3.org/2000/svg" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"';
+		$icons = array(
+			'zap'         => '<svg %s viewBox="0 0 16 16"><path d="M8.5 1.5L3 9h4.5l-.5 5.5L13 7H8.5l.5-5.5z"/></svg>',
+			'moon'        => '<svg %s viewBox="0 0 16 16"><path d="M13.5 8.5a5.5 5.5 0 1 1-6-6 4.5 4.5 0 0 0 6 6z"/></svg>',
+			'pen'         => '<svg %s viewBox="0 0 16 16"><path d="M11.2 2.3a1.6 1.6 0 0 1 2.5 2l-8 8L2.5 13l.7-3.2z"/></svg>',
+			'search'      => '<svg %s viewBox="0 0 16 16"><circle cx="7" cy="7" r="4.5"/><path d="m13.5 13.5-3-3"/></svg>',
+			'shield'      => '<svg %s viewBox="0 0 16 16"><path d="M8 1.5L2.5 4v3.5c0 3.5 2.3 6 5.5 7 3.2-1 5.5-3.5 5.5-7V4z"/></svg>',
+			'barChart'    => '<svg %s viewBox="0 0 16 16"><path d="M6 13.5V7M10 13.5V2.5M2.5 13.5v-3M13.5 13.5V5"/></svg>',
+			'sparkles'    => '<svg %s viewBox="0 0 16 16"><path d="M8 1.5l1 3.5 3.5 1-3.5 1-1 3.5-1-3.5L3.5 6l3.5-1z"/><path d="M12 10l.5 1.5 1.5.5-1.5.5-.5 1.5-.5-1.5L10 12l1.5-.5z"/></svg>',
+			'check'       => '<svg %s viewBox="0 0 16 16"><path d="M3.5 8.5l3 3 6-6"/></svg>',
+			'x'           => '<svg %s viewBox="0 0 16 16"><path d="M4 4l8 8M12 4l-8 8"/></svg>',
+			'warning'     => '<svg %s viewBox="0 0 16 16"><path d="M7.13 2.5L1.5 12.5h13L8.87 2.5a1 1 0 0 0-1.74 0z"/><path d="M8 6.5v2.5"/><circle cx="8" cy="11" r=".5" fill="currentColor" stroke="none"/></svg>',
+			'lock'        => '<svg %s viewBox="0 0 16 16"><rect x="3.5" y="7" width="9" height="6.5" rx="1.5"/><path d="M5.5 7V5a2.5 2.5 0 0 1 5 0v2"/></svg>',
+			'mail'        => '<svg %s viewBox="0 0 16 16"><rect x="1.5" y="3.5" width="13" height="9" rx="1.5"/><path d="M1.5 5l6.5 4 6.5-4"/></svg>',
+			'send'        => '<svg %s viewBox="0 0 16 16"><path d="M14.5 1.5l-6 13-2.5-5.5L1.5 6.5z"/><path d="M14.5 1.5L6 9"/></svg>',
+			'house'       => '<svg %s viewBox="0 0 16 16"><path d="M2.5 6.5L8 2l5.5 4.5V13a1 1 0 0 1-1 1h-9a1 1 0 0 1-1-1z"/><path d="M6 14V9h4v5"/></svg>',
+			'checkCircle' => '<svg %s viewBox="0 0 16 16"><circle cx="8" cy="8" r="6.5"/><path d="M5.5 8l2 2 3.5-3.5"/></svg>',
+			'xCircle'     => '<svg %s viewBox="0 0 16 16"><circle cx="8" cy="8" r="6.5"/><path d="M5.5 5.5l5 5M10.5 5.5l-5 5"/></svg>',
+			'dollar'      => '<svg %s viewBox="0 0 16 16"><path d="M8 1.5v13"/><path d="M11 4.5H6.5a2 2 0 0 0 0 4h3a2 2 0 0 1 0 4H5"/></svg>',
+			'package'     => '<svg %s viewBox="0 0 16 16"><path d="M2 4.5L8 1.5l6 3v7l-6 3-6-3z"/><path d="M2 4.5L8 8l6-3.5"/><path d="M8 8v6.5"/></svg>',
+			'alertCircle' => '<svg %s viewBox="0 0 16 16"><circle cx="8" cy="8" r="6.5"/><path d="M8 5v3.5"/><circle cx="8" cy="11" r=".5" fill="currentColor" stroke="none"/></svg>',
+			'star'        => '<svg %s viewBox="0 0 16 16"><path d="M8 1.5l1.9 4 4.4.6-3.2 3 .8 4.4L8 11.3 4.1 13.5l.8-4.4-3.2-3 4.4-.6z"/></svg>',
+			'gift'        => '<svg %s viewBox="0 0 16 16"><rect x="1.5" y="6" width="13" height="3" rx="1"/><rect x="2.5" y="9" width="11" height="5" rx="1"/><path d="M8 6v8"/><path d="M8 6C6.5 6 4 4.5 4 3a2 2 0 0 1 4 0"/><path d="M8 6c1.5 0 4-1.5 4-3a2 2 0 0 0-4 0"/></svg>',
+			'statusDot'   => '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"><circle cx="5" cy="5" r="4" fill="currentColor"/></svg>',
+		);
+	}
+
+	if ( ! isset( $icons[ $name ] ) ) {
+		return '';
+	}
+
+	$attrs = sprintf(
+		'xmlns="http://www.w3.org/2000/svg" width="%1$d" height="%1$d" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"',
+		$size
+	);
+
+	$svg = sprintf( $icons[ $name ], $attrs );
+
+	return '<span class="pw-icon" style="display:inline-flex;align-items:center;vertical-align:middle;">' . $svg . '</span>';
 }
 
 /**
@@ -745,6 +803,14 @@ function pressark_init(): void {
 	PressArk_Cron_Manager::register_hooks();
 	PressArk_Frontend_SEO::register_hooks();
 	PressArk_WC_Events::register_hooks();
+
+	// Watchdog alert batch flush — must fire even outside wp-admin.
+	add_action(
+		PressArk_Watchdog_Alerter::FLUSH_HOOK,
+		array( PressArk_Watchdog_Alerter::class, 'handle_flush_batch' ),
+		10,
+		2
+	);
 
 	// Cache invalidation hooks.
 	add_action( 'after_switch_theme', static function (): void {

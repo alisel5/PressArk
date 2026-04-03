@@ -78,6 +78,7 @@ class PressArk_Automation_Policy {
 		'create_variation',
 		'bulk_edit_products',
 		'moderate_review',
+		'reply_review',
 	);
 
 	/**

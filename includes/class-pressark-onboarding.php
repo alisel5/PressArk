@@ -603,19 +603,19 @@ class PressArk_Onboarding {
 
 					<div class="pw-ob-quick-actions">
 						<button type="button" data-message="<?php esc_attr_e( 'Run a security check on my site and fix any issues', 'pressark' ); ?>">
-							&#x1F512; <?php esc_html_e( 'Security Scan', 'pressark' ); ?>
+							<?php echo pressark_icon( 'shield' ); ?> <?php esc_html_e( 'Security Scan', 'pressark' ); ?>
 						</button>
 						<button type="button" data-message="<?php esc_attr_e( "Scan my site's SEO and suggest improvements", 'pressark' ); ?>">
-							&#x1F4CA; <?php esc_html_e( 'SEO Audit', 'pressark' ); ?>
+							<?php echo pressark_icon( 'barChart' ); ?> <?php esc_html_e( 'SEO Audit', 'pressark' ); ?>
 						</button>
 						<button type="button" data-message="<?php esc_attr_e( "Write a new blog post that matches my site's tone and style", 'pressark' ); ?>">
-							&#x270D;&#xFE0F; <?php esc_html_e( 'Write a Blog Post', 'pressark' ); ?>
+							<?php echo pressark_icon( 'pen' ); ?> <?php esc_html_e( 'Write a Blog Post', 'pressark' ); ?>
 						</button>
 						<button type="button" data-message="<?php esc_attr_e( 'Rewrite my homepage content to be more engaging', 'pressark' ); ?>">
-							&#x1F3E0; <?php esc_html_e( 'Update Homepage', 'pressark' ); ?>
+							<?php echo pressark_icon( 'house' ); ?> <?php esc_html_e( 'Update Homepage', 'pressark' ); ?>
 						</button>
 						<button type="button" data-message="<?php esc_attr_e( "Check my site's performance and loading speed", 'pressark' ); ?>">
-							&#x26A1; <?php esc_html_e( 'Check Speed', 'pressark' ); ?>
+							<?php echo pressark_icon( 'zap' ); ?> <?php esc_html_e( 'Check Speed', 'pressark' ); ?>
 						</button>
 					</div>
 

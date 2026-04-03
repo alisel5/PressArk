@@ -110,6 +110,9 @@ class PressArk_Entitlements {
 			'max_automations'         => 0,
 			'min_automation_interval' => 0,
 			'max_request_icus'        => 50000,
+			'watchdog_alerts'         => false,
+			'watchdog_digest'         => false,
+			'watchdog_triggers'       => false,
 		),
 		'pro' => array(
 			'icu_budget'              => 5000000,
@@ -131,6 +134,9 @@ class PressArk_Entitlements {
 			'max_automations'         => 5,
 			'min_automation_interval' => 3600,
 			'max_request_icus'        => 300000,
+			'watchdog_alerts'         => true,
+			'watchdog_digest'         => true,
+			'watchdog_triggers'       => false,
 		),
 		'team' => array(
 			'icu_budget'              => 15000000,
@@ -152,6 +158,9 @@ class PressArk_Entitlements {
 			'max_automations'         => 15,
 			'min_automation_interval' => 1800,
 			'max_request_icus'        => 500000,
+			'watchdog_alerts'         => true,
+			'watchdog_digest'         => true,
+			'watchdog_triggers'       => true,
 		),
 		'agency' => array(
 			'icu_budget'              => 40000000,
@@ -173,6 +182,9 @@ class PressArk_Entitlements {
 			'max_automations'         => 50,
 			'min_automation_interval' => 900,
 			'max_request_icus'        => 1000000,
+			'watchdog_alerts'         => true,
+			'watchdog_digest'         => true,
+			'watchdog_triggers'       => true,
 		),
 		'enterprise' => array(
 			'icu_budget'              => 100000000,
@@ -194,6 +206,9 @@ class PressArk_Entitlements {
 			'max_automations'         => -1,
 			'min_automation_interval' => 300,
 			'max_request_icus'        => 2500000,
+			'watchdog_alerts'         => true,
+			'watchdog_digest'         => true,
+			'watchdog_triggers'       => true,
 		),
 	);
 

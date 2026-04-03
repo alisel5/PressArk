@@ -154,17 +154,36 @@ class PressArk_Admin_Automations {
 			}
 		}
 
+		// Event trigger (Team+ only).
+		$event_trigger          = sanitize_key( wp_unslash( $_POST['event_trigger'] ?? '' ) );
+		$event_trigger_cooldown = absint( wp_unslash( $_POST['event_trigger_cooldown'] ?? 60 ) );
+
+		// Validate event trigger value.
+		if ( $event_trigger && ! in_array( $event_trigger, PressArk_Watchdog_Alerter::VALID_EVENT_TRIGGERS, true ) ) {
+			$event_trigger = '';
+		}
+
+		// Enforce Team+ tier for event triggers.
+		if ( $event_trigger && ! PressArk_Entitlements::can_use_feature( $tier, 'watchdog_triggers' ) ) {
+			$event_trigger = '';
+		}
+
+		// Convert minutes to seconds, enforce minimum of 5 minutes.
+		$event_trigger_cooldown = max( 300, $event_trigger_cooldown * 60 );
+
 		$automation_id = $store->create( array(
-			'user_id'              => $user_id,
-			'name'                 => sanitize_text_field( wp_unslash( $_POST['name'] ?? '' ) ) ?: mb_substr( wp_strip_all_tags( $prompt ), 0, 80 ),
-			'prompt'               => $prompt,
-			'timezone'             => $timezone,
-			'cadence_type'         => $cadence_type,
-			'cadence_value'        => $cadence_value,
-			'first_run_at'         => $first_run_at,
-			'approval_policy'      => sanitize_key( wp_unslash( $_POST['approval_policy'] ?? PressArk_Automation_Policy::default_for_tier( $tier ) ) ),
-			'notification_channel' => 'telegram',
-			'notification_target'  => PressArk_Notification_Manager::get_user_telegram_id( $user_id ),
+			'user_id'                => $user_id,
+			'name'                   => sanitize_text_field( wp_unslash( $_POST['name'] ?? '' ) ) ?: mb_substr( wp_strip_all_tags( $prompt ), 0, 80 ),
+			'prompt'                 => $prompt,
+			'timezone'               => $timezone,
+			'cadence_type'           => $cadence_type,
+			'cadence_value'          => $cadence_value,
+			'event_trigger'          => $event_trigger ?: null,
+			'event_trigger_cooldown' => $event_trigger_cooldown,
+			'first_run_at'           => $first_run_at,
+			'approval_policy'        => sanitize_key( wp_unslash( $_POST['approval_policy'] ?? PressArk_Automation_Policy::default_for_tier( $tier ) ) ),
+			'notification_channel'   => 'telegram',
+			'notification_target'    => PressArk_Notification_Manager::get_user_telegram_id( $user_id ),
 		) );
 
 		PressArk_Automation_Dispatcher::schedule_next_wake( $automation_id, $first_run_at );
@@ -205,6 +224,21 @@ class PressArk_Admin_Automations {
 		}
 		if ( isset( $_POST['approval_policy'] ) ) {
 			$update['approval_policy'] = sanitize_key( wp_unslash( $_POST['approval_policy'] ) );
+		}
+
+		// Event trigger fields.
+		if ( isset( $_POST['event_trigger'] ) ) {
+			$et = sanitize_key( wp_unslash( $_POST['event_trigger'] ) );
+			$tier_check = ( new PressArk_License() )->get_tier();
+			if ( '' === $et || ! PressArk_Entitlements::can_use_feature( $tier_check, 'watchdog_triggers' ) ) {
+				$update['event_trigger'] = null;
+			} elseif ( in_array( $et, PressArk_Watchdog_Alerter::VALID_EVENT_TRIGGERS, true ) ) {
+				$update['event_trigger'] = $et;
+			}
+		}
+		if ( isset( $_POST['event_trigger_cooldown'] ) ) {
+			$cd_minutes = absint( wp_unslash( $_POST['event_trigger_cooldown'] ) );
+			$update['event_trigger_cooldown'] = max( 300, $cd_minutes * 60 );
 		}
 
 		// Recompute next run if cadence changed.
@@ -457,7 +491,12 @@ class PressArk_Admin_Automations {
 					<td style="max-width:250px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="<?php echo esc_attr( $a['prompt'] ); ?>">
 						<?php echo esc_html( mb_substr( $a['prompt'], 0, 80 ) ); ?>
 					</td>
-					<td><?php echo esc_html( PressArk_Automation_Recurrence::label( $a['cadence_type'], $a['cadence_value'] ) ); ?></td>
+					<td>
+						<?php echo esc_html( PressArk_Automation_Recurrence::label( $a['cadence_type'], $a['cadence_value'] ) ); ?>
+						<?php if ( ! empty( $a['event_trigger'] ) ) : ?>
+							<br><small style="color:#6366f1;">+ <?php echo esc_html( str_replace( '_', ' ', $a['event_trigger'] ) ); ?></small>
+						<?php endif; ?>
+					</td>
 					<td>
 						<span style="color:<?php echo esc_attr( $sc ); ?>;font-weight:600;">
 							<?php echo esc_html( ucfirst( $a['status'] ) ); ?>
@@ -619,6 +658,45 @@ class PressArk_Admin_Automations {
 					</tr>
 				</table>
 
+				<?php // Event Trigger section (Team+ only). ?>
+				<?php $can_trigger = PressArk_Entitlements::can_use_feature( $tier, 'watchdog_triggers' ); ?>
+				<h3 style="margin-top:24px;"><?php esc_html_e( 'Event Trigger (optional)', 'pressark' ); ?></h3>
+
+				<?php if ( ! $can_trigger ) : ?>
+					<div style="background:#fffbeb;border:1px solid #fde68a;border-radius:4px;padding:12px;margin-bottom:16px;">
+						<strong style="color:#d97706;"><?php esc_html_e( 'Upgrade to Team to enable event-triggered automations', 'pressark' ); ?></strong>
+						<p style="margin:4px 0 0;color:#64748b;"><?php esc_html_e( 'Event triggers allow automations to run immediately when specific WooCommerce events occur.', 'pressark' ); ?></p>
+					</div>
+				<?php else : ?>
+					<table class="form-table">
+						<tr>
+							<th><label for="pw-auto-event-trigger"><?php esc_html_e( 'Trigger on event', 'pressark' ); ?></label></th>
+							<td>
+								<select id="pw-auto-event-trigger" name="event_trigger">
+									<option value=""><?php esc_html_e( 'None (time-based only)', 'pressark' ); ?></option>
+									<option value="order_failed"><?php esc_html_e( 'Order Failed', 'pressark' ); ?></option>
+									<option value="order_cancelled"><?php esc_html_e( 'Order Cancelled', 'pressark' ); ?></option>
+									<option value="refund_issued"><?php esc_html_e( 'Refund Issued', 'pressark' ); ?></option>
+									<option value="low_stock"><?php esc_html_e( 'Low Stock', 'pressark' ); ?></option>
+									<option value="out_of_stock"><?php esc_html_e( 'Out of Stock', 'pressark' ); ?></option>
+									<option value="negative_review"><?php esc_html_e( 'Negative Review', 'pressark' ); ?></option>
+									<option value="high_value_order"><?php esc_html_e( 'High-Value Order', 'pressark' ); ?></option>
+								</select>
+							</td>
+						</tr>
+						<tr>
+							<th><label for="pw-auto-event-cooldown"><?php esc_html_e( 'Cooldown', 'pressark' ); ?></label></th>
+							<td>
+								<input type="number" id="pw-auto-event-cooldown" name="event_trigger_cooldown" value="60" min="5" class="small-text">
+								<span><?php esc_html_e( 'minutes between triggers', 'pressark' ); ?></span>
+								<p class="description">
+									<?php esc_html_e( 'When set, this automation will also run immediately when the selected event occurs, in addition to any scheduled cadence. The cooldown prevents the automation from firing too frequently on high-volume stores.', 'pressark' ); ?>
+								</p>
+							</td>
+						</tr>
+					</table>
+				<?php endif; ?>
+
 				<?php submit_button( __( 'Create Automation', 'pressark' ) ); ?>
 			</form>
 		</div>
@@ -690,6 +768,46 @@ class PressArk_Admin_Automations {
 					</tr>
 				</table>
 
+				<?php // Event Trigger section (Team+ only). ?>
+				<?php $can_trigger = PressArk_Entitlements::can_use_feature( $tier, 'watchdog_triggers' ); ?>
+				<h3 style="margin-top:24px;"><?php esc_html_e( 'Event Trigger (optional)', 'pressark' ); ?></h3>
+
+				<?php if ( ! $can_trigger ) : ?>
+					<div style="background:#fffbeb;border:1px solid #fde68a;border-radius:4px;padding:12px;margin-bottom:16px;">
+						<strong style="color:#d97706;"><?php esc_html_e( 'Upgrade to Team to enable event-triggered automations', 'pressark' ); ?></strong>
+					</div>
+				<?php else : ?>
+					<?php $current_trigger = $a['event_trigger'] ?? ''; ?>
+					<?php $current_cooldown = (int) ( $a['event_trigger_cooldown'] ?? 3600 ); ?>
+					<table class="form-table">
+						<tr>
+							<th><label for="pw-auto-event-trigger"><?php esc_html_e( 'Trigger on event', 'pressark' ); ?></label></th>
+							<td>
+								<select id="pw-auto-event-trigger" name="event_trigger">
+									<option value="" <?php selected( '', $current_trigger ); ?>><?php esc_html_e( 'None (time-based only)', 'pressark' ); ?></option>
+									<option value="order_failed" <?php selected( 'order_failed', $current_trigger ); ?>><?php esc_html_e( 'Order Failed', 'pressark' ); ?></option>
+									<option value="order_cancelled" <?php selected( 'order_cancelled', $current_trigger ); ?>><?php esc_html_e( 'Order Cancelled', 'pressark' ); ?></option>
+									<option value="refund_issued" <?php selected( 'refund_issued', $current_trigger ); ?>><?php esc_html_e( 'Refund Issued', 'pressark' ); ?></option>
+									<option value="low_stock" <?php selected( 'low_stock', $current_trigger ); ?>><?php esc_html_e( 'Low Stock', 'pressark' ); ?></option>
+									<option value="out_of_stock" <?php selected( 'out_of_stock', $current_trigger ); ?>><?php esc_html_e( 'Out of Stock', 'pressark' ); ?></option>
+									<option value="negative_review" <?php selected( 'negative_review', $current_trigger ); ?>><?php esc_html_e( 'Negative Review', 'pressark' ); ?></option>
+									<option value="high_value_order" <?php selected( 'high_value_order', $current_trigger ); ?>><?php esc_html_e( 'High-Value Order', 'pressark' ); ?></option>
+								</select>
+							</td>
+						</tr>
+						<tr>
+							<th><label for="pw-auto-event-cooldown"><?php esc_html_e( 'Cooldown', 'pressark' ); ?></label></th>
+							<td>
+								<input type="number" id="pw-auto-event-cooldown" name="event_trigger_cooldown" value="<?php echo absint( $current_cooldown / 60 ); ?>" min="5" class="small-text">
+								<span><?php esc_html_e( 'minutes between triggers', 'pressark' ); ?></span>
+								<p class="description">
+									<?php esc_html_e( 'The cooldown prevents the automation from firing too frequently on high-volume stores.', 'pressark' ); ?>
+								</p>
+							</td>
+						</tr>
+					</table>
+				<?php endif; ?>
+
 				<?php submit_button( __( 'Save Changes', 'pressark' ) ); ?>
 			</form>
 
@@ -745,7 +863,7 @@ class PressArk_Admin_Automations {
 
 			<?php if ( $has_token && $chat_id ) : ?>
 				<div style="background:#f0fdf4;border:1px solid #86efac;border-radius:4px;padding:12px;margin-top:8px;">
-					<strong style="color:#16a34a;">&#10003; <?php esc_html_e( 'Telegram configured', 'pressark' ); ?></strong>
+					<strong style="color:#16a34a;"><?php echo pressark_icon( 'check' ); ?> <?php esc_html_e( 'Telegram configured', 'pressark' ); ?></strong>
 					<span style="color:#64748b;margin-left:8px;"><?php printf(
 						/* translators: %s: Telegram chat ID. */
 						esc_html__( 'Chat ID: %s', 'pressark' ),

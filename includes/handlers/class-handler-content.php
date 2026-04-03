@@ -1928,11 +1928,11 @@ class PressArk_Handler_Content extends PressArk_Handler_Base {
 				foreach ( $scan['checks'] ?? array() as $check ) {
 					$status = $check['status'] ?? '';
 					if ( 'pass' === $status ) {
-						$status_icon = "<span class='pass'>&#10003; Pass</span>";
+						$status_icon = "<span class='pass'>" . pressark_icon( 'check' ) . " Pass</span>";
 					} elseif ( 'warning' === $status ) {
-						$status_icon = "<span class='warn'>&#9888; Warning</span>";
+						$status_icon = "<span class='warn'>" . pressark_icon( 'warning' ) . " Warning</span>";
 					} else {
-						$status_icon = "<span class='fail'>&#10007; Fail</span>";
+						$status_icon = "<span class='fail'>" . pressark_icon( 'x' ) . " Fail</span>";
 					}
 					$report_html .= "<tr><td>" . esc_html( $check['label'] ?? ( $check['name'] ?? '' ) ) . "</td><td>{$status_icon}</td><td>" . esc_html( $check['severity'] ?? '' ) . "</td><td>" . esc_html( $check['message'] ?? '' ) . "</td></tr>";
 				}

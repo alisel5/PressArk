@@ -542,7 +542,7 @@ class PressArk_Admin {
 		?>
 		<div style="background:#f8fafc;border:1px solid rgba(226,232,240,0.8);border-radius:12px;padding:32px;margin-bottom:20px;box-shadow:0 4px 12px rgba(0,0,0,0.02);">
 			<?php if ( $is_pro ) : ?>
-				<strong style="color:#0f172a;font-size:15px;display:flex;align-items:center;gap:8px;"><span style="color:#10b981;font-size:18px;">&#9889;</span> <?php
+				<strong style="color:#0f172a;font-size:15px;display:flex;align-items:center;gap:8px;"><span style="color:#10b981;font-size:18px;"><?php echo pressark_icon( 'zap', 18 ); ?></span> <?php
 				/* translators: %s: plan tier label (e.g., Pro, Agency) */
 				printf( esc_html__( '%s Plan Active', 'pressark' ), esc_html( $tier_label ) );
 			?></strong>
@@ -614,9 +614,9 @@ class PressArk_Admin {
 
 		echo '<p>';
 		if ( $is_healthy ) {
-			echo '<span style="color:#00a32a;">&#9679;</span> ' . esc_html__( 'Connected to PressArk AI service', 'pressark' );
+			echo '<span style="color:#00a32a;">' . pressark_icon( 'statusDot', 10 ) . '</span> ' . esc_html__( 'Connected to PressArk AI service', 'pressark' );
 		} else {
-			echo '<span style="color:#d63638;">&#9679;</span> ' . esc_html__( 'Unable to reach PressArk AI service', 'pressark' );
+			echo '<span style="color:#d63638;">' . pressark_icon( 'statusDot', 10 ) . '</span> ' . esc_html__( 'Unable to reach PressArk AI service', 'pressark' );
 		}
 		echo '</p>';
 		echo '<p class="description">' . esc_html__( 'No API key is stored locally. All AI calls are routed through the secure PressArk service.', 'pressark' ) . '</p>';
@@ -686,7 +686,7 @@ class PressArk_Admin {
 						$info['cost_class'],
 						'Value' === $info['cost_class'] ? '3×' : '8×'
 					) : '' ); ?>">
-						<?php echo esc_html( $info['label'] ); ?><?php echo $is_pro ? '' : ' &#9889; Pro'; ?>
+						<?php echo esc_html( $info['label'] ); ?><?php echo $is_pro ? '' : ' [Pro]'; ?>
 					</option>
 				<?php endforeach; ?>
 			</optgroup>
@@ -700,7 +700,7 @@ class PressArk_Admin {
 						$info['cost_class'],
 						'Premium' === $info['cost_class'] ? '15×' : '8×'
 					) : '' ); ?>">
-						<?php echo esc_html( $info['label'] ); ?><?php echo $is_team ? '' : ' &#9889; Team+'; ?>
+						<?php echo esc_html( $info['label'] ); ?><?php echo $is_team ? '' : ' [Team+]'; ?>
 					</option>
 				<?php endforeach; ?>
 			</optgroup>
@@ -726,7 +726,7 @@ class PressArk_Admin {
 
 		<?php if ( ! $is_pro ) : ?>
 		<p class="description" style="color: #e94560; margin-top: 4px;">
-			&#128274; <?php
+			<?php echo pressark_icon( 'lock' ); ?> <?php
 			echo wp_kses(
 				sprintf(
 					/* translators: %s: Freemius upgrade URL. */
@@ -809,7 +809,7 @@ class PressArk_Admin {
 						$info['cost_class'],
 						'Value' === $info['cost_class'] ? '3×' : '8×'
 					) : '' ); ?>">
-						<?php echo esc_html( $info['label'] ); ?><?php echo $is_pro ? '' : ' &#9889; Pro'; ?>
+						<?php echo esc_html( $info['label'] ); ?><?php echo $is_pro ? '' : ' [Pro]'; ?>
 					</option>
 				<?php endforeach; ?>
 			</optgroup>
@@ -823,7 +823,7 @@ class PressArk_Admin {
 						$info['cost_class'],
 						'Premium' === $info['cost_class'] ? '15×' : '8×'
 					) : '' ); ?>">
-						<?php echo esc_html( $info['label'] ); ?><?php echo $is_team ? '' : ' &#9889; Team+'; ?>
+						<?php echo esc_html( $info['label'] ); ?><?php echo $is_team ? '' : ' [Team+]'; ?>
 					</option>
 				<?php endforeach; ?>
 			</optgroup>
@@ -852,7 +852,7 @@ class PressArk_Admin {
 
 		<?php if ( ! $is_pro ) : ?>
 		<p class="description" style="color: #e94560; margin-top: 4px;">
-			&#128274; <?php
+			<?php echo pressark_icon( 'lock' ); ?> <?php
 			echo wp_kses(
 				sprintf(
 					/* translators: %s: Freemius upgrade URL. */

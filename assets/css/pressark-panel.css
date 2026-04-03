@@ -464,6 +464,15 @@
 	box-shadow: none !important;
 }
 
+.pressark-panel .pressark-suggestion .pw-icon {
+	margin-right: 4px;
+}
+
+.pressark-panel .pressark-suggestion .pw-icon svg {
+	width: 14px;
+	height: 14px;
+}
+
 .pressark-panel .pressark-suggestion:hover {
 	border-color: var(--pw-primary) !important;
 	color: var(--pw-primary) !important;
@@ -1261,6 +1270,19 @@ body.pressark-panel-active .pressark-toggle-btn {
 	line-height: 1.3;
 }
 
+.pw-icon {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	vertical-align: middle;
+	flex-shrink: 0;
+}
+
+.pw-icon svg {
+	width: 1em;
+	height: 1em;
+}
+
 .pressark-step-icon {
 	display: inline-flex;
 	align-items: center;
@@ -1270,6 +1292,11 @@ body.pressark-panel-active .pressark-toggle-btn {
 	border-radius: 50%;
 	font-size: 10px;
 	flex-shrink: 0;
+}
+
+.pressark-step-icon svg {
+	width: 14px;
+	height: 14px;
 }
 
 .pressark-step-icon--reading {

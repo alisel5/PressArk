@@ -4,6 +4,48 @@
 (function () {
 	'use strict';
 
+	/* ── Inline SVG Icon Helper ─────────────────────────────────────── */
+	var pwIcons = {
+		zap:       '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8.5 1.5L3 9h4.5l-.5 5.5L13 7H8.5l.5-5.5z"/></svg>',
+		moon:      '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M13.5 8.5a5.5 5.5 0 1 1-6-6 4.5 4.5 0 0 0 6 6z"/></svg>',
+		pen:       '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M11.2 2.3a1.6 1.6 0 0 1 2.5 2l-8 8L2.5 13l.7-3.2z"/></svg>',
+		search:    '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="7" cy="7" r="4.5"/><path d="m13.5 13.5-3-3"/></svg>',
+		shield:    '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8 1.5L2.5 4v3.5c0 3.5 2.3 6 5.5 7 3.2-1 5.5-3.5 5.5-7V4z"/></svg>',
+		barChart:  '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M6 13.5V7M10 13.5V2.5M2.5 13.5v-3M13.5 13.5V5"/></svg>',
+		sparkles:  '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8 1.5l1 3.5 3.5 1-3.5 1-1 3.5-1-3.5L3.5 6l3.5-1z"/><path d="M12 10l.5 1.5 1.5.5-1.5.5-.5 1.5-.5-1.5L10 12l1.5-.5z"/></svg>',
+		refresh:   '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M1.5 2.5v4h4"/><path d="M2.5 10a5.5 5.5 0 1 0 1-5.5L1.5 6.5"/></svg>',
+		broom:     '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 9l6.5-6.5M4 10l-1.5 4.5L7 13l1-1"/><path d="M7 13c1.5 0 4-1.5 6.5-4"/></svg>',
+		clipboard: '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3.5" y="2.5" width="9" height="11" rx="1.5"/><path d="M6 2.5V1.5h4v1"/><path d="M6 7h4M6 9.5h2.5"/></svg>',
+		store:     '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2 5.5l1-3.5h10l1 3.5"/><path d="M2 5.5c0 1.1.9 2 2 2s2-.9 2-2c0 1.1.9 2 2 2s2-.9 2-2c0 1.1.9 2 2 2s2-.9 2-2"/><path d="M2.5 7.5v6h11v-6"/><path d="M6.5 13.5v-3.5h3v3.5"/></svg>',
+		trendUp:   '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M14.5 3.5l-5 5-3-3-5 5"/><path d="M10 3.5h4.5V7"/></svg>',
+		check:     '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 8.5l3 3 6-6"/></svg>',
+		x:         '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4l8 8M12 4l-8 8"/></svg>',
+		warning:   '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M7.13 2.5L1.5 12.5h13L8.87 2.5a1 1 0 0 0-1.74 0z"/><path d="M8 6.5v2.5"/><circle cx="8" cy="11" r=".5" fill="currentColor" stroke="none"/></svg>',
+		info:      '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="6.5"/><path d="M8 7v4"/><circle cx="8" cy="5" r=".5" fill="currentColor" stroke="none"/></svg>',
+		fileDown:  '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M9.5 1.5H4.5a1 1 0 0 0-1 1v11a1 1 0 0 0 1 1h7a1 1 0 0 0 1-1V4.5z"/><path d="M8 7v4M6 9.5L8 11.5 10 9.5"/></svg>',
+		loader:    '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8 1.5v2M8 12.5v2M3.4 3.4l1.4 1.4M11.2 11.2l1.4 1.4M1.5 8h2M12.5 8h2M3.4 12.6l1.4-1.4M11.2 4.8l1.4-1.4"/></svg>',
+		dot:       '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="3"/></svg>',
+		pencil:    '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M10.5 2.5l3 3L5 14H2v-3z"/></svg>',
+		undo:      '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4 6h6a3 3 0 1 1 0 6H8"/><path d="M6.5 3.5L4 6l2.5 2.5"/></svg>',
+		lock:      '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3.5" y="7" width="9" height="6.5" rx="1.5"/><path d="M5.5 7V5a2.5 2.5 0 0 1 5 0v2"/></svg>',
+		mail:      '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="1.5" y="3.5" width="13" height="9" rx="1.5"/><path d="M1.5 5l6.5 4 6.5-4"/></svg>',
+		send:      '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M14.5 1.5l-6 13-2.5-5.5L1.5 6.5z"/><path d="M14.5 1.5L6 9"/></svg>',
+		house:     '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 6.5L8 2l5.5 4.5V13a1 1 0 0 1-1 1h-9a1 1 0 0 1-1-1z"/><path d="M6 14V9h4v5"/></svg>',
+		checkCircle: '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="6.5"/><path d="M5.5 8l2 2 3.5-3.5"/></svg>',
+		xCircle:   '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="6.5"/><path d="M5.5 5.5l5 5M10.5 5.5l-5 5"/></svg>',
+		dollar:    '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8 1.5v13"/><path d="M11 4.5H6.5a2 2 0 0 0 0 4h3a2 2 0 0 1 0 4H5"/></svg>',
+		package:   '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2 4.5L8 1.5l6 3v7l-6 3-6-3z"/><path d="M2 4.5L8 8l6-3.5"/><path d="M8 8v6.5"/></svg>',
+		alertCircle: '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="6.5"/><path d="M8 5v3.5"/><circle cx="8" cy="11" r=".5" fill="currentColor" stroke="none"/></svg>',
+		star:      '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8 1.5l1.9 4 4.4.6-3.2 3 .8 4.4L8 11.3 4.1 13.5l.8-4.4-3.2-3 4.4-.6z"/></svg>',
+		gift:      '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="1.5" y="6" width="13" height="3" rx="1"/><rect x="2.5" y="9" width="11" height="5" rx="1"/><path d="M8 6v8"/><path d="M8 6C6.5 6 4 4.5 4 3a2 2 0 0 1 4 0"/><path d="M8 6c1.5 0 4-1.5 4-3a2 2 0 0 0-4 0"/></svg>',
+		statusDot: '<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" viewBox="0 0 10 10"><circle cx="5" cy="5" r="4" fill="currentColor"/></svg>'
+	};
+
+	/** Wrap an icon SVG string in a .pw-icon span for inline use. */
+	function pwIcon(name) {
+		return '<span class="pw-icon">' + (pwIcons[name] || '') + '</span>';
+	}
+
 	var PANEL_STATE_KEY = 'pressark_panel_open';
 
 	var PressArk = {
@@ -265,7 +307,7 @@
 				upgradeMsg.innerHTML =
 					'<div class="pressark-message-content">' +
 					'<div class="pressark-upgrade-prompt">' +
-					'<strong>\u26A1 Deep Mode is a Pro feature</strong>' +
+					'<strong>' + pwIcon('zap') + ' Deep Mode is a Pro feature</strong>' +
 					'<p>Deep Mode uses premium AI models (Claude Sonnet 4.6, GPT-5.4) with extended context for complex tasks like full-site rewrites, detailed analysis, and bulk content generation.</p>' +
 					'<a href="' + this.escapeHtml(upgradeUrl) + '" target="_blank" class="pressark-upgrade-btn">Upgrade to Pro</a>' +
 					'</div></div>';
@@ -285,8 +327,8 @@
 			indicator.innerHTML =
 				'<div class="pressark-message-content">' +
 				(this.deepModeActive
-					? '\u26A1 <strong>Deep Mode ON</strong> \u2014 Using premium AI with extended context. Best for complex tasks.'
-					: '\uD83D\uDCA4 <strong>Deep Mode OFF</strong> \u2014 Back to standard mode.') +
+					? pwIcon('zap') + ' <strong>Deep Mode ON</strong> \u2014 Using premium AI with extended context. Best for complex tasks.'
+					: pwIcon('moon') + ' <strong>Deep Mode OFF</strong> \u2014 Back to standard mode.') +
 				'</div>';
 			this.messagesEl.appendChild(indicator);
 			this.scrollToBottom();
@@ -866,20 +908,20 @@
 			container.className = 'pressark-suggestions';
 
 			var allSuggestions = [
-				{ icon: '\u270D\uFE0F', label: 'Draft Blog Post', message: 'Write a new blog post with SEO-optimized title, meta description, and engaging content that matches my brand voice' },
-				{ icon: '\uD83D\uDD0D', label: 'Full SEO Audit', message: 'Run a comprehensive SEO audit on my site \u2014 check meta tags, headings, alt text, and give me a prioritized fix list' },
-				{ icon: '\uD83D\uDEE1\uFE0F', label: 'Security Scan', message: 'Scan my site for security vulnerabilities and outdated components, then suggest fixes' },
-				{ icon: '\uD83D\uDCCA', label: 'Content Performance', message: 'Analyze my published content and identify which posts need updating, better SEO, or more engagement hooks' },
-				{ icon: '\u2728', label: 'Rewrite & Improve', message: 'Review my homepage content and rewrite it to be more compelling, conversion-focused, and SEO-friendly' },
-				{ icon: '\uD83D\uDD04', label: 'Bulk Find & Replace', message: 'Find and replace text, links, or outdated references across all my pages and posts' },
-				{ icon: '\uD83E\uDDF9', label: 'Site Cleanup', message: 'Clean up my database \u2014 remove post revisions, spam comments, orphaned metadata, and transient data' },
-				{ icon: '\uD83D\uDCCB', label: 'Content Overview', message: 'Give me a complete overview of all my content \u2014 pages, posts, and their publish status, word count, and last updated date' },
+				{ icon: pwIcon('pen'), label: 'Draft Blog Post', message: 'Write a new blog post with SEO-optimized title, meta description, and engaging content that matches my brand voice' },
+				{ icon: pwIcon('search'), label: 'Full SEO Audit', message: 'Run a comprehensive SEO audit on my site \u2014 check meta tags, headings, alt text, and give me a prioritized fix list' },
+				{ icon: pwIcon('shield'), label: 'Security Scan', message: 'Scan my site for security vulnerabilities and outdated components, then suggest fixes' },
+				{ icon: pwIcon('barChart'), label: 'Content Performance', message: 'Analyze my published content and identify which posts need updating, better SEO, or more engagement hooks' },
+				{ icon: pwIcon('sparkles'), label: 'Rewrite & Improve', message: 'Review my homepage content and rewrite it to be more compelling, conversion-focused, and SEO-friendly' },
+				{ icon: pwIcon('refresh'), label: 'Bulk Find & Replace', message: 'Find and replace text, links, or outdated references across all my pages and posts' },
+				{ icon: pwIcon('broom'), label: 'Site Cleanup', message: 'Clean up my database \u2014 remove post revisions, spam comments, orphaned metadata, and transient data' },
+				{ icon: pwIcon('clipboard'), label: 'Content Overview', message: 'Give me a complete overview of all my content \u2014 pages, posts, and their publish status, word count, and last updated date' },
 			];
 
 			if (hasWoo) {
 				allSuggestions.splice(2, 0,
-					{ icon: '\uD83C\uDFEA', label: 'Store Health Check', message: 'Analyze my WooCommerce store health \u2014 check inventory levels, missing product data, and optimization opportunities' },
-					{ icon: '\uD83D\uDCC8', label: 'Product Optimizer', message: 'Review my products and improve titles, descriptions, and SEO metadata for better search visibility and conversions' }
+					{ icon: pwIcon('store'), label: 'Store Health Check', message: 'Analyze my WooCommerce store health \u2014 check inventory levels, missing product data, and optimization opportunities' },
+					{ icon: pwIcon('trendUp'), label: 'Product Optimizer', message: 'Review my products and improve titles, descriptions, and SEO metadata for better search visibility and conversions' }
 				);
 			}
 
@@ -891,7 +933,7 @@
 				(function (s) {
 					var btn = document.createElement('button');
 					btn.className = 'pressark-suggestion';
-					btn.textContent = s.icon + ' ' + s.label;
+					btn.innerHTML = s.icon + ' ' + self.escapeHtml(s.label);
 					btn.addEventListener('click', function () {
 						self.inputEl.value = s.message;
 						self.sendMessage();
@@ -1055,7 +1097,7 @@
 		},
 
 		renderErrorMessage: function (text) {
-			var html = '<span class="pressark-error-icon">\u26A0\uFE0F</span>';
+			var html = '<span class="pressark-error-icon">' + pwIcons.warning + '</span>';
 			html += '<span class="pressark-message-content">' + this.escapeHtml(text) + '</span>';
 			html += '<button class="pressark-retry-btn">Retry</button>';
 			return html;
@@ -1089,7 +1131,7 @@
 			msgEl.className = result.success
 				? 'pressark-action-result pressark-action-success'
 				: 'pressark-action-result pressark-action-fail';
-			var icon = result.success ? '\u2713' : '\u2717';
+			var icon = result.success ? pwIcon('check') : pwIcon('x');
 
 			var contentHtml = '<span>' + icon + ' ' + this.escapeHtml(result.message) + '</span>';
 
@@ -1105,7 +1147,7 @@
 				downloadBtn.href = result.data.download_url;
 				downloadBtn.target = '_blank';
 				downloadBtn.className = 'pressark-download-btn';
-				downloadBtn.innerHTML = '\uD83D\uDCC4 Download Report';
+				downloadBtn.innerHTML = pwIcon('fileDown') + ' Download Report';
 				downloadBtn.download = result.data.filename || 'report.html';
 				msgEl.appendChild(downloadBtn);
 			}
@@ -1163,9 +1205,9 @@
 				for (var w = 0; w < preview.seo_warnings.length; w++) {
 					var warn = preview.seo_warnings[w];
 					var warnClass = 'pressark-seo-warn--' + (warn.type || 'info');
-					var warnIcon = warn.type === 'warning' ? '\u26A0\uFE0F'
-						: warn.type === 'caution' ? '\u26A0'
-						: '\u2139\uFE0F';
+					var warnIcon = warn.type === 'warning' ? pwIcons.warning
+						: warn.type === 'caution' ? pwIcons.warning
+						: pwIcons.info;
 					warningsHTML +=
 						'<div class="pressark-seo-warn ' + warnClass + '">' +
 						'<span class="pressark-seo-warn-icon">' + warnIcon + '</span>' +
@@ -1243,7 +1285,7 @@
 				self.confirmAction(actionData, false, actionRunId, actionPendingIndex);
 				card.innerHTML =
 					'<div class="pressark-preview-cancelled">' +
-					'<span>\u2717 Changes cancelled</span>' +
+					'<span>' + pwIcon('x') + ' Changes cancelled</span>' +
 					'</div>';
 				card.classList.add('pressark-preview-dismissed');
 				// Save card summary for history rendering.
@@ -1367,8 +1409,8 @@
 			}
 
 			var resultHTML = status === 'applied'
-				? '<div class="pressark-action-result pressark-action-success"><span>\u2713 Changes applied successfully</span></div>'
-				: '<div class="pressark-preview-cancelled"><span>\u2717 Changes cancelled</span></div>';
+				? '<div class="pressark-action-result pressark-action-success"><span>' + pwIcon('check') + ' Changes applied successfully</span></div>'
+				: '<div class="pressark-preview-cancelled"><span>' + pwIcon('x') + ' Changes cancelled</span></div>';
 
 			card.innerHTML =
 				'<div class="pressark-preview-header">' +
@@ -1420,7 +1462,7 @@
 				}
 				actionsDiv.innerHTML =
 					'<div class="pressark-action-result pressark-action-success">' +
-					'<span>\u2713 ' + this.escapeHtml(result.message || 'Changes applied successfully') + '</span>' +
+					'<span>' + pwIcon('check') + ' ' + this.escapeHtml(result.message || 'Changes applied successfully') + '</span>' +
 					undoHtml +
 					'</div>' + verifyHtml;
 				card.classList.add('pressark-preview-applied');
@@ -1446,7 +1488,7 @@
 			} else {
 				actionsDiv.innerHTML =
 					'<div class="pressark-action-result pressark-action-fail">' +
-					'<span>\u2717 ' + this.escapeHtml(result.message || 'Failed to apply changes') + '</span>' +
+					'<span>' + pwIcon('x') + ' ' + this.escapeHtml(result.message || 'Failed to apply changes') + '</span>' +
 					'</div>';
 			}
 
@@ -1710,7 +1752,7 @@
 						if (result.success) {
 							var contentEl = parent.querySelector('.pressark-message-content') || parent.querySelector('span');
 							if (contentEl) {
-								contentEl.innerHTML = '\u21A9 Undone \u2014 restored previous version';
+								contentEl.innerHTML = pwIcon('undo') + ' Undone \u2014 restored previous version';
 							}
 							btn.remove();
 						} else {
@@ -1975,16 +2017,16 @@
 				var icon = '';
 				switch (status) {
 					case 'reading':
-						icon = '<span class="pressark-step-icon pressark-step-icon--reading">\u27F3</span>';
+						icon = '<span class="pressark-step-icon pressark-step-icon--reading">' + pwIcons.loader + '</span>';
 						break;
 					case 'done':
-						icon = '<span class="pressark-step-icon pressark-step-icon--done">\u2713</span>';
+						icon = '<span class="pressark-step-icon pressark-step-icon--done">' + pwIcons.check + '</span>';
 						break;
 					case 'preparing_preview':
-						icon = '<span class="pressark-step-icon pressark-step-icon--preview">\u25C9</span>';
+						icon = '<span class="pressark-step-icon pressark-step-icon--preview">' + pwIcons.dot + '</span>';
 						break;
 					case 'needs_confirm':
-						icon = '<span class="pressark-step-icon pressark-step-icon--confirm">\u26A0</span>';
+						icon = '<span class="pressark-step-icon pressark-step-icon--confirm">' + pwIcons.warning + '</span>';
 						break;
 					default:
 						icon = '<span class="pressark-step-icon">\u00B7</span>';
@@ -2160,7 +2202,7 @@
 					if (result.success) {
 						self.closePreview(action);
 						var displayMsg = action === 'keep'
-							? '\u2713 Changes applied successfully.'
+							? pwIcon('check') + ' Changes applied successfully.'
 							: 'Changes discarded.';
 						// v3.1.0: Append verification summary if present.
 						if (action === 'keep' && result.verification && result.verification.message) {
@@ -2858,7 +2900,7 @@
 				case 'error':
 					this.finishRequest();
 					var msg = (event.data && event.data.message) || 'An error occurred.';
-					contentEl.innerHTML = '<span class="pressark-error-icon">\u26A0\uFE0F</span> ' + this.escapeHtml(msg);
+					contentEl.innerHTML = '<span class="pressark-error-icon">' + pwIcons.warning + '</span> ' + this.escapeHtml(msg);
 					bubble.classList.add('pressark-message-error');
 					bubble.classList.remove('pressark-message-streaming');
 					break;
@@ -2909,7 +2951,7 @@
 						var iconEl = rows[i].querySelector('.pressark-step-icon');
 						if (iconEl) {
 							iconEl.className = 'pressark-step-icon pressark-step-icon--done';
-							iconEl.textContent = '\u2713';
+							iconEl.innerHTML = pwIcons.check;
 						}
 						return;
 					}
@@ -2937,13 +2979,13 @@
 
 			var icon = '';
 			if (status === 'reading') {
-				icon = '<span class="pressark-step-icon pressark-step-icon--reading">\u27F3</span>';
+				icon = '<span class="pressark-step-icon pressark-step-icon--reading">' + pwIcons.loader + '</span>';
 			} else if (status === 'done') {
-				icon = '<span class="pressark-step-icon pressark-step-icon--done">\u2713</span>';
+				icon = '<span class="pressark-step-icon pressark-step-icon--done">' + pwIcons.check + '</span>';
 			} else if (status === 'preparing_preview') {
-				icon = '<span class="pressark-step-icon pressark-step-icon--preview">\u2728</span>';
+				icon = '<span class="pressark-step-icon pressark-step-icon--preview">' + pwIcons.sparkles + '</span>';
 			} else if (status === 'needs_confirm') {
-				icon = '<span class="pressark-step-icon pressark-step-icon--confirm">\u270E</span>';
+				icon = '<span class="pressark-step-icon pressark-step-icon--confirm">' + pwIcons.pencil + '</span>';
 			} else {
 				icon = '<span class="pressark-step-icon">\u2022</span>';
 			}

@@ -33,6 +33,8 @@ class PressArk_Notification_Manager {
 		switch ( $channel ) {
 			case 'telegram':
 				return PressArk_Notification_Telegram::send( $target, $subject, $body, $metadata );
+			case 'email':
+				return PressArk_Notification_Email::send( $target, $subject, $body, $metadata );
 			default:
 				return array( 'success' => false, 'error' => "Unknown notification channel: {$channel}" );
 		}
@@ -131,7 +133,16 @@ class PressArk_Notification_Manager {
 	 * existing automations too.
 	 */
 	public static function resolve_automation_target( array $automation ): string {
+		$channel = $automation['notification_channel'] ?? 'telegram';
 		$user_id = (int) ( $automation['user_id'] ?? 0 );
+
+		if ( 'email' === $channel && $user_id > 0 ) {
+			$user = get_userdata( $user_id );
+			if ( $user && is_email( $user->user_email ) ) {
+				return $user->user_email;
+			}
+		}
+
 		if ( $user_id > 0 ) {
 			$current_target = self::get_user_telegram_id( $user_id );
 			if ( '' !== $current_target ) {
@@ -140,6 +151,33 @@ class PressArk_Notification_Manager {
 		}
 
 		return (string) ( $automation['notification_target'] ?? '' );
+	}
+
+	/**
+	 * Resolve notification channel and target for a config + user.
+	 *
+	 * Falls back to email if telegram is configured but no chat_id exists.
+	 *
+	 * @param array $config  Configuration with 'notification_channel' key.
+	 * @param int   $user_id WordPress user ID.
+	 * @return array { channel: string, target: string }
+	 */
+	public static function resolve_notification_target( array $config, int $user_id ): array {
+		$channel = $config['notification_channel'] ?? 'email';
+
+		if ( 'telegram' === $channel ) {
+			$chat_id = self::get_user_telegram_id( $user_id );
+			if ( '' !== $chat_id ) {
+				return array( 'channel' => 'telegram', 'target' => $chat_id );
+			}
+			// Fallback to email when telegram is configured but no chat_id.
+			$channel = 'email';
+		}
+
+		$user = get_userdata( $user_id );
+		$email = ( $user && is_email( $user->user_email ) ) ? $user->user_email : '';
+
+		return array( 'channel' => 'email', 'target' => $email );
 	}
 
 	/**

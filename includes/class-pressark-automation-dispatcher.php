@@ -42,19 +42,33 @@ class PressArk_Automation_Dispatcher {
 	/**
 	 * Dispatch a single automation.
 	 *
-	 * 1. Atomically claim
+	 * 1. Atomically claim (skipped for event-triggered dispatches)
 	 * 2. Validate entitlements
 	 * 3. Create durable run
 	 * 4. Enqueue async task
 	 * 5. Compute and persist next occurrence
+	 *
+	 * @param array                    $automation     Automation row.
+	 * @param PressArk_Automation_Store $store         Store instance.
+	 * @param bool                     $skip_claim     Skip atomic claim (event triggers).
+	 * @param string|null              $prompt_override When set, use this prompt instead of stored.
 	 */
-	private static function dispatch_one( array $automation, PressArk_Automation_Store $store ): void {
+	public static function dispatch_one( array $automation, PressArk_Automation_Store $store, bool $skip_claim = false, ?string $prompt_override = null ): void {
 		$automation_id = $automation['automation_id'];
 		$claim_token   = wp_generate_uuid4();
-		$scheduled_slot = $automation['next_run_at'] ?? current_time( 'mysql', true );
 
-		// Atomic claim — prevents double-dispatch.
-		if ( ! $store->claim( $automation_id, $claim_token ) ) {
+		// For event-triggered dispatches, use a time-bucketed slot to enable
+		// idempotency dedup within the cooldown window (60-second buckets).
+		// For scheduled dispatches, use the scheduled next_run_at slot.
+		if ( $skip_claim ) {
+			$bucket = (int) floor( time() / 60 );
+			$scheduled_slot = 'event_' . $bucket;
+		} else {
+			$scheduled_slot = $automation['next_run_at'] ?? current_time( 'mysql', true );
+		}
+
+		// Atomic claim — prevents double-dispatch (skipped for event triggers).
+		if ( ! $skip_claim && ! $store->claim( $automation_id, $claim_token ) ) {
 			PressArk_Error_Tracker::debug( 'AutomationDispatcher', 'Dispatch skipped: claim failed (already claimed)', array( 'automation_id' => $automation_id ) );
 			return;
 		}
@@ -121,12 +135,15 @@ class PressArk_Automation_Dispatcher {
 				}
 			}
 
+			// Resolve the effective prompt (may be overridden for event triggers).
+			$effective_prompt = $prompt_override ?? $automation['prompt'];
+
 			// Build conversation from automation memory.
 			$conversation = self::build_automation_conversation( $automation, $chat_id, $user_id );
 
 			// Create durable run.
 			$reservation    = new PressArk_Reservation();
-			$estimated      = $reservation->estimate_tokens( $automation['prompt'], $conversation, $tier );
+			$estimated      = $reservation->estimate_tokens( $effective_prompt, $conversation, $tier );
 			$reserve_result = $reservation->reserve( $user_id, $estimated, 'pending', $tier );
 
 			if ( empty( $reserve_result['ok'] ) ) {
@@ -147,7 +164,7 @@ class PressArk_Automation_Dispatcher {
 				'user_id'        => $user_id,
 				'chat_id'        => $chat_id,
 				'route'          => 'automation',
-				'message'        => $automation['prompt'],
+				'message'        => $effective_prompt,
 				'reservation_id' => $reservation_id,
 				'tier'           => $tier,
 			) );
@@ -168,7 +185,7 @@ class PressArk_Automation_Dispatcher {
 			// Enqueue as async task — DO NOT run AI here in the cron callback.
 			$queue  = new PressArk_Task_Queue();
 			$queued = $queue->enqueue(
-				$automation['prompt'],
+				$effective_prompt,
 				$conversation,
 				array(),
 				$user_id,
@@ -220,12 +237,15 @@ class PressArk_Automation_Dispatcher {
 			) );
 
 			// Compute and persist next occurrence BEFORE the task runs.
-			self::compute_and_persist_next( $automation, $store );
+			// Skip for event-triggered dispatches — they don't advance the schedule.
+			if ( ! $skip_claim ) {
+				self::compute_and_persist_next( $automation, $store );
 
-			// Release the dispatch claim immediately so the automation is
-			// visible to the next sweep cycle without waiting for the
-			// 10-minute stale-claim timeout.
-			$store->release_claim( $automation_id );
+				// Release the dispatch claim immediately so the automation is
+				// visible to the next sweep cycle without waiting for the
+				// 10-minute stale-claim timeout.
+				$store->release_claim( $automation_id );
+			}
 
 			PressArk_Error_Tracker::info( 'AutomationDispatcher', 'Automation dispatched', array( 'automation_id' => $automation_id, 'run_id' => $run_id, 'task_id' => $task_id, 'next_run_at' => $automation['next_run_at'] ?? 'none' ) );
 
@@ -235,7 +255,11 @@ class PressArk_Automation_Dispatcher {
 				'last_task_id' => '',
 			) );
 			$store->record_failure( $automation_id, '', $e->getMessage() );
-			self::compute_and_persist_next( $automation, $store );
+
+			if ( ! $skip_claim ) {
+				self::compute_and_persist_next( $automation, $store );
+				$store->release_claim( $automation_id );
+			}
 
 			PressArk_Notification_Manager::notify_automation_failure( $automation, $e->getMessage() );
 

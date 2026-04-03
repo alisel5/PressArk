@@ -14,6 +14,7 @@ class PressArk {
 	private PressArk_Admin $admin;
 	private PressArk_Admin_Automations $admin_automations;
 	private PressArk_Admin_Activity $admin_activity;
+	private PressArk_Admin_Watchdog $admin_watchdog;
 	private PressArk_Chat $chat;
 	private PressArk_Dashboard $dashboard;
 	private PressArk_Onboarding $onboarding;
@@ -29,7 +30,11 @@ class PressArk {
 		$this->admin              = new PressArk_Admin();
 		$this->admin_automations  = new PressArk_Admin_Automations();
 		$this->admin_activity     = new PressArk_Admin_Activity();
+		$this->admin_watchdog     = new PressArk_Admin_Watchdog();
 		$this->chat               = new PressArk_Chat();
+
+		// Watchdog onboarding nudge for WooCommerce sites.
+		PressArk_Watchdog_Templates::register_nudge_hooks();
 		$this->dashboard          = new PressArk_Dashboard();
 		$this->onboarding         = new PressArk_Onboarding();
 

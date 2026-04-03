@@ -192,11 +192,14 @@ class PressArk_Context {
 					$type = $evt['type'];
 					$data = $evt['data'];
 					$alert_parts[] = match( $type ) {
-						'low_stock'       => "Low stock: {$data['name']} ({$data['stock']} left)",
-						'out_of_stock'    => "Out of stock: {$data['name']}",
-						'order_failed'    => "Order #{$data['number']} failed",
-						'order_cancelled' => "Order #{$data['number']} cancelled",
-						default           => $type,
+						'low_stock'        => "Low stock: {$data['name']} ({$data['stock']} left)",
+						'out_of_stock'     => "Out of stock: {$data['name']}",
+						'order_failed'     => "Order #{$data['number']} failed",
+						'order_cancelled'  => "Order #{$data['number']} cancelled",
+						'refund_issued'    => "Refund: \${$data['amount']} on Order #{$data['number']}",
+						'negative_review'  => "{$data['rating']}★ review on {$data['product_name']}: \"{$data['excerpt']}\"",
+						'high_value_order' => "Big order: #{$data['number']} (\${$data['total']})",
+						default            => $type,
 					};
 				}
 				$lines[] = 'WC Alerts: ' . implode( '; ', $alert_parts );

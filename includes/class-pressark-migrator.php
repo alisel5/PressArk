@@ -17,7 +17,7 @@ class PressArk_Migrator {
 	/**
 	 * Highest schema version in the migration chain.
 	 */
-	const LATEST = 11;
+	const LATEST = 13;
 
 	/**
 	 * Option key where the current schema version is stored.
@@ -35,6 +35,7 @@ class PressArk_Migrator {
 		'pressark_tasks'         => 2,
 		'pressark_runs'          => 3,
 		'pressark_automations'   => 5,
+		'pressark_alert_batches' => 12,
 	);
 
 	/**
@@ -205,6 +206,21 @@ class PressArk_Migrator {
 					'message' => sprintf( 'Missing %1$s column on %2$s.', $column, $ledger_table ),
 				);
 			}
+		}
+
+		// v13: Event trigger columns on automations.
+		$automations_table = $wpdb->prefix . 'pressark_automations';
+		if ( self::table_exists( $automations_table ) && ! self::table_has_column( $automations_table, 'event_trigger' ) ) {
+			$issues[] = array(
+				'version' => 13,
+				'message' => sprintf( 'Missing event_trigger column on %s.', $automations_table ),
+			);
+		}
+		if ( self::table_exists( $automations_table ) && ! self::table_has_index( $automations_table, 'idx_event_trigger' ) ) {
+			$issues[] = array(
+				'version' => 13,
+				'message' => sprintf( 'Missing idx_event_trigger index on %s.', $automations_table ),
+			);
 		}
 
 		usort( $issues, static function ( array $a, array $b ): int {
@@ -491,6 +507,48 @@ class PressArk_Migrator {
 	}
 
 	/**
+	 * v12: Alert batches table for Watchdog atomic batching.
+	 */
+	private static function migrate_to_12(): bool {
+		dbDelta( PressArk_Watchdog_Alerter::get_schema() );
+		return true;
+	}
+
+	/**
+	 * v13: Event trigger columns on the automations table.
+	 *
+	 * Adds event_trigger, event_trigger_cooldown, and last_triggered_at
+	 * columns to support event-driven automation dispatch.
+	 */
+	private static function migrate_to_13(): bool {
+		global $wpdb;
+		$table = $wpdb->prefix . 'pressark_automations';
+
+		if ( ! self::table_exists( $table ) ) {
+			return false;
+		}
+
+		if ( ! self::table_has_column( $table, 'event_trigger' ) ) {
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+			$wpdb->query( "ALTER TABLE {$table} ADD COLUMN event_trigger VARCHAR(64) DEFAULT NULL AFTER cadence_value" );
+		}
+
+		if ( ! self::table_has_column( $table, 'event_trigger_cooldown' ) ) {
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+			$wpdb->query( "ALTER TABLE {$table} ADD COLUMN event_trigger_cooldown INT UNSIGNED DEFAULT 3600 AFTER event_trigger" );
+		}
+
+		if ( ! self::table_has_column( $table, 'last_triggered_at' ) ) {
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+			$wpdb->query( "ALTER TABLE {$table} ADD COLUMN last_triggered_at DATETIME DEFAULT NULL AFTER event_trigger_cooldown" );
+		}
+
+		self::ensure_index( $table, 'idx_event_trigger', 'status, event_trigger' );
+
+		return true;
+	}
+
+	/**
 	 * Ensure a FULLTEXT index exists on a table.
 	 */
 	private static function ensure_fulltext_index( string $table, string $index_name, string $columns ): bool {
@@ -655,6 +713,28 @@ class PressArk_Migrator {
 
 			case 10:
 				// No strict postcondition — the UPDATE is best-effort for existing rows.
+				return '';
+
+			case 12:
+				if ( ! self::table_exists( $wpdb->prefix . 'pressark_alert_batches' ) ) {
+					return 'Alert batches table is missing.';
+				}
+				return '';
+
+			case 13:
+				$auto_table = $wpdb->prefix . 'pressark_automations';
+				if ( ! self::table_has_column( $auto_table, 'event_trigger' ) ) {
+					return 'Automations table is missing event_trigger column.';
+				}
+				if ( ! self::table_has_column( $auto_table, 'event_trigger_cooldown' ) ) {
+					return 'Automations table is missing event_trigger_cooldown column.';
+				}
+				if ( ! self::table_has_column( $auto_table, 'last_triggered_at' ) ) {
+					return 'Automations table is missing last_triggered_at column.';
+				}
+				if ( ! self::table_has_index( $auto_table, 'idx_event_trigger' ) ) {
+					return 'Automations table is missing idx_event_trigger index.';
+				}
 				return '';
 		}
 
