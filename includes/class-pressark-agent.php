@@ -279,6 +279,24 @@ class PressArk_Agent {
 		$this->task_type = $task_type;
 		$this->plan_steps = $plan['steps'];
 		$this->plan_step = 1;
+
+		// v5.2.0: Surface execution plan for multi-step transparency.
+		if ( count( $this->plan_steps ) >= 2 ) {
+			$plan_items = array();
+			foreach ( $this->plan_steps as $i => $step ) {
+				$plan_items[] = array(
+					'index'  => $i + 1,
+					'text'   => $step,
+					'status' => 0 === $i ? 'active' : 'pending',
+				);
+			}
+			$this->steps[] = array(
+				'type'    => 'plan',
+				'content' => $plan_items,
+			);
+			$emit_fn( 'plan', $plan_items );
+		}
+
 		$this->ai->resolve_for_task( $task_type, $deep_mode );
 
 		// Local heuristics guarantee critical domains (like content editing)

@@ -2719,7 +2719,7 @@
 						for (var i = 0; i < parsed.events.length; i++) {
 							var evt = parsed.events[i];
 							// Create the bubble on first meaningful content.
-							if (evt.type === 'token' || evt.type === 'step' || evt.type === 'tool_call' || evt.type === 'tool_result' || evt.type === 'done' || evt.type === 'error') {
+							if (evt.type === 'token' || evt.type === 'plan' || evt.type === 'step' || evt.type === 'tool_call' || evt.type === 'tool_result' || evt.type === 'done' || evt.type === 'error') {
 								ensureBubble();
 							}
 							self.handleStreamEvent(evt, bubble, textBuffer);
@@ -2870,6 +2870,11 @@
 					}
 					break;
 
+				case 'plan':
+					this._renderPlanCard(contentEl, event.data);
+					this._streamSegmentText = '';
+					break;
+
 				case 'step':
 					this._renderInlineStep(contentEl, event.data);
 					this._streamSegmentText = ''; // Next tokens go in a new segment.
@@ -2914,9 +2919,10 @@
 		 * re-rendering the formatted markdown doesn't clobber the step rows.
 		 */
 		_getOrCreateTextSegment: function (contentEl) {
-			// If there are no inline steps yet, the contentEl itself is the segment.
+			// If there are no inline steps or plan cards yet, the contentEl itself is the segment.
 			var steps = contentEl.querySelectorAll('.pressark-inline-step');
-			if (!steps.length) return contentEl;
+			var planCards = contentEl.querySelectorAll('.pressark-plan-card');
+			if (!steps.length && !planCards.length) return contentEl;
 
 			// Find the last child. If it's a text segment div, reuse it.
 			var last = contentEl.lastElementChild;
@@ -2929,6 +2935,51 @@
 			seg.className = 'pressark-stream-text-segment';
 			contentEl.appendChild(seg);
 			return seg;
+		},
+
+		/**
+		 * Render a collapsible execution plan card inline within the bubble.
+		 * @since 5.2.0
+		 */
+		_renderPlanCard: function (contentEl, planItems) {
+			if (!Array.isArray(planItems) || !planItems.length) return;
+
+			var card = document.createElement('div');
+			card.className = 'pressark-plan-card';
+
+			var header = document.createElement('div');
+			header.className = 'pressark-plan-header';
+			header.textContent = 'Plan';
+			header.addEventListener('click', function () {
+				card.classList.toggle('collapsed');
+			});
+			card.appendChild(header);
+
+			var list = document.createElement('ol');
+			list.className = 'pressark-plan-steps';
+
+			for (var i = 0; i < planItems.length; i++) {
+				var li = document.createElement('li');
+				li.className = 'step-' + (planItems[i].status || 'pending');
+				li.textContent = planItems[i].text || '';
+				list.appendChild(li);
+			}
+
+			card.appendChild(list);
+			contentEl.appendChild(card);
+			this.scrollToBottom();
+		},
+
+		/**
+		 * Update plan card step statuses as execution progresses.
+		 * @since 5.2.0
+		 */
+		_updatePlanStep: function (bubble, stepIndex, status) {
+			if (!bubble) return;
+			var items = bubble.querySelectorAll('.pressark-plan-steps li');
+			if (stepIndex < items.length) {
+				items[stepIndex].className = 'step-' + status;
+			}
 		},
 
 		/**
@@ -3036,8 +3087,20 @@
 				var inlineSteps = contentEl.querySelectorAll('.pressark-inline-step');
 				var hadInlineSteps = inlineSteps.length > 0;
 
+				// Detach plan cards before clearing — they survive the finalize.
+				var planCards = contentEl.querySelectorAll('.pressark-plan-card');
+				var savedPlanCards = [];
+				for (var pc = 0; pc < planCards.length; pc++) {
+					savedPlanCards.push(planCards[pc].parentNode.removeChild(planCards[pc]));
+				}
+
 				// Clear inline content and render final formatted text.
 				contentEl.innerHTML = this.renderFormattedMessage(replyText);
+
+				// Re-insert plan cards at the top.
+				for (var pc2 = savedPlanCards.length - 1; pc2 >= 0; pc2--) {
+					contentEl.insertBefore(savedPlanCards[pc2], contentEl.firstChild);
+				}
 
 				// If there were inline steps, render the final activity strip above the bubble.
 				if (result.steps && result.steps.length > 0) {

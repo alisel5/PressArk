@@ -1716,3 +1716,65 @@ body:not(.pressark-frontend) .interface-interface-skeleton {
 		width: 100%;
 	}
 }
+
+/* v5.2.0: Execution plan card */
+.pressark-plan-card {
+	margin: 8px 0;
+	border: 1px solid var(--pw-border-light);
+	border-radius: 6px;
+	overflow: hidden;
+	font-size: 12px;
+}
+
+.pressark-plan-header {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	padding: 6px 10px;
+	background: var(--pw-bg-secondary, #f8f9fa);
+	color: var(--pw-text-secondary);
+	font-weight: 500;
+	cursor: pointer;
+	user-select: none;
+}
+
+.pressark-plan-header::before {
+	content: '\25BE';
+	font-size: 10px;
+	transition: transform 0.15s ease;
+}
+
+.pressark-plan-card.collapsed .pressark-plan-header::before {
+	transform: rotate(-90deg);
+}
+
+.pressark-plan-steps {
+	margin: 0;
+	padding: 6px 10px 6px 28px;
+	list-style: decimal;
+}
+
+.pressark-plan-card.collapsed .pressark-plan-steps {
+	display: none;
+}
+
+.pressark-plan-steps li {
+	padding: 2px 0;
+	color: var(--pw-text-secondary);
+	line-height: 1.4;
+}
+
+.pressark-plan-steps li.step-active {
+	color: var(--pw-primary);
+	font-weight: 500;
+}
+
+.pressark-plan-steps li.step-completed {
+	color: var(--pw-success);
+	text-decoration: line-through;
+	opacity: 0.7;
+}
+
+.pressark-plan-steps li.step-pending {
+	opacity: 0.6;
+}
