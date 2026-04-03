@@ -16,6 +16,7 @@ class PressArk_Handler_Discovery extends PressArk_Handler_Base {
 
 	/** @var array<string, string[]> */
 	private const AVAILABLE_TOOL_CATEGORIES = array(
+		'resources'  => array( 'list_resources', 'read_resource' ),
 		'content'    => array( 'read_content', 'search_content', 'edit_content', 'update_meta', 'create_post', 'delete_content', 'list_posts' ),
 		'seo'        => array( 'analyze_seo', 'fix_seo' ),
 		'security'   => array( 'scan_security', 'fix_security' ),
@@ -531,6 +532,162 @@ class PressArk_Handler_Discovery extends PressArk_Handler_Base {
 	}
 
 	/**
+	 * List available site resources.
+	 *
+	 * @since 5.1.0
+	 */
+	public function list_resources( array $params ): array {
+		$group = sanitize_text_field( $params['group'] ?? '' );
+
+		$resources = PressArk_Resource_Registry::list(
+			'' !== $group ? $group : null
+		);
+
+		if ( empty( $resources ) ) {
+			if ( '' !== $group ) {
+				return $this->success(
+					sprintf(
+						/* translators: 1: resource group name, 2: available groups */
+						__( 'No resources in group "%1$s". Available groups: %2$s', 'pressark' ),
+						$group,
+						implode( ', ', PressArk_Resource_Registry::group_names() )
+					)
+				);
+			}
+			return $this->success( __( 'No resources available.', 'pressark' ) );
+		}
+
+		$lines = array();
+		$by_group = array();
+		foreach ( $resources as $res ) {
+			$by_group[ $res['group'] ][] = $res;
+		}
+
+		foreach ( $by_group as $grp => $items ) {
+			$lines[] = strtoupper( $grp ) . ':';
+			foreach ( $items as $res ) {
+				$lines[] = sprintf( '  %s — %s (%s)', $res['uri'], $res['name'], $res['description'] );
+			}
+		}
+
+		return array(
+			'success' => true,
+			'message' => implode( "\n", $lines ),
+			'data'    => $resources,
+		);
+	}
+
+	/**
+	 * Read a specific resource by URI.
+	 *
+	 * @since 5.1.0
+	 */
+	public function read_resource( array $params ): array {
+		$uri = sanitize_text_field( $params['uri'] ?? '' );
+
+		if ( '' === $uri ) {
+			return $this->error( __( 'Missing "uri" parameter. Use list_resources first to see available resource URIs.', 'pressark' ) );
+		}
+
+		$result = PressArk_Resource_Registry::read( $uri );
+
+		if ( ! ( $result['success'] ?? false ) ) {
+			return $this->error( $result['error'] ?? __( 'Failed to read resource.', 'pressark' ) );
+		}
+
+		$data   = $result['data'];
+		$cached = $result['cached'] ?? false;
+
+		// Format for AI consumption.
+		$message = wp_json_encode( $data, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES );
+		if ( $cached ) {
+			$message .= "\n(cached)";
+		}
+
+		return array(
+			'success' => true,
+			'message' => $message,
+			'data'    => $data,
+		);
+	}
+
+	/**
+	 * Record a site observation for future conversations.
+	 *
+	 * @param array $params { note: string, category: string }.
+	 * @return array Success or error response.
+	 */
+	public function site_note( array $params ): array {
+		if ( ! current_user_can( 'manage_options' ) ) {
+			return $this->error( __( 'You do not have permission to record site notes.', 'pressark' ) );
+		}
+
+		$note = sanitize_text_field( $params['note'] ?? '' );
+		if ( '' === $note ) {
+			return $this->error( __( 'Missing "note" parameter.', 'pressark' ) );
+		}
+		if ( mb_strlen( $note ) > 200 ) {
+			$note = mb_substr( $note, 0, 200 );
+		}
+
+		$allowed_categories = array( 'content', 'products', 'technical', 'preferences', 'issues' );
+		$category           = sanitize_text_field( $params['category'] ?? '' );
+		if ( ! in_array( $category, $allowed_categories, true ) ) {
+			return $this->error(
+				__( 'Invalid category. Must be one of: ', 'pressark' ) . implode( ', ', $allowed_categories )
+			);
+		}
+
+		$raw   = get_option( 'pressark_site_notes', '[]' );
+		$notes = json_decode( is_string( $raw ) ? $raw : '[]', true );
+		if ( ! is_array( $notes ) ) {
+			$notes = array();
+		}
+
+		// Dedup: if a very similar note exists in the same category, update it instead.
+		foreach ( $notes as $idx => $existing ) {
+			if ( ( $existing['category'] ?? '' ) === $category
+				&& self::word_similarity( strtolower( $existing['note'] ?? '' ), strtolower( $note ) ) > 0.8
+			) {
+				$notes[ $idx ]['created_at'] = current_time( 'mysql' );
+				$notes[ $idx ]['note']       = $note;
+				update_option( 'pressark_site_notes', wp_json_encode( array_values( $notes ) ), false );
+
+				return $this->success(
+					sprintf(
+						/* translators: 1: category name */
+						__( 'Updated existing site note under "%1$s". %2$d notes stored.', 'pressark' ),
+						$category,
+						count( $notes )
+					)
+				);
+			}
+		}
+
+		$notes[] = array(
+			'note'       => $note,
+			'category'   => $category,
+			'created_at' => current_time( 'mysql' ),
+		);
+
+		// FIFO: keep max 50 entries.
+		if ( count( $notes ) > 50 ) {
+			$notes = array_slice( $notes, -50 );
+		}
+
+		update_option( 'pressark_site_notes', wp_json_encode( $notes ), false );
+
+		return $this->success(
+			sprintf(
+				/* translators: 1: category name */
+				__( 'Site note recorded under "%1$s". %2$d notes stored.', 'pressark' ),
+				$category,
+				count( $notes )
+			)
+		);
+	}
+
+	/**
 	 * Build the category map used by get_available_tools.
 	 *
 	 * @return array<string, string[]>
@@ -563,5 +720,139 @@ class PressArk_Handler_Discovery extends PressArk_Handler_Base {
 		}
 
 		return $categories;
+	}
+
+	// ── Site Notes Utilities ─────────────────────────────────────────
+
+	/**
+	 * Jaccard word similarity between two strings.
+	 *
+	 * @return float 0.0–1.0
+	 */
+	public static function word_similarity( string $a, string $b ): float {
+		$words_a = array_unique( preg_split( '/\s+/', trim( $a ), -1, PREG_SPLIT_NO_EMPTY ) );
+		$words_b = array_unique( preg_split( '/\s+/', trim( $b ), -1, PREG_SPLIT_NO_EMPTY ) );
+
+		if ( empty( $words_a ) || empty( $words_b ) ) {
+			return 0.0;
+		}
+
+		$intersection = count( array_intersect( $words_a, $words_b ) );
+		$union        = count( array_unique( array_merge( $words_a, $words_b ) ) );
+
+		return 0 === $union ? 0.0 : (float) $intersection / $union;
+	}
+
+	/**
+	 * Weekly cron callback: consolidate site notes.
+	 *
+	 * Deduplicates similar notes in the same category, prunes stale
+	 * issues (>90 days), and caps total at 40 entries.
+	 */
+	public static function consolidate_site_notes(): void {
+		$raw   = get_option( 'pressark_site_notes', '[]' );
+		$notes = json_decode( is_string( $raw ) ? $raw : '[]', true );
+
+		if ( empty( $notes ) || ! is_array( $notes ) ) {
+			return;
+		}
+
+		$consolidated = array();
+
+		foreach ( $notes as $note ) {
+			$text = strtolower( trim( $note['note'] ?? '' ) );
+			$cat  = $note['category'] ?? 'technical';
+
+			if ( '' === $text ) {
+				continue;
+			}
+
+			// Dedup: if a very similar note exists in the same category, keep the newer one.
+			$dominated = false;
+			foreach ( $consolidated as $i => $existing ) {
+				if ( ( $existing['category'] ?? '' ) === $cat ) {
+					if ( self::word_similarity( $text, strtolower( $existing['note'] ?? '' ) ) > 0.8 ) {
+						if ( ( $note['created_at'] ?? '' ) > ( $existing['created_at'] ?? '' ) ) {
+							$consolidated[ $i ] = $note;
+						}
+						$dominated = true;
+						break;
+					}
+				}
+			}
+
+			if ( ! $dominated ) {
+				$consolidated[] = $note;
+			}
+		}
+
+		// Prune issues older than 90 days.
+		$cutoff       = gmdate( 'Y-m-d H:i:s', strtotime( '-90 days' ) );
+		$consolidated = array_filter( $consolidated, static function ( $n ) use ( $cutoff ) {
+			if ( 'issues' === ( $n['category'] ?? '' ) && ( $n['created_at'] ?? '' ) < $cutoff ) {
+				return false;
+			}
+			return true;
+		} );
+
+		// Sort by created_at and cap at 40 (headroom below 50 cap).
+		$consolidated = array_values( $consolidated );
+		usort( $consolidated, static function ( $a, $b ) {
+			return strcmp( $a['created_at'] ?? '', $b['created_at'] ?? '' );
+		} );
+
+		if ( count( $consolidated ) > 40 ) {
+			$consolidated = array_slice( $consolidated, -40 );
+		}
+
+		update_option( 'pressark_site_notes', wp_json_encode( $consolidated ), false );
+	}
+
+	/**
+	 * Lightweight site notes formatter for non-agent callers (chat, workflow).
+	 *
+	 * Groups notes by category (last 5 per category), applies a 2400-char
+	 * budget cap, and returns the formatted string ready to append to context.
+	 *
+	 * @return string Formatted notes block or empty string.
+	 */
+	public static function format_site_notes_basic(): string {
+		$raw   = get_option( 'pressark_site_notes', '[]' );
+		$notes = json_decode( is_string( $raw ) ? $raw : '[]', true );
+
+		if ( empty( $notes ) || ! is_array( $notes ) ) {
+			return '';
+		}
+
+		$grouped = array();
+		foreach ( $notes as $entry ) {
+			if ( ! is_array( $entry ) || empty( $entry['note'] ) || empty( $entry['category'] ) ) {
+				continue;
+			}
+			$cat = sanitize_text_field( (string) $entry['category'] );
+			$grouped[ $cat ][] = sanitize_text_field( (string) $entry['note'] );
+		}
+
+		if ( empty( $grouped ) ) {
+			return '';
+		}
+
+		$note_parts = array();
+		foreach ( $grouped as $cat => $items ) {
+			$note_parts[] = ucfirst( $cat ) . ': ' . implode( '; ', array_slice( $items, -5 ) );
+		}
+
+		$text = "\nSite Notes: " . implode( ' | ', $note_parts );
+
+		// Hard cap: ~600 tokens.
+		if ( strlen( $text ) > 2400 ) {
+			// Trim categories with most entries first.
+			while ( strlen( $text ) > 2400 && count( $note_parts ) > 1 ) {
+				array_shift( $note_parts );
+				$text = "\nSite Notes: " . implode( ' | ', $note_parts );
+			}
+		}
+
+		return $text;
 	}
 }

@@ -820,6 +820,39 @@ class PressArk_Chat {
 			$checkpoint_data = $server_checkpoint->to_array();
 		}
 
+		// v5.2.0: Sync pending confirm actions into checkpoint so the model
+		// knows prior proposed writes were NOT applied when the user sends
+		// a follow-up message instead of clicking Approve.
+		// Also clears stale pending entries when the run has been settled
+		// (user clicked Approve since the last message).
+		if ( $chat_id > 0 && ! empty( $checkpoint_data ) ) {
+			$run_store_preflight = new PressArk_Run_Store();
+			$pending_confirm     = $run_store_preflight->get_pending_confirm_actions( $user_id, $chat_id );
+			$cp                  = PressArk_Checkpoint::from_array( $checkpoint_data );
+
+			if ( ! empty( $pending_confirm ) ) {
+				// Active awaiting_confirm run — populate pending entries.
+				$cp->clear_pending();
+				foreach ( $pending_confirm as $pa ) {
+					$name   = $pa['name'] ?? $pa['type'] ?? 'unknown_action';
+					$target = '';
+					$args   = $pa['arguments'] ?? $pa['params'] ?? array();
+					if ( ! empty( $args['post_id'] ) ) {
+						$target = 'post #' . $args['post_id'];
+					} elseif ( ! empty( $args['title'] ) ) {
+						$target = '"' . $args['title'] . '"';
+					}
+					$cp->add_pending( $name, $target ?: 'site', 'NOT YET APPLIED — awaiting user approval' );
+				}
+			} elseif ( $cp->has_unapplied_confirms() ) {
+				// No awaiting_confirm run but stale entries remain (user
+				// clicked Approve since last message) — clear them.
+				$cp->clear_pending();
+			}
+
+			$checkpoint_data = $cp->to_array();
+		}
+
 		if ( $chat_id > 0 ) {
 			$chat_history  = new PressArk_Chat_History();
 			$stored_chat   = $chat_history->get_chat( $chat_id );
@@ -1446,6 +1479,7 @@ class PressArk_Chat {
 		// Build compact context — dynamic part only (cached part in connector).
 		$context      = new PressArk_Context();
 		$context_text = $context->build( $screen, $post_id );
+		$context_text .= PressArk_Handler_Discovery::format_site_notes_basic();
 
 		// v3.3.0: Inject retrieval-grounded content from the content index.
 		$content_index     = new PressArk_Content_Index();

@@ -198,6 +198,10 @@ class PressArk_Tools {
 		$tools[] = self::get_site_map();
 		$tools[] = self::get_brand_profile();
 		$tools[] = self::get_available_tools();
+		$tools[] = self::site_note();
+		// Resource Bridge (v5.1.0).
+		$tools[] = self::list_resources();
+		$tools[] = self::read_resource();
 
 		// Plugin Management (Prompt 12 Part B).
 		$tools[] = self::list_plugins();
@@ -317,7 +321,8 @@ class PressArk_Tools {
 	 */
 	public const TOOL_GROUPS = array(
 		'discovery' => array(
-			'get_site_overview', 'get_site_map', 'get_brand_profile', 'get_available_tools',
+			'get_site_overview', 'get_site_map', 'get_brand_profile', 'get_available_tools', 'site_note',
+			'list_resources', 'read_resource',
 		),
 		'core' => array(
 			'read_content', 'search_content', 'edit_content', 'update_meta',
@@ -1057,7 +1062,7 @@ class PressArk_Tools {
 			'name'        => 'bulk_edit_products',
 			'description' => 'Update multiple WooCommerce products at once.',
 			'params'      => array(
-				array( 'name' => 'products', 'required' => false, 'desc' => 'Array of {post_id, changes} objects; inside changes, plain price maps to regular_price and stock maps to stock_quantity' ),
+				array( 'name' => 'products', 'required' => false, 'desc' => 'Array of objects, each with post_id (int) and a changes object: [{post_id: 10, changes: {description: "New text"}}, {post_id: 11, changes: {short_description: "...", regular_price: "19.99"}}]. Use this when each product gets different values.' ),
 				array( 'name' => 'scope', 'required' => false, 'desc' => 'Use "all" or "matching" to target many products without enumerating them one by one' ),
 				array( 'name' => 'changes', 'required' => false, 'desc' => 'Shared changes for scope-based bulk updates. Supports price_delta and price_adjust_pct for relative price changes.' ),
 				array( 'name' => 'status', 'required' => false, 'desc' => 'Optional product status filter for scope-based bulk updates. Default: publish' ),
@@ -1946,6 +1951,39 @@ class PressArk_Tools {
 			'description' => 'List available tools beyond current set. Use when needing unlisted capabilities.',
 			'params'      => array(
 				array( 'name' => 'category', 'required' => false, 'desc' => 'media|comments|users|email|health|scheduled|generation|bulk|export|profile|logs|index|plugins|themes|database|woocommerce|elementor' ),
+			),
+		);
+	}
+
+	private static function site_note(): array {
+		return array(
+			'name'        => 'site_note',
+			'description' => 'Record a site observation for future conversations. Use when discovering patterns, preferences, or issues.',
+			'params'      => array(
+				array( 'name' => 'note', 'required' => true, 'desc' => 'Observation to record (max 200 chars)' ),
+				array( 'name' => 'category', 'required' => true, 'desc' => 'content|products|technical|preferences|issues' ),
+			),
+		);
+	}
+
+	// ── Resource Bridge (v5.1.0) ──────────────────────────────────────
+
+	private static function list_resources(): array {
+		return array(
+			'name'        => 'list_resources',
+			'description' => 'List available site resources (design tokens, templates, REST routes, schemas). Each resource has a URI you can pass to read_resource.',
+			'params'      => array(
+				array( 'name' => 'group', 'required' => false, 'desc' => 'Filter by resource group: site, design, templates, schema, rest, woocommerce, elementor' ),
+			),
+		);
+	}
+
+	private static function read_resource(): array {
+		return array(
+			'name'        => 'read_resource',
+			'description' => 'Read a site resource by URI. Returns cached data (design system, templates, post type schema, REST routes, etc.). Use list_resources first to see available URIs.',
+			'params'      => array(
+				array( 'name' => 'uri', 'required' => true, 'desc' => 'Resource URI from list_resources (e.g., pressark://design/theme-json, pressark://schema/post-types)' ),
 			),
 		);
 	}

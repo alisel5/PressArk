@@ -374,6 +374,30 @@ class PressArk_Checkpoint {
 		$this->pending = array();
 	}
 
+	/**
+	 * Get all pending action entries.
+	 *
+	 * @since 5.2.0
+	 * @return array[]
+	 */
+	public function get_pending(): array {
+		return $this->pending;
+	}
+
+	/**
+	 * Check if any pending entries are unapplied confirm actions.
+	 *
+	 * @since 5.2.0
+	 */
+	public function has_unapplied_confirms(): bool {
+		foreach ( $this->pending as $p ) {
+			if ( str_contains( $p['detail'] ?? '', 'NOT YET APPLIED' ) ) {
+				return true;
+			}
+		}
+		return false;
+	}
+
 	public function add_constraint( string $constraint ): void {
 		$this->constraints[] = sanitize_text_field( $constraint );
 	}

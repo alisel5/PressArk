@@ -38,6 +38,7 @@ class PressArk_Tool_Catalog {
 		'get_site_map'             => 'read',
 		'get_brand_profile'        => 'read',
 		'get_available_tools'      => 'read',
+		'site_note'                => 'read',
 
 		// Content — reads.
 		'read_content'             => 'read',
@@ -254,6 +255,10 @@ class PressArk_Tool_Catalog {
 		'load_tool_group'          => 'read',
 		'discover_tools'           => 'read',
 		'load_tools'               => 'read',
+
+		// Resource bridge (v5.1.0).
+		'list_resources'           => 'read',
+		'read_resource'            => 'read',
 	);
 
 	// ── Group Keyword Patterns ──────────────────────────────────────────
@@ -587,8 +592,16 @@ class PressArk_Tool_Catalog {
 			return '';
 		}
 
-		return "TOOL GROUPS (discover_tools to search, load_tools to activate):\n"
+		$map = "TOOL GROUPS (discover_tools to search, load_tools to activate):\n"
 			. implode( "\n", $lines );
+
+		// v5.1.0: Append resource summary when bridge is available.
+		$resource_context = PressArk_Capability_Bridge::get_context_resources( $loaded_groups );
+		if ( '' !== $resource_context ) {
+			$map .= "\n\n" . $resource_context;
+		}
+
+		return $map;
 	}
 
 	/**
@@ -822,7 +835,14 @@ class PressArk_Tool_Catalog {
 			$results[] = $item;
 		}
 
-		return $results;
+		// v5.1.0: Also search resources and append matches.
+		$resource_matches = PressArk_Resource_Registry::search( $query );
+		foreach ( $resource_matches as $rm ) {
+			unset( $rm['score'] );
+			$results[] = $rm;
+		}
+
+		return array_slice( $results, 0, 25 );
 	}
 
 	/**

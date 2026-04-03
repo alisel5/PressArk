@@ -127,7 +127,9 @@ class PressArk_Tool_Loader {
 			$schemas[] = PressArk_Tools::tool_to_schema( $tool );
 		}
 
-		// No meta-tools needed — model searches natively.
+		// No discover/load meta-tools needed — model searches natively.
+		// Resource tools (list_resources, read_resource) ARE included in
+		// the full tool set since they're registered in get_all().
 
 		// Canonical sort for cache stability.
 		usort( $schemas, function ( $a, $b ) {
@@ -139,11 +141,16 @@ class PressArk_Tool_Loader {
 			$tool_names[] = $s['function']['name'] ?? '';
 		}
 
+		// v5.1.0: Include resource context so the model knows what
+		// resources are available via list_resources / read_resource.
+		$groups       = PressArk_Operation_Registry::group_names();
+		$resource_ctx = PressArk_Capability_Bridge::get_context_resources( $groups );
+
 		return array(
 			'schemas'        => $schemas,
 			'descriptors'    => '',
-			'capability_map' => '',
-			'groups'         => PressArk_Operation_Registry::group_names(),
+			'capability_map' => $resource_ctx,
+			'groups'         => $groups,
 			'strategy'       => 'native_search',
 			'tool_count'     => count( $schemas ),
 			'tool_names'     => $tool_names,

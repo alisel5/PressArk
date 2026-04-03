@@ -214,6 +214,45 @@ class PressArk_Run_Store {
 		return $this->decode_row( $row );
 	}
 
+	/**
+	 * Find the most recent run awaiting confirmation for a chat.
+	 *
+	 * Returns the pending_actions array if found, null otherwise.
+	 * Used to inject pending-confirm context into follow-up messages
+	 * so the model knows actions were NOT yet applied.
+	 *
+	 * @since 5.2.0
+	 * @param int $user_id User ID.
+	 * @param int $chat_id Chat ID.
+	 * @return array|null Decoded pending_actions, or null.
+	 */
+	public function get_pending_confirm_actions( int $user_id, int $chat_id ): ?array {
+		if ( $chat_id <= 0 ) {
+			return null;
+		}
+
+		global $wpdb;
+		$table = self::table_name();
+
+		$json = $wpdb->get_var( $wpdb->prepare(
+			"SELECT pending_actions FROM {$table}
+			 WHERE user_id = %d
+			 AND chat_id = %d
+			 AND status IN ('awaiting_confirm', 'partially_confirmed')
+			 ORDER BY created_at DESC
+			 LIMIT 1",
+			$user_id,
+			$chat_id
+		) );
+
+		if ( ! is_string( $json ) || '' === $json ) {
+			return null;
+		}
+
+		$decoded = json_decode( $json, true );
+		return is_array( $decoded ) && ! empty( $decoded ) ? $decoded : null;
+	}
+
 	// ── Lifecycle Transitions ────────────────────────────────────────
 
 	/**

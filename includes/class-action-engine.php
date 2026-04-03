@@ -96,6 +96,16 @@ class PressArk_Action_Engine {
 
 			$params = $action['params'] ?? array();
 
+			// v5.3.0: Pre-permission input validation (fail-fast before approval).
+			$validation = PressArk_Operation_Registry::validate_input( $type, $params );
+			if ( ! ( $validation['valid'] ?? true ) ) {
+				return array(
+					'success'     => false,
+					'message'     => $validation['message'] ?? __( 'Invalid input for this tool.', 'pressark' ),
+					'action_type' => $type,
+				);
+			}
+
 			$tool_group      = PressArk_Operation_Registry::get_group( $type );
 			$tool_capability = PressArk_Operation_Registry::classify( $type, $params );
 
@@ -120,9 +130,21 @@ class PressArk_Action_Engine {
 				}
 			}
 
+			// v5.3.0: Fire pre_execute policy hooks.
+			$pre_hooks = PressArk_Operation_Registry::get_policy_hooks( $type, 'pre_execute' );
+			foreach ( $pre_hooks as $hook_name ) {
+				$params = apply_filters( $hook_name, $params, $type );
+			}
+
 			$result = $this->dispatch( $type, $params );
 
 			$result['action_type'] = $type;
+
+			// v5.3.0: Fire post_execute policy hooks.
+			$post_hooks = PressArk_Operation_Registry::get_policy_hooks( $type, 'post_execute' );
+			foreach ( $post_hooks as $hook_name ) {
+				$result = apply_filters( $hook_name, $result, $type, $params );
+			}
 
 			if ( ( $result['success'] ?? false ) && ! empty( $tool_group ) && 'read' !== $tool_capability ) {
 				PressArk_Entitlements::record_group_usage( $tool_group );

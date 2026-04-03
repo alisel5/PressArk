@@ -115,7 +115,7 @@ class PressArk_Admin {
 
 		add_settings_field(
 			'pressark_summarize_model',
-			__( 'Context Compression Model', 'pressark' ),
+			__( 'Back-Agent', 'pressark' ),
 			array( $this, 'render_summarize_model_field' ),
 			'pressark',
 			'pressark_api_section'
@@ -781,7 +781,7 @@ class PressArk_Admin {
 		$upgrade_url  = pressark_get_upgrade_url();
 		$models       = $this->get_supported_model_options();
 		$descriptions = $this->get_model_option_descriptions(
-			__( 'Auto mode uses DeepSeek V3.2 for task-aware context compression. This affects continuation capsules only, not normal chat execution.', 'pressark' )
+			__( 'Auto mode uses a cheap model for background tasks: planning, context compression, and memory selection. Does not affect chat responses.', 'pressark' )
 		);
 		?>
 		<select name="pressark_summarize_model" id="pressark-summarize-model-select">
@@ -847,7 +847,7 @@ class PressArk_Admin {
 			<?php esc_html_e( 'Auto mode uses DeepSeek V3.2 for task-aware context compression. This affects continuation capsules only, not normal chat execution.', 'pressark' ); ?>
 		</p>
 		<p class="description" style="margin-top:4px;">
-			<?php esc_html_e( 'Used only when PressArk compacts a long-running request into a continuation capsule.', 'pressark' ); ?>
+			<?php esc_html_e( 'Handles task planning, context compression, and memory selection behind the scenes. A cheaper model saves credits without affecting response quality.', 'pressark' ); ?>
 		</p>
 
 		<?php if ( ! $is_pro ) : ?>

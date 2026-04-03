@@ -20,6 +20,13 @@ class PressArk_Cron_Manager {
 	public static function register_hooks(): void {
 		add_filter( 'cron_schedules', array( self::class, 'register_cron_schedules' ) );
 		add_action( 'pressark_cleanup_tasks', array( self::class, 'handle_task_cleanup' ) );
+		add_action( 'pressark_consolidate_site_notes', array( 'PressArk_Handler_Discovery', 'consolidate_site_notes' ) );
+
+		// Backfill: schedule consolidation cron for upgraded installs that
+		// missed the activation hook (cron was added after initial install).
+		if ( ! wp_next_scheduled( 'pressark_consolidate_site_notes' ) ) {
+			wp_schedule_event( time(), 'weekly', 'pressark_consolidate_site_notes' );
+		}
 	}
 
 	/**
@@ -124,6 +131,9 @@ class PressArk_Cron_Manager {
 		if ( ! wp_next_scheduled( 'pressark_cleanup_tasks' ) ) {
 			wp_schedule_event( time(), 'daily', 'pressark_cleanup_tasks' );
 		}
+		if ( ! wp_next_scheduled( 'pressark_consolidate_site_notes' ) ) {
+			wp_schedule_event( time(), 'weekly', 'pressark_consolidate_site_notes' );
+		}
 	}
 
 	/**
@@ -151,5 +161,6 @@ class PressArk_Cron_Manager {
 		self::unschedule_background_hook( 'pressark_automation_wake' );
 		wp_clear_scheduled_hook( 'pressark_kick_as_runner' );
 		wp_clear_scheduled_hook( 'pressark_caps_continue_user_migration' );
+		wp_clear_scheduled_hook( 'pressark_consolidate_site_notes' );
 	}
 }

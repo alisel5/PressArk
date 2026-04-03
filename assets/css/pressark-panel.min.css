@@ -479,6 +479,45 @@
 	background: var(--pw-primary-subtle) !important;
 }
 
+/* ── Contextual Suggestion Chips (after AI responses) ── */
+
+.pressark-suggestion-chips {
+	padding: 2px 16px 12px !important;
+	gap: 6px !important;
+}
+
+.pressark-panel .pressark-chip {
+	display: inline-flex !important;
+	align-items: center !important;
+	background: var(--pw-primary-subtle) !important;
+	border: 1px solid var(--pw-primary-border) !important;
+	border-radius: 20px !important;
+	padding: 5px 13px !important;
+	margin: 0 !important;
+	font-size: 12px !important;
+	line-height: 1.4 !important;
+	color: var(--pw-primary) !important;
+	cursor: pointer !important;
+	transition: all 0.15s ease !important;
+	font-family: inherit !important;
+	font-weight: 500 !important;
+	box-shadow: none !important;
+	text-decoration: none !important;
+	outline: none !important;
+	white-space: nowrap !important;
+}
+
+.pressark-panel .pressark-chip:hover {
+	background: var(--pw-primary) !important;
+	border-color: var(--pw-primary) !important;
+	color: #fff !important;
+}
+
+.pressark-panel .pressark-chip:focus-visible {
+	outline: 2px solid var(--pw-primary) !important;
+	outline-offset: 2px !important;
+}
+
 /* ============ ACTION RESULTS ============ */
 
 .pressark-action-result {

@@ -576,6 +576,24 @@ class PressArk_Handler_WooCommerce extends PressArk_Handler_Base {
 
 	private function resolve_bulk_product_updates( array $params ): array {
 		$products = $params['products'] ?? array();
+
+		// v5.2.0: Models often emit large arrays as JSON-encoded strings
+		// instead of native JSON arrays. The string may also contain
+		// broken JSON (e.g., unescaped quotes like 15\" for inch marks).
+		// Strategy: try json_decode first; on failure, extract objects
+		// individually with regex as a robust fallback.
+		if ( is_string( $products ) && '' !== $products ) {
+			$decoded = json_decode( $products, true );
+			if ( is_array( $decoded ) ) {
+				$products = $decoded;
+			} else {
+				// Fallback: extract {post_id, changes} objects individually.
+				// Each object is self-contained; one broken description
+				// shouldn't prevent the other 7 from being parsed.
+				$products = $this->extract_product_objects_from_string( $products );
+			}
+		}
+
 		if ( ! empty( $products ) && is_array( $products ) ) {
 			$normalized = array();
 			foreach ( $products as $product_update ) {
@@ -583,7 +601,8 @@ class PressArk_Handler_WooCommerce extends PressArk_Handler_Base {
 					continue;
 				}
 
-				$post_id = absint( $product_update['post_id'] ?? 0 );
+				// Accept post_id, id, or product_id — models often use 'id'.
+				$post_id = absint( $product_update['post_id'] ?? $product_update['id'] ?? $product_update['product_id'] ?? 0 );
 				if ( $post_id <= 0 ) {
 					continue;
 				}
@@ -614,6 +633,12 @@ class PressArk_Handler_WooCommerce extends PressArk_Handler_Base {
 		}
 
 		$changes = $params['changes'] ?? array();
+		if ( is_string( $changes ) && '' !== $changes ) {
+			$decoded = json_decode( $changes, true );
+			if ( is_array( $decoded ) ) {
+				$changes = $decoded;
+			}
+		}
 		$changes = is_array( $changes ) ? $this->normalize_product_changes( $changes ) : array();
 		if ( empty( $changes ) ) {
 			return array(
@@ -3910,6 +3935,160 @@ class PressArk_Handler_WooCommerce extends PressArk_Handler_Base {
 		array_unshift( $log, $entry );
 		$log = array_slice( $log, 0, 100 );
 		update_option( 'pressark_email_log', $log, false );
+	}
+
+	/**
+	 * Extract product objects from a string that fails json_decode.
+	 *
+	 * Models sometimes produce JSON strings with broken escaping (e.g.,
+	 * 15\" for an inch mark inside a description). Rather than trying to
+	 * repair the full JSON, we isolate each top-level object by tracking
+	 * brace depth and string boundaries, then try to decode each one
+	 * individually. Objects that fail are skipped with a logged warning.
+	 *
+	 * @since 5.2.0
+	 * @param string $raw The string-encoded products array.
+	 * @return array Decoded product objects that parsed successfully.
+	 */
+	private function extract_product_objects_from_string( string $raw ): array {
+		$raw = trim( $raw );
+		if ( '' === $raw || '[' !== $raw[0] ) {
+			return array();
+		}
+
+		// Strip outer brackets.
+		$inner = trim( substr( $raw, 1, -1 ) );
+		if ( '' === $inner ) {
+			return array();
+		}
+
+		// Walk the string tracking depth and string state to find
+		// the boundaries of each top-level { ... } object.
+		$len       = strlen( $inner );
+		$depth     = 0;
+		$in_string = false;
+		$escape    = false;
+		$obj_start = null;
+		$objects   = array();
+
+		for ( $i = 0; $i < $len; $i++ ) {
+			$c = $inner[ $i ];
+
+			if ( $escape ) {
+				$escape = false;
+				continue;
+			}
+			if ( '\\' === $c && $in_string ) {
+				$escape = true;
+				continue;
+			}
+			if ( '"' === $c ) {
+				$in_string = ! $in_string;
+				continue;
+			}
+			if ( $in_string ) {
+				continue;
+			}
+			if ( '{' === $c ) {
+				if ( 0 === $depth ) {
+					$obj_start = $i;
+				}
+				$depth++;
+			}
+			if ( '}' === $c ) {
+				$depth--;
+				if ( 0 === $depth && null !== $obj_start ) {
+					$objects[] = substr( $inner, $obj_start, $i - $obj_start + 1 );
+					$obj_start = null;
+				}
+			}
+		}
+
+		// Try to decode each object individually.
+		$products = array();
+		foreach ( $objects as $idx => $obj_str ) {
+			$obj = json_decode( $obj_str, true );
+			if ( is_array( $obj ) && ! empty( $obj['post_id'] ?? $obj['id'] ?? 0 ) ) {
+				$products[] = $obj;
+				continue;
+			}
+
+			// Last resort: try to at least extract post_id and description
+			// from the broken object with regex.
+			$pid = 0;
+			if ( preg_match( '/"post_id"\s*:\s*(\d+)/', $obj_str, $m ) ) {
+				$pid = (int) $m[1];
+			} elseif ( preg_match( '/"id"\s*:\s*(\d+)/', $obj_str, $m ) ) {
+				$pid = (int) $m[1];
+			}
+
+			if ( $pid > 0 ) {
+				$changes = array();
+				// Extract string values by walking from the key to the closing quote,
+				// handling the \" ambiguity by checking if the char after the quote
+				// is a JSON structural character (end of value) or content (stray escape).
+				foreach ( array( 'description', 'short_description' ) as $field ) {
+					$pattern = '/"' . $field . '"\s*:\s*"/';
+					if ( preg_match( $pattern, $obj_str, $fm, PREG_OFFSET_CAPTURE ) ) {
+						$val_start = $fm[0][1] + strlen( $fm[0][0] );
+						$val       = '';
+						$j         = $val_start;
+						$obj_len   = strlen( $obj_str );
+						$esc       = false;
+
+						while ( $j < $obj_len ) {
+							$ch = $obj_str[ $j ];
+
+							if ( $esc ) {
+								$val .= $ch;
+								$esc  = false;
+								$j++;
+								continue;
+							}
+
+							if ( '\\' === $ch && $j + 1 < $obj_len && '"' === $obj_str[ $j + 1 ] ) {
+								// Is this \" the JSON string-close or a stray content escape?
+								$after = $j + 2 < $obj_len ? $obj_str[ $j + 2 ] : '';
+								if ( preg_match( '/[\s,}\]]/', $after ) || '' === $after ) {
+									break; // Real end of JSON string value.
+								}
+								// Stray content escape (e.g. 15\") — keep the quote, drop the backslash.
+								$val .= '"';
+								$j   += 2;
+								continue;
+							}
+
+							if ( '\\' === $ch ) {
+								$val .= $ch;
+								$esc  = true;
+								$j++;
+								continue;
+							}
+
+							if ( '"' === $ch ) {
+								break; // Unescaped close quote.
+							}
+
+							$val .= $ch;
+							$j++;
+						}
+
+						if ( '' !== $val ) {
+							$changes[ $field ] = $val;
+						}
+					}
+				}
+
+				if ( ! empty( $changes ) ) {
+					$products[] = array(
+						'post_id' => $pid,
+						'changes' => $changes,
+					);
+				}
+			}
+		}
+
+		return $products;
 	}
 
 	private function normalize_product_changes( array $changes ): array {

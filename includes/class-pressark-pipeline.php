@@ -253,6 +253,7 @@ class PressArk_Pipeline {
 			'silent_continuation',
 			'verification',
 			'checkpoint',
+			'suggestions',
 		) as $field ) {
 			if ( array_key_exists( $field, $result ) ) {
 				$data[ $field ] = $result[ $field ];

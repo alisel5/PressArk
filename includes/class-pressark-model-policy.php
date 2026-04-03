@@ -160,6 +160,12 @@ class PressArk_Model_Policy {
 			'premium'     => 'anthropic/claude-sonnet-4.6',
 			'needs_tools' => false,
 		),
+		'memory_selection' => array(
+			'economy'     => 'deepseek/deepseek-v3.2',
+			'standard'    => 'deepseek/deepseek-v3.2',
+			'premium'     => 'anthropic/claude-sonnet-4.6',
+			'needs_tools' => false,
+		),
 		// Structured context compression stays on the cheapest model.
 		// DeepSeek V3.2 is the cheapest bundled model for compression.
 		'summarize' => array(
@@ -391,14 +397,17 @@ class PressArk_Model_Policy {
 	 * @return string
 	 */
 	public static function for_phase( string $phase, string $tier, array $context = array() ): string {
-		if ( 'summarize' === $phase ) {
+		// Back-Agent phases: planning, compression, memory selection.
+		// All share the pressark_summarize_model setting (renamed "Back-Agent" in UI).
+		$back_agent_phases = array( 'summarize', 'classification', 'memory_selection' );
+		if ( in_array( $phase, $back_agent_phases, true ) ) {
 			$configured = get_option( 'pressark_summarize_model', 'auto' );
 			if ( 'custom' === $configured ) {
 				$configured = sanitize_text_field( (string) get_option( 'pressark_summarize_custom_model', '' ) );
 			}
 			if ( '' !== $configured && 'auto' !== $configured ) {
 				if ( in_array( $configured, self::PRO_MODELS, true ) && ! PressArk_Entitlements::is_paid_tier( $tier ) ) {
-					return self::PHASE_ROUTING['summarize']['economy'];
+					return self::PHASE_ROUTING[ $phase ]['economy'] ?? self::PHASE_ROUTING['summarize']['economy'];
 				}
 				return $configured;
 			}

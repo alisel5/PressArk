@@ -5,6 +5,10 @@
  * v3.4.0: Replaces scattered tool metadata with one central contract layer.
  * v3.4.1: Becomes the authoritative source — all group membership, entitlements,
  *         discovery, and loading derive from this registry. TOOL_GROUPS is deprecated.
+ * v5.3.0: Extended execution contract — richer metadata (search hints, interrupt
+ *         behavior, cache policies, output policies, resumability, deferred loading,
+ *         pre-permission validation, policy hooks). Old tuple format still works.
+ *         New fields set via contract array in 9th tuple position or via filter.
  *
  * Adding a new tool:
  *   1. Add one line to boot() below.
@@ -111,6 +115,36 @@ class PressArk_Operation_Registry {
 	public static function get_group( string $name ): string {
 		$op = self::resolve( $name );
 		return $op ? $op->group : '';
+	}
+
+	/**
+	 * Check if a read tool is safe for batched execution.
+	 *
+	 * Returns true when the tool can execute in a group of reads without
+	 * depending on the results of other tools in the same group and without
+	 * mutating shared state (tool_set, tool_defs, checkpoint dependencies).
+	 *
+	 * Dynamic tools (call_rest_endpoint GET, manage_webhooks list) are
+	 * treated as concurrency-safe since the read path has no side effects.
+	 *
+	 * @since 5.2.0
+	 */
+	public static function is_concurrency_safe( string $name, array $args = array() ): bool {
+		// Dynamic tools: only the read variant is safe.
+		if ( 'call_rest_endpoint' === $name ) {
+			return 'GET' === strtoupper( $args['method'] ?? 'GET' );
+		}
+		if ( 'manage_webhooks' === $name ) {
+			return 'list' === ( $args['action'] ?? 'list' );
+		}
+
+		$op = self::resolve( $name );
+		if ( ! $op ) {
+			// Unknown tool — fail closed (serial).
+			return false;
+		}
+
+		return $op->is_concurrency_safe();
 	}
 
 	/**
@@ -273,6 +307,162 @@ class PressArk_Operation_Registry {
 		return isset( self::$operations[ $canonical ] );
 	}
 
+	// ── Execution Contract API (v5.3.0) ────────────────────────────
+
+	/**
+	 * Get the full execution contract for a tool.
+	 *
+	 * Returns an associative array with all operation semantics — both
+	 * legacy and extended. Passes through the 'pressark_operation_contract'
+	 * filter so third parties can augment metadata.
+	 *
+	 * @since 5.3.0
+	 * @param string $name Tool name (or alias).
+	 * @return array|null Execution contract or null if not found.
+	 */
+	public static function get_contract( string $name ): ?array {
+		$op = self::resolve( $name );
+		if ( ! $op ) {
+			return null;
+		}
+		return $op->execution_contract();
+	}
+
+	/**
+	 * Run pre-permission validation for a tool.
+	 *
+	 * If the operation has a validate callable, it runs BEFORE the
+	 * capability/approval flow. Returns early with a failure result
+	 * if validation fails — preventing unnecessary permission prompts.
+	 *
+	 * @since 5.3.0
+	 * @param string $name   Tool name (or alias).
+	 * @param array  $params Tool parameters from the AI.
+	 * @return array{valid: bool, message?: string}
+	 */
+	public static function validate_input( string $name, array $params ): array {
+		$op = self::resolve( $name );
+		if ( ! $op ) {
+			return array( 'valid' => true );
+		}
+		return $op->validate_input( $params );
+	}
+
+	/**
+	 * Get the cache TTL hint for a tool.
+	 *
+	 * @since 5.3.0
+	 * @param string $name Tool name (or alias).
+	 * @return int Cache TTL in seconds (0 = no caching).
+	 */
+	public static function get_cache_ttl( string $name ): int {
+		$op = self::resolve( $name );
+		return $op ? $op->cache_ttl : 0;
+	}
+
+	/**
+	 * Get the interrupt behavior for a tool.
+	 *
+	 * @since 5.3.0
+	 * @param string $name Tool name (or alias).
+	 * @return string 'cancel'|'block'
+	 */
+	public static function get_interrupt( string $name ): string {
+		$op = self::resolve( $name );
+		return $op ? $op->interrupt : 'block';
+	}
+
+	/**
+	 * Get the output size policy for a tool.
+	 *
+	 * @since 5.3.0
+	 * @param string $name Tool name (or alias).
+	 * @return string 'compact'|'standard'|'large'
+	 */
+	public static function get_output_policy( string $name ): string {
+		$op = self::resolve( $name );
+		return $op ? $op->output_policy : 'standard';
+	}
+
+	/**
+	 * Check if a tool is resumable after interruption.
+	 *
+	 * @since 5.3.0
+	 * @param string $name Tool name (or alias).
+	 * @return bool
+	 */
+	public static function is_resumable( string $name ): bool {
+		$op = self::resolve( $name );
+		return $op ? $op->resumable : false;
+	}
+
+	/**
+	 * Get the search hint for a tool.
+	 *
+	 * @since 5.3.0
+	 * @param string $name Tool name (or alias).
+	 * @return string Search keywords (empty string = none).
+	 */
+	public static function get_search_hint( string $name ): string {
+		$op = self::resolve( $name );
+		return $op ? $op->search_hint : '';
+	}
+
+	/**
+	 * Get policy hooks for a specific execution phase.
+	 *
+	 * @since 5.3.0
+	 * @param string $name  Tool name (or alias).
+	 * @param string $phase Hook phase: 'pre_execute', 'post_execute', 'pre_approve'.
+	 * @return string[] Filter names to fire.
+	 */
+	public static function get_policy_hooks( string $name, string $phase ): array {
+		$op = self::resolve( $name );
+		if ( ! $op || ! isset( $op->policy_hooks[ $phase ] ) ) {
+			return array();
+		}
+		$hooks = $op->policy_hooks[ $phase ];
+		return is_array( $hooks ) ? $hooks : array( $hooks );
+	}
+
+	/**
+	 * Apply a contract overlay to an already-registered operation.
+	 *
+	 * Useful for third-party plugins that want to enrich metadata
+	 * for existing tools without re-registering them.
+	 *
+	 * @since 5.3.0
+	 * @param string $name     Tool name (or alias).
+	 * @param array  $contract Contract fields to overlay.
+	 * @return bool True if the operation was found and updated.
+	 */
+	public static function apply_contract( string $name, array $contract ): bool {
+		$canonical = self::$aliases[ $name ] ?? $name;
+		if ( ! isset( self::$operations[ $canonical ] ) ) {
+			return false;
+		}
+		self::$operations[ $canonical ]->apply_contract( $contract );
+		return true;
+	}
+
+	/**
+	 * Get all operations matching a set of tags.
+	 *
+	 * @since 5.3.0
+	 * @param string[] $tags Tags to match (OR logic).
+	 * @return PressArk_Operation[]
+	 */
+	public static function by_tags( array $tags ): array {
+		self::ensure_booted();
+		$result = array();
+		foreach ( self::$operations as $op ) {
+			if ( array_intersect( $tags, $op->tags ) ) {
+				$result[ $op->name ] = $op;
+			}
+		}
+		return $result;
+	}
+
 	// ── Registration ────────────────────────────────────────────────
 
 	/**
@@ -385,12 +575,13 @@ class PressArk_Operation_Registry {
 	/**
 	 * Register all operations. Called once on first access.
 	 *
-	 * Extended tuple format (v3.4.1):
-	 *   [ name, group, capability, handler, method, preview_strategy?, requires?, description? ]
+	 * Extended tuple format (v5.2.0):
+	 *   [ name, group, capability, handler, method, preview_strategy?, requires?, description?, concurrency_safe? ]
 	 *
 	 * preview_strategy defaults to 'none'.
 	 * requires defaults to null.
 	 * description defaults to ''.
+	 * concurrency_safe defaults to true (only meaningful for reads).
 	 * label auto-generated from name.
 	 * risk auto-derived from capability + name.
 	 */
@@ -407,13 +598,20 @@ class PressArk_Operation_Registry {
 			array( 'get_site_map',        'discovery', 'read', 'discovery', 'get_site_map',        'none', null, 'Full site structure: pages, posts, homepage config, blog page' ),
 			array( 'get_brand_profile',   'discovery', 'read', 'discovery', 'get_brand_profile',   'none', null, 'AI-generated site profile: identity, voice, content DNA, audience' ),
 			array( 'get_available_tools', 'discovery', 'read', 'discovery', 'get_available_tools', 'none', null, 'List all available tools beyond those currently loaded' ),
+			array( 'site_note',           'discovery', 'read', 'discovery', 'site_note',           'none', null, 'Record a site observation for future conversations. Use when discovering patterns, preferences, or issues.' ),
 		) );
 
-		// ── Meta-tools ──────────────────────────────────────────
+		// ── Meta-tools (NOT concurrency-safe: mutate tool_set/tool_defs) ──
 		self::register_all( array(
-			array( 'load_tool_group', 'discovery', 'read', 'discovery', 'load_tool_group',      'none', null, 'Load tool schemas by group name' ),
-			array( 'discover_tools',  'discovery', 'read', 'discovery', 'handle_discover_tools', 'none', null, 'Search for tools by natural-language query' ),
-			array( 'load_tools',      'discovery', 'read', 'discovery', 'handle_load_tools',     'none', null, 'Load tool schemas by group or specific tool names' ),
+			array( 'load_tool_group', 'discovery', 'read', 'discovery', 'load_tool_group',      'none', null, 'Load tool schemas by group name', false ),
+			array( 'discover_tools',  'discovery', 'read', 'discovery', 'handle_discover_tools', 'none', null, 'Search for tools by natural-language query', false ),
+			array( 'load_tools',      'discovery', 'read', 'discovery', 'handle_load_tools',     'none', null, 'Load tool schemas by group or specific tool names', false ),
+		) );
+
+		// ── Resource Bridge (v5.1.0) ────────────────────────────
+		self::register_all( array(
+			array( 'list_resources', 'discovery', 'read', 'discovery', 'list_resources', 'none', null, 'List available site resources (design tokens, templates, REST routes, schemas). Use read_resource to fetch.' ),
+			array( 'read_resource',  'discovery', 'read', 'discovery', 'read_resource',  'none', null, 'Read a specific resource by URI. Returns cached site data (design system, templates, post type schema, etc.).' ),
 		) );
 
 		// ── Content — reads ─────────────────────────────────────
@@ -737,12 +935,373 @@ class PressArk_Operation_Registry {
 		// ── Virtual group aliases (cross-group supersets) ────────
 		// 'content' = core tools + get_revision_history (health) + search_knowledge (index)
 		self::register_virtual_group( 'content', array( 'core' ), array( 'get_revision_history', 'search_knowledge' ) );
+
+		// ── v5.3.0: Apply extended contracts for high-risk/important tools ──
+		self::apply_execution_contracts();
+
+		// ── v5.3.0: Allow third-party contract enrichment ──
+		self::apply_contract_filters();
+	}
+
+	/**
+	 * Apply execution contracts to high-risk and high-value operations.
+	 *
+	 * Called after all operations are registered in boot(). Populates the
+	 * richer contract metadata for the most important tools first — bulk
+	 * destructive ops, financial writes, system mutations, and high-traffic
+	 * reads that benefit from caching.
+	 *
+	 * @since 5.3.0
+	 */
+	private static function apply_execution_contracts(): void {
+
+		$contracts = array(
+
+			// ── Destructive / high-risk operations ──────────────────
+
+			'delete_content' => array(
+				'search_hint'   => 'trash remove delete post page',
+				'interrupt'     => 'cancel',
+				'tags'          => array( 'destructive', 'content' ),
+				'idempotent'    => false,
+				'policy_hooks'  => array(
+					'pre_execute' => 'pressark_before_delete_content',
+				),
+			),
+
+			'bulk_delete' => array(
+				'search_hint'   => 'bulk trash remove delete multiple posts',
+				'interrupt'     => 'cancel',
+				'resumable'     => true,
+				'output_policy' => 'compact',
+				'tags'          => array( 'destructive', 'bulk', 'content' ),
+				'idempotent'    => false,
+				'policy_hooks'  => array(
+					'pre_execute'  => 'pressark_before_bulk_delete',
+					'post_execute' => 'pressark_after_bulk_delete',
+				),
+			),
+
+			'empty_trash' => array(
+				'search_hint'   => 'permanently delete empty trash irreversible',
+				'interrupt'     => 'cancel',
+				'resumable'     => true,
+				'tags'          => array( 'destructive', 'bulk', 'irreversible' ),
+				'idempotent'    => true,
+				'policy_hooks'  => array(
+					'pre_approve' => 'pressark_confirm_empty_trash',
+				),
+			),
+
+			'bulk_delete_media' => array(
+				'search_hint'   => 'permanently delete media images attachments',
+				'interrupt'     => 'cancel',
+				'resumable'     => true,
+				'tags'          => array( 'destructive', 'bulk', 'media', 'irreversible' ),
+				'idempotent'    => false,
+			),
+
+			'find_and_replace' => array(
+				'search_hint'   => 'find replace text across multiple posts bulk',
+				'interrupt'     => 'cancel',
+				'resumable'     => true,
+				'output_policy' => 'large',
+				'tags'          => array( 'bulk', 'content', 'dangerous' ),
+				'idempotent'    => false,
+				'policy_hooks'  => array(
+					'pre_execute' => 'pressark_before_find_replace',
+				),
+			),
+
+			'fix_security' => array(
+				'search_hint'   => 'security fix remediate exposed files xmlrpc',
+				'interrupt'     => 'block',
+				'tags'          => array( 'destructive', 'security', 'system' ),
+				'idempotent'    => false,
+			),
+
+			'cleanup_database' => array(
+				'search_hint'   => 'cleanup revisions drafts spam transients database',
+				'interrupt'     => 'cancel',
+				'resumable'     => true,
+				'tags'          => array( 'destructive', 'database', 'maintenance' ),
+				'idempotent'    => true,
+			),
+
+			'optimize_database' => array(
+				'search_hint'   => 'optimize tables reclaim space database',
+				'interrupt'     => 'block',
+				'tags'          => array( 'database', 'maintenance' ),
+				'idempotent'    => true,
+			),
+
+			// ── WooCommerce financial / customer-facing ─────────────
+
+			'create_refund' => array(
+				'search_hint'   => 'refund order money return payment',
+				'interrupt'     => 'cancel',
+				'tags'          => array( 'woocommerce', 'financial', 'irreversible' ),
+				'idempotent'    => false,
+				'policy_hooks'  => array(
+					'pre_approve' => 'pressark_confirm_refund',
+				),
+			),
+
+			'email_customer' => array(
+				'search_hint'   => 'email customer send message notification',
+				'interrupt'     => 'cancel',
+				'tags'          => array( 'woocommerce', 'communication', 'irreversible' ),
+				'idempotent'    => false,
+			),
+
+			'trigger_wc_email' => array(
+				'search_hint'   => 'trigger woocommerce email notification',
+				'interrupt'     => 'cancel',
+				'tags'          => array( 'woocommerce', 'communication' ),
+				'idempotent'    => false,
+			),
+
+			'bulk_edit_products' => array(
+				'search_hint'   => 'bulk update products price stock status',
+				'interrupt'     => 'cancel',
+				'resumable'     => true,
+				'output_policy' => 'compact',
+				'tags'          => array( 'woocommerce', 'bulk', 'products' ),
+				'idempotent'    => false,
+			),
+
+			// ── Content writes (preview flow) ───────────────────────
+
+			'edit_content' => array(
+				'search_hint'   => 'edit update post page title content excerpt',
+				'interrupt'     => 'block',
+				'tags'          => array( 'content', 'write' ),
+			),
+
+			'create_post' => array(
+				'search_hint'   => 'create new post page draft publish',
+				'interrupt'     => 'block',
+				'tags'          => array( 'content', 'write' ),
+				'idempotent'    => false,
+			),
+
+			'bulk_edit' => array(
+				'search_hint'   => 'bulk edit status category author posts',
+				'interrupt'     => 'cancel',
+				'resumable'     => true,
+				'tags'          => array( 'bulk', 'content' ),
+				'idempotent'    => false,
+			),
+
+			// ── System mutations ────────────────────────────────────
+
+			'update_site_settings' => array(
+				'search_hint'   => 'update site settings name url timezone',
+				'interrupt'     => 'block',
+				'tags'          => array( 'settings', 'system' ),
+			),
+
+			'switch_theme' => array(
+				'search_hint'   => 'switch activate theme',
+				'interrupt'     => 'cancel',
+				'tags'          => array( 'themes', 'system', 'dangerous' ),
+				'idempotent'    => true,
+			),
+
+			'toggle_plugin' => array(
+				'search_hint'   => 'activate deactivate plugin enable disable',
+				'interrupt'     => 'cancel',
+				'tags'          => array( 'plugins', 'system' ),
+				'idempotent'    => true,
+			),
+
+			'manage_scheduled_task' => array(
+				'search_hint'   => 'cron scheduled task run remove reschedule',
+				'interrupt'     => 'cancel',
+				'tags'          => array( 'system', 'cron' ),
+			),
+
+			'clear_log' => array(
+				'search_hint'   => 'clear truncate log debug',
+				'interrupt'     => 'cancel',
+				'tags'          => array( 'logs', 'maintenance' ),
+				'idempotent'    => true,
+			),
+
+			// ── High-traffic reads (cache candidates) ───────────────
+
+			'read_content' => array(
+				'search_hint'   => 'read view post page content by ID URL slug',
+				'cache_ttl'     => 300,
+				'tags'          => array( 'content', 'read' ),
+				'defer'         => 'always_load',
+			),
+
+			'search_content' => array(
+				'search_hint'   => 'search find posts pages keyword',
+				'cache_ttl'     => 120,
+				'tags'          => array( 'content', 'search', 'read' ),
+				'defer'         => 'always_load',
+			),
+
+			'list_posts' => array(
+				'search_hint'   => 'list posts pages filter type status date',
+				'cache_ttl'     => 120,
+				'tags'          => array( 'content', 'read' ),
+				'defer'         => 'always_load',
+			),
+
+			'get_site_overview' => array(
+				'search_hint'   => 'site overview info wordpress version theme plugins',
+				'cache_ttl'     => 600,
+				'tags'          => array( 'discovery', 'read' ),
+			),
+
+			'get_site_map' => array(
+				'search_hint'   => 'site map structure pages navigation',
+				'cache_ttl'     => 600,
+				'tags'          => array( 'discovery', 'read' ),
+			),
+
+			'analyze_seo' => array(
+				'search_hint'   => 'seo analysis audit score meta title description',
+				'cache_ttl'     => 300,
+				'output_policy' => 'large',
+				'tags'          => array( 'seo', 'analysis', 'read' ),
+			),
+
+			'scan_security' => array(
+				'search_hint'   => 'security scan audit vulnerabilities check',
+				'cache_ttl'     => 300,
+				'output_policy' => 'large',
+				'tags'          => array( 'security', 'analysis', 'read' ),
+			),
+
+			'site_health' => array(
+				'search_hint'   => 'site health status issues recommendations',
+				'cache_ttl'     => 300,
+				'output_policy' => 'large',
+				'tags'          => array( 'health', 'diagnostics', 'read' ),
+			),
+
+			'search_knowledge' => array(
+				'search_hint'   => 'search indexed content knowledge base keyword',
+				'cache_ttl'     => 60,
+				'tags'          => array( 'content', 'search', 'index' ),
+			),
+
+			// ── Discovery meta-tools ────────────────────────────────
+
+			'discover_tools' => array(
+				'search_hint'   => 'find search available tools capabilities',
+				'cache_ttl'     => 0,
+				'defer'         => 'always_load',
+				'tags'          => array( 'meta', 'discovery' ),
+			),
+
+			'load_tools' => array(
+				'search_hint'   => 'load activate tool schemas group',
+				'cache_ttl'     => 0,
+				'defer'         => 'always_load',
+				'tags'          => array( 'meta', 'discovery' ),
+			),
+
+			'load_tool_group' => array(
+				'search_hint'   => 'load tool group schemas by name',
+				'cache_ttl'     => 0,
+				'defer'         => 'always_load',
+				'tags'          => array( 'meta', 'discovery' ),
+			),
+
+			// ── WooCommerce analytics (large output, cacheable) ─────
+
+			'sales_summary' => array(
+				'search_hint'   => 'sales revenue orders average value period report',
+				'cache_ttl'     => 180,
+				'output_policy' => 'large',
+				'tags'          => array( 'woocommerce', 'analytics', 'read' ),
+			),
+
+			'inventory_report' => array(
+				'search_hint'   => 'inventory stock levels low out report',
+				'cache_ttl'     => 180,
+				'output_policy' => 'large',
+				'tags'          => array( 'woocommerce', 'inventory', 'read' ),
+			),
+
+			'customer_insights' => array(
+				'search_hint'   => 'customer segmentation RFM active churn analysis',
+				'cache_ttl'     => 300,
+				'output_policy' => 'large',
+				'tags'          => array( 'woocommerce', 'analytics', 'customers' ),
+			),
+
+			'revenue_report' => array(
+				'search_hint'   => 'revenue report comparison period growth',
+				'cache_ttl'     => 180,
+				'output_policy' => 'large',
+				'tags'          => array( 'woocommerce', 'analytics', 'financial' ),
+			),
+
+			// ── Automations ────────────────────────────────────────
+
+			'delete_automation' => array(
+				'search_hint'   => 'delete remove automation permanently',
+				'interrupt'     => 'cancel',
+				'tags'          => array( 'automations', 'destructive' ),
+				'idempotent'    => false,
+			),
+
+			'run_automation_now' => array(
+				'search_hint'   => 'trigger run automation immediately now',
+				'interrupt'     => 'block',
+				'tags'          => array( 'automations' ),
+				'idempotent'    => true,
+			),
+
+			// ── Elementor writes ───────────────────────────────────
+
+			'elementor_edit_widget' => array(
+				'search_hint'   => 'elementor edit widget text heading image button',
+				'interrupt'     => 'block',
+				'tags'          => array( 'elementor', 'write' ),
+			),
+
+			'elementor_create_page' => array(
+				'search_hint'   => 'elementor create new page template',
+				'interrupt'     => 'block',
+				'tags'          => array( 'elementor', 'write' ),
+				'idempotent'    => false,
+			),
+
+			'elementor_find_replace' => array(
+				'search_hint'   => 'elementor find replace text across pages',
+				'interrupt'     => 'cancel',
+				'resumable'     => true,
+				'tags'          => array( 'elementor', 'bulk', 'dangerous' ),
+				'idempotent'    => false,
+			),
+		);
+
+		foreach ( $contracts as $name => $contract ) {
+			if ( isset( self::$operations[ $name ] ) ) {
+				self::$operations[ $name ]->apply_contract( $contract );
+			}
+		}
 	}
 
 	/**
 	 * Bulk register from compact tuple arrays.
 	 *
 	 * v3.4.1 format: [ name, group, cap, handler, method, strategy?, requires?, description? ]
+	 * v5.2.0 format: [ ..., concurrency_safe? ] (bool at position 8)
+	 * v5.3.0 format: [ ..., contract? ] (assoc array at position 8 or 9)
+	 *
+	 * The contract array is detected by type: if position 8 is an array,
+	 * it's treated as the execution contract (concurrency_safe defaults true).
+	 * If position 8 is a bool, it's concurrency_safe and position 9 is the
+	 * optional contract array.
+	 *
 	 * label auto-generated from name. risk auto-derived from cap + name.
 	 */
 	private static function register_all( array $rows ): void {
@@ -750,7 +1309,24 @@ class PressArk_Operation_Registry {
 			$name = $row[0];
 			$cap  = $row[2];
 
-			self::register( new PressArk_Operation(
+			// Detect contract array position (backward-compatible).
+			$concurrency_safe = true;
+			$contract         = array();
+
+			if ( isset( $row[8] ) ) {
+				if ( is_array( $row[8] ) ) {
+					// v5.3.0: position 8 is the contract array.
+					$contract = $row[8];
+				} else {
+					// v5.2.0: position 8 is concurrency_safe bool.
+					$concurrency_safe = (bool) $row[8];
+					if ( isset( $row[9] ) && is_array( $row[9] ) ) {
+						$contract = $row[9];
+					}
+				}
+			}
+
+			$op = new PressArk_Operation(
 				name:             $name,
 				group:            $row[1],
 				capability:       $cap,
@@ -761,7 +1337,46 @@ class PressArk_Operation_Registry {
 				label:            ucwords( str_replace( '_', ' ', $name ) ),
 				description:      $row[7] ?? '',
 				risk:             self::derive_risk( $name, $cap ),
-			) );
+				concurrency_safe: $concurrency_safe,
+			);
+
+			if ( ! empty( $contract ) ) {
+				$op->apply_contract( $contract );
+			}
+
+			self::register( $op );
+		}
+	}
+
+	/**
+	 * Fire the contract filter hook after boot.
+	 *
+	 * Allows third-party plugins and Pressark extensions to enrich
+	 * execution contracts for any registered operation. The filter
+	 * receives each operation's contract array and can return a
+	 * modified version.
+	 *
+	 * @since 5.3.0
+	 */
+	private static function apply_contract_filters(): void {
+		if ( ! has_filter( 'pressark_operation_contract' ) ) {
+			return;
+		}
+
+		foreach ( self::$operations as $op ) {
+			/**
+			 * Filter the execution contract for a registered operation.
+			 *
+			 * @since 5.3.0
+			 * @param array             $contract The full execution contract array.
+			 * @param PressArk_Operation $op       The operation object.
+			 * @return array Modified contract (only extended fields are applied).
+			 */
+			$filtered = apply_filters( 'pressark_operation_contract', $op->execution_contract(), $op );
+
+			if ( is_array( $filtered ) ) {
+				$op->apply_contract( $filtered );
+			}
 		}
 	}
 }

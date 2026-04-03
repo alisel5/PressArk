@@ -146,9 +146,10 @@ For actionable SEO work on a known post/page, prefer fix_seo or update_meta dire
 - Scheduling: status "future" with scheduled_date in "Y-m-d H:i:s" format.
 - Undo: call get_revision_history first — show available versions before restoring.
 - Trash vs Delete: "delete posts" = move to trash (bulk_delete). "Empty trash" = permanently delete already-trashed posts (empty_trash). Never use bulk_delete on posts already in trash.
-- Bulk: when acting on multiple items, always prefer one bulk call over many individual calls. bulk_delete (trash), empty_trash (permanent), bulk_delete_media (media), bulk_edit (status/category/tag changes).
+- Bulk: for uniform changes (same status, same price delta, same category) across many items, prefer one bulk call: bulk_delete (trash), empty_trash (permanent), bulk_delete_media (media), bulk_edit (status/category/tag changes), bulk_edit_products (same field change). When each item needs DIFFERENT content (unique descriptions, unique titles), use individual tool calls (edit_product, edit_content) — one per item — so each argument stays compact.
 - WooCommerce reviews: for one review reply, prefer reply_review (or moderate_review with action="reply"). For multiple review replies, prefer bulk_reply_reviews in one action.
 - Reply workflows: if the user asks you to reply to comments or reviews, read the targets, then emit the reply tool call(s). Do not stop at drafted text and do not ask for permission in prose.
+- site_note: Record important discoveries about this site for future conversations. Categories: content (editorial patterns), products (store setup, pricing), technical (config, caching, PHP), preferences (user style/tone/workflow), issues (bugs, errors, warnings). Keep notes concise and specific. Duplicates in the same category are auto-merged.
 
 ## Output Rules
 - IMPORTANT: Go straight to the point. Lead with the action or answer, not the reasoning.
@@ -157,7 +158,8 @@ For actionable SEO work on a known post/page, prefer fix_seo or update_meta dire
 - Do not explain what you're ABOUT to do — just do it. The preview/confirm UI handles consent.
 - If you can say it in one sentence, don't use three.
 - Focus text output on: what you found from reads, decisions needing user input, warnings for destructive actions.
-- When proposing writes, emit the action blocks immediately. Add explanation only for non-obvious changes.
+- When read results return lists of 4+ similar items (products, posts, pages, orders), summarize by count and key insight — do NOT list every item. Example: "All 8 products have short descriptions (1–2 sentences)." NOT a table of every product's description.
+- When proposing writes, emit the tool calls immediately. NEVER reproduce the full content of proposed changes in your text response — the preview/confirm card shows the user exactly what will change. A one-line summary per item is the maximum. Example: "Updating descriptions for 8 products with richer keyword-optimized versions." NOT the full text of each description.
 - Proactive: mention issues when helpful, but do not ask for permission in prose when the user already asked you to take an action.
 PROMPT;
 
@@ -239,7 +241,10 @@ PROMPT;
 	 * @return string
 	 */
 	public function resolve_for_phase( string $phase, array $context = array() ): string {
-		if ( 'summarize' === $phase ) {
+		// Back-Agent phases always route through for_phase() so the
+		// pressark_summarize_model setting overrides the main model.
+		$back_agent_phases = array( 'summarize', 'classification', 'memory_selection' );
+		if ( in_array( $phase, $back_agent_phases, true ) ) {
 			$this->model = PressArk_Model_Policy::for_phase( $phase, $this->tier, $context );
 			return $this->model;
 		}
@@ -1022,12 +1027,15 @@ FSEPROMPT;
 
 	/**
 	 * Check if current provider/model supports native tool search.
-	 * PressArk's local PHP tools are not exposed through an MCP/deferred-tools
-	 * bridge yet, so GPT-5.4-class OpenAI tool_search cannot be activated
-	 * truthfully here. Do not infer support from the model name alone.
 	 *
-	 * When a real tool-search bridge exists, this method should become the
-	 * single activation point for that path.
+	 * v5.1.0: Now delegates to Capability_Bridge::is_bridge_ready() instead of
+	 * hard-coding false. The bridge verifies that both the Resource Registry and
+	 * Operation Registry are booted with sufficient data before activating.
+	 *
+	 * Requirements for activation:
+	 * 1. Provider must be OpenAI (native tool search is an OpenAI feature).
+	 * 2. Model must have native tool search capability (GPT-5.4+).
+	 * 3. Capability Bridge must be ready (resources + operations registered).
 	 */
 	public function supports_tool_search(): bool {
 		$tracker  = $this->get_tracker();
@@ -1044,7 +1052,8 @@ FSEPROMPT;
 			return false;
 		}
 
-		return false;
+		// v5.1.0: Bridge gate — only activate when resource + tool registries are ready.
+		return PressArk_Capability_Bridge::is_bridge_ready();
 	}
 
 	/**

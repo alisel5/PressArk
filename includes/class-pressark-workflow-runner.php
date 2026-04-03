@@ -340,6 +340,7 @@ abstract class PressArk_Workflow_Runner {
 		// Build context.
 		$context = new PressArk_Context();
 		$system  = $context->build( $this->state['screen'] ?? '', $this->state['post_id'] ?? 0 );
+		$system .= PressArk_Handler_Discovery::format_site_notes_basic();
 
 		// Build user message with scoped prompt and structured data.
 		$user_content = $scoped_prompt;

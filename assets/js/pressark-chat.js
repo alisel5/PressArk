@@ -587,6 +587,10 @@
 
 			this.applyResultState(result);
 
+			if (result.suggestions) {
+				this.renderSuggestionChips(result.suggestions);
+			}
+
 			this.autoSaveChat();
 		},
 
@@ -943,6 +947,30 @@
 						}
 					});
 					container.appendChild(btn);
+				})(suggestions[i]);
+			}
+
+			this.messagesEl.appendChild(container);
+			this.scrollToBottom();
+		},
+
+		renderSuggestionChips: function (suggestions) {
+			if (!suggestions || !suggestions.length) return;
+			var self = this;
+			var container = document.createElement('div');
+			container.className = 'pressark-suggestions pressark-suggestion-chips';
+
+			var count = Math.min(suggestions.length, 3);
+			for (var i = 0; i < count; i++) {
+				(function (text) {
+					var chip = document.createElement('button');
+					chip.className = 'pressark-chip';
+					chip.textContent = text;
+					chip.addEventListener('click', function () {
+						self.inputEl.value = text;
+						self.sendMessage();
+					});
+					container.appendChild(chip);
 				})(suggestions[i]);
 			}
 
@@ -2202,7 +2230,7 @@
 					if (result.success) {
 						self.closePreview(action);
 						var displayMsg = action === 'keep'
-							? pwIcon('check') + ' Changes applied successfully.'
+							? 'Changes applied successfully.'
 							: 'Changes discarded.';
 						// v3.1.0: Append verification summary if present.
 						if (action === 'keep' && result.verification && result.verification.message) {
@@ -2561,6 +2589,10 @@
 					}
 
 					self.applyResultState(result);
+
+					if (result.suggestions) {
+						self.renderSuggestionChips(result.suggestions);
+					}
 
 					self.autoSaveChat();
 					} catch (processingErr) {
@@ -3141,6 +3173,10 @@
 			}
 
 			this.applyResultState(result);
+
+			if (result.suggestions) {
+				this.renderSuggestionChips(result.suggestions);
+			}
 
 			this.autoSaveChat();
 		},

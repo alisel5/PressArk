@@ -604,49 +604,19 @@ class PressArk_Agent {
 
 			// ── CASE A: All reads — execute and continue loop ────────────────
 			if ( ! empty( $read_calls ) && empty( $preview_calls ) && empty( $confirm_calls ) ) {
-				$tool_results = array();
-				foreach ( $read_calls as $tc ) {
-					if ( $cancel_check() ) {
-						return $build_cancelled_result();
-					}
+				$tool_results = $this->execute_reads_orchestrated(
+					$read_calls,
+					$checkpoint,
+					$round,
+					$loader,
+					$tool_set,
+					$tool_defs,
+					$emit_fn,
+					$cancel_check
+				);
 
-					$meta_result = $this->handle_meta_tool( $tc, $loader, $tool_set, $tool_defs );
-					if ( null !== $meta_result ) {
-						$tool_results[] = $meta_result;
-						continue;
-					}
-
-					// v3.7.0: Bundle hit check — return stub for duplicate reads.
-					$bundle_stub = $this->check_bundle_hit( $checkpoint, $tc['name'], $tc['arguments'] ?? array() );
-					if ( null !== $bundle_stub ) {
-						$tool_results[] = array(
-							'tool_use_id' => $tc['id'],
-							'result'      => $bundle_stub,
-						);
-						continue;
-					}
-
-					$this->emit_step( 'reading', $tc['name'], $tc['arguments'] );
-					$emit_fn( 'step', array( 'status' => 'reading', 'label' => $this->get_step_label( $tc['name'], $tc['arguments'] ), 'tool' => $tc['name'] ) );
-
-					$result = $this->engine->execute_read( $tc['name'], $tc['arguments'] );
-					$result = $this->enforce_tool_result_limit( $result, $tc['name'] );
-
-					$this->emit_step( 'done', $tc['name'], $tc['arguments'], $result );
-					$emit_fn( 'tool_result', array( 'id' => $tc['id'] ?? '', 'name' => $tc['name'], 'success' => true, 'summary' => $this->summarize_result( $result ) ) );
-
-					// v2.4.0: Update checkpoint from read result.
-					$this->update_checkpoint_from_result( $checkpoint, $tc, $result, $round );
-
-					// v3.7.0: Record bundle ID for future dedup.
-					if ( ! $this->is_tool_result_limit_result( $result ) ) {
-						$this->record_bundle( $checkpoint, $tc['name'], $tc['arguments'] ?? array(), $result );
-					}
-
-					$tool_results[] = array(
-						'tool_use_id' => $tc['id'],
-						'result'      => $result,
-					);
+				if ( null === $tool_results ) {
+					return $build_cancelled_result();
 				}
 
 				// v2.4.0: Compact large tool results for in-loop messages.
@@ -686,39 +656,19 @@ class PressArk_Agent {
 			// If MIXED (some reads + some writes in same response):
 			// Execute reads first, then pause for writes.
 			if ( ! empty( $read_calls ) ) {
-				$read_results = array();
-				foreach ( $read_calls as $tc ) {
-					if ( $cancel_check() ) {
-						return $build_cancelled_result();
-					}
+				$read_results = $this->execute_reads_orchestrated(
+					$read_calls,
+					$checkpoint,
+					$round,
+					$loader,
+					$tool_set,
+					$tool_defs,
+					$emit_fn,
+					$cancel_check
+				);
 
-					$meta_result = $this->handle_meta_tool( $tc, $loader, $tool_set, $tool_defs );
-					if ( null !== $meta_result ) {
-						$read_results[] = $meta_result;
-						continue;
-					}
-
-					$this->emit_step( 'reading', $tc['name'], $tc['arguments'] );
-					$emit_fn( 'step', array( 'status' => 'reading', 'label' => $this->get_step_label( $tc['name'], $tc['arguments'] ), 'tool' => $tc['name'] ) );
-
-					$result = $this->engine->execute_read( $tc['name'], $tc['arguments'] );
-					$result = $this->enforce_tool_result_limit( $result, $tc['name'] );
-
-					$this->emit_step( 'done', $tc['name'], $tc['arguments'], $result );
-					$emit_fn( 'tool_result', array( 'id' => $tc['id'] ?? '', 'name' => $tc['name'], 'success' => true, 'summary' => $this->summarize_result( $result ) ) );
-
-					// v2.4.0: Update checkpoint from read result.
-					$this->update_checkpoint_from_result( $checkpoint, $tc, $result, $round );
-
-					// v3.7.0: Record bundle ID for future dedup.
-					if ( ! $this->is_tool_result_limit_result( $result ) ) {
-						$this->record_bundle( $checkpoint, $tc['name'], $tc['arguments'] ?? array(), $result );
-					}
-
-					$read_results[] = array(
-						'tool_use_id' => $tc['id'],
-						'result'      => $result,
-					);
+				if ( null === $read_results ) {
+					return $build_cancelled_result();
 				}
 
 				// v2.4.0: Compact large read results for in-loop messages.
@@ -793,6 +743,143 @@ class PressArk_Agent {
 			'hit_limit'   => true,
 			'exit_reason' => $exit_reason,
 		), $tool_set, $initial_groups, $checkpoint );
+	}
+
+	// ── Orchestrated Read Execution (v5.2.0) ────────────────────────────
+
+	/**
+	 * Execute read tool calls using batched orchestration.
+	 *
+	 * Analogous to Claude Code's partitionToolCalls + runToolsConcurrently:
+	 * consecutive concurrency-safe reads are grouped into batches where all
+	 * "reading" step events fire upfront and all "done" events fire after.
+	 * Meta-tools and non-safe reads execute serially with full step events.
+	 *
+	 * Pre-processing extracts meta-tool results and bundle-hit stubs first
+	 * (they have their own step-event handling), then passes only real
+	 * execution calls to the orchestrator, then merges everything back in
+	 * original model-emission order.
+	 *
+	 * @param array[]               $read_calls  Ordered read tool calls.
+	 * @param PressArk_Checkpoint   $checkpoint  Current checkpoint.
+	 * @param int                   $round       Current agent round.
+	 * @param PressArk_Tool_Loader  $loader      Tool loader (for meta-tools).
+	 * @param array                &$tool_set    Current tool set (meta-tools mutate).
+	 * @param array                &$tool_defs   Current tool defs (meta-tools mutate).
+	 * @param callable              $emit_fn     SSE step emitter.
+	 * @param callable              $cancel_check Cancellation check.
+	 * @return array[]|null Ordered results, or null if cancelled.
+	 */
+	private function execute_reads_orchestrated(
+		array $read_calls,
+		PressArk_Checkpoint $checkpoint,
+		int $round,
+		PressArk_Tool_Loader $loader,
+		array &$tool_set,
+		array &$tool_defs,
+		callable $emit_fn,
+		callable $cancel_check
+	): ?array {
+		// Phase 1: Pre-process — handle meta-tools and bundle-hits in order.
+		// These produce immediate results with their own step events and must
+		// not enter the orchestrator (meta-tools mutate tool_set/tool_defs).
+		$slot_results   = array(); // position → result entry
+		$execute_calls  = array(); // calls that need real execution
+		$execute_indices = array(); // maps execute_calls index → original position
+
+		foreach ( $read_calls as $i => $tc ) {
+			if ( $cancel_check() ) {
+				return null;
+			}
+
+			// Meta-tool fast path (handles its own step events).
+			$meta_result = $this->handle_meta_tool( $tc, $loader, $tool_set, $tool_defs );
+			if ( null !== $meta_result ) {
+				$slot_results[ $i ] = $meta_result;
+				continue;
+			}
+
+			// Bundle-hit fast path (no step events needed).
+			$bundle_stub = $this->check_bundle_hit( $checkpoint, $tc['name'], $tc['arguments'] ?? array() );
+			if ( null !== $bundle_stub ) {
+				$slot_results[ $i ] = array(
+					'tool_use_id' => $tc['id'],
+					'result'      => $bundle_stub,
+				);
+				continue;
+			}
+
+			// Needs real execution — send to orchestrator.
+			$execute_indices[ count( $execute_calls ) ] = $i;
+			$execute_calls[] = $tc;
+		}
+
+		// Phase 2: Partition and execute remaining calls.
+		if ( ! empty( $execute_calls ) ) {
+			$batches = PressArk_Read_Orchestrator::partition( $execute_calls );
+
+			if ( defined( 'PRESSARK_DEBUG' ) && PRESSARK_DEBUG ) {
+				PressArk_Error_Tracker::debug(
+					'Agent',
+					'Read orchestration: ' . PressArk_Read_Orchestrator::describe_batches( $batches )
+				);
+			}
+
+			// Execute callback: runs a single tool and records checkpoint + bundle.
+			$exec_fn = function ( array $tc ) use ( $checkpoint, $round ): array {
+				$result = $this->engine->execute_read( $tc['name'], $tc['arguments'] );
+				$result = $this->enforce_tool_result_limit( $result, $tc['name'] );
+
+				// Checkpoint and bundle recording (safe within single-threaded PHP).
+				$this->update_checkpoint_from_result( $checkpoint, $tc, $result, $round );
+				if ( ! $this->is_tool_result_limit_result( $result ) ) {
+					$this->record_bundle( $checkpoint, $tc['name'], $tc['arguments'] ?? array(), $result );
+				}
+
+				return $result;
+			};
+
+			// Step-event callback: emits reading/done events to SSE stream.
+			$step_fn = function ( string $status, array $tc, ?array $result ) use ( $emit_fn ): void {
+				if ( 'reading' === $status ) {
+					$this->emit_step( 'reading', $tc['name'], $tc['arguments'] );
+					$emit_fn( 'step', array(
+						'status' => 'reading',
+						'label'  => $this->get_step_label( $tc['name'], $tc['arguments'] ),
+						'tool'   => $tc['name'],
+					) );
+				} elseif ( 'done' === $status && null !== $result ) {
+					$this->emit_step( 'done', $tc['name'], $tc['arguments'], $result );
+					$emit_fn( 'tool_result', array(
+						'id'      => $tc['id'] ?? '',
+						'name'    => $tc['name'],
+						'success' => true,
+						'summary' => $this->summarize_result( $result ),
+					) );
+				}
+			};
+
+			$orchestrated = PressArk_Read_Orchestrator::execute(
+				$batches,
+				$exec_fn,
+				$step_fn,
+				$cancel_check
+			);
+
+			if ( $orchestrated['cancelled'] ) {
+				return null;
+			}
+
+			// Map orchestrated results back to their original positions.
+			foreach ( $orchestrated['results'] as $j => $entry ) {
+				$original_pos = $execute_indices[ $j ];
+				$slot_results[ $original_pos ] = $entry;
+			}
+		}
+
+		// Phase 3: Assemble results in deterministic original order.
+		ksort( $slot_results );
+		return array_values( $slot_results );
 	}
 
 	// ── Meta-Tool Handling (v2.3.1) ─────────────────────────────────────
@@ -977,6 +1064,7 @@ class PressArk_Agent {
 			'model'              => $this->actual_model,
 			'agent_rounds'       => $this->model_rounds,
 			'task_type'          => $this->task_type,
+			'suggestions'        => $this->generate_suggestions( $data['message'] ?? '' ),
 			'loaded_groups'      => array_values( array_unique(
 				! empty( $this->loaded_groups ) ? $this->loaded_groups : ( $tool_set['groups'] ?? array() )
 			) ),
@@ -1003,6 +1091,54 @@ class PressArk_Agent {
 		}
 
 		return $base;
+	}
+
+	/**
+	 * Generate contextual follow-up suggestion chips based on task type and response content.
+	 *
+	 * @param string $response_text The AI response text.
+	 * @return string[] Up to 3 suggestion strings.
+	 */
+	private function generate_suggestions( string $response_text ): array {
+		if ( '' === $response_text ) {
+			return array();
+		}
+
+		$type = $this->task_type;
+
+		if ( in_array( $type, array( 'analyze', 'diagnose' ), true ) ) {
+			$suggestions = array();
+			if ( false !== stripos( $response_text, 'seo' ) || false !== stripos( $response_text, 'meta' ) ) {
+				$suggestions[] = 'Fix the SEO issues';
+			}
+			if ( false !== stripos( $response_text, 'security' ) || false !== stripos( $response_text, 'vulnerab' ) ) {
+				$suggestions[] = 'Fix the security issues';
+			}
+			$suggestions[] = 'Auto-fix what you can';
+			return array_slice( $suggestions, 0, 3 );
+		}
+
+		if ( 'generate' === $type ) {
+			$suggestions = array( 'Publish it' );
+			if ( false !== stripos( $response_text, 'word' ) || strlen( $response_text ) > 1500 ) {
+				$suggestions[] = 'Make it shorter';
+			} else {
+				$suggestions[] = 'Make it longer';
+			}
+			$suggestions[] = 'Change the tone';
+			return array_slice( $suggestions, 0, 3 );
+		}
+
+		if ( 'edit' === $type ) {
+			return array( 'How does it look now?', 'Check the SEO too', 'Undo the changes' );
+		}
+
+		if ( 'code' === $type ) {
+			return array( 'Run it again', 'Explain what changed', 'Check for issues' );
+		}
+
+		// Fallback for chat and other task types.
+		return array( 'Check my SEO', 'Any issues on my site?', 'What\'s new in my store?' );
 	}
 
 	/**
@@ -1540,6 +1676,23 @@ class PressArk_Agent {
 			$system_prompt .= "\n\n" . $execution_guard;
 		}
 
+		// v5.2.0: When a previous round proposed writes that the user has NOT
+		// yet approved (confirm card still pending), inject an explicit notice.
+		// Without this, the model sees its own "I'll apply changes" text in
+		// history and assumes the actions were applied.
+		if ( $checkpoint->has_unapplied_confirms() ) {
+			$pending_names = array_map(
+				fn( $p ) => $p['action'] . ( $p['target'] ? ' on ' . $p['target'] : '' ),
+				$checkpoint->get_pending()
+			);
+			$system_prompt .= "\n\n## Pending Confirmation\n"
+				. "You previously proposed these write actions but they were NOT applied yet — "
+				. "the user has not clicked Approve on the confirm card:\n- "
+				. implode( "\n- ", $pending_names )
+				. "\nDo NOT claim these actions are done. If the user asks you to proceed, "
+				. "re-emit the tool calls so a new confirm card is generated.";
+		}
+
 		// v4.3.2: Inject execution plan if multi-step.
 		if ( count( $this->plan_steps ) > 1 ) {
 			$plan_lines = array();
@@ -1579,7 +1732,235 @@ class PressArk_Agent {
 			                . "Still use the preview/confirm flow, but don't over-warn about risks.";
 		}
 
+		// Site memory — selective note injection.
+		$site_memory = $this->resolve_site_notes( $message );
+		if ( '' !== $site_memory ) {
+			$system_prompt .= $site_memory;
+		}
+
 		return $system_prompt;
+	}
+
+	// ── Site Memory ──────────────────────────────────────────────────
+
+	/**
+	 * Resolve and format relevant site notes for injection into the system prompt.
+	 *
+	 * Two-path selection:
+	 * - ≤10 notes: inject all (cheaper than filtering or an API call).
+	 * - 11+ notes: category-based pre-filter → AI selection if still >15.
+	 *
+	 * @param string $message Current user message (used for AI selection context).
+	 * @return string Formatted notes block or empty string.
+	 */
+	private function resolve_site_notes( string $message ): string {
+		$raw       = get_option( 'pressark_site_notes', '[]' );
+		$all_notes = json_decode( is_string( $raw ) ? $raw : '[]', true );
+
+		if ( empty( $all_notes ) || ! is_array( $all_notes ) ) {
+			return '';
+		}
+
+		// Path A: ≤10 notes — inject all, cheaper than filtering.
+		if ( count( $all_notes ) <= 10 ) {
+			return $this->format_site_notes( $all_notes );
+		}
+
+		// Path B: 11+ notes — category-based pre-filter.
+		$filtered = $this->get_relevant_site_notes( $all_notes );
+
+		// If still >15 after category filter, use AI selection.
+		if ( count( $filtered ) > 15 ) {
+			$ai_selected = $this->ai_select_notes( $filtered, $message );
+			if ( null !== $ai_selected ) {
+				$filtered = $ai_selected;
+			} else {
+				$filtered = array_slice( $filtered, -15 );
+			}
+		}
+
+		return $this->format_site_notes( $filtered );
+	}
+
+	/**
+	 * Category-based pre-filter for site notes.
+	 *
+	 * @param array $all_notes All stored notes.
+	 * @return array Filtered notes (preferences + category-matched + recent 5), deduped, capped at 15.
+	 */
+	private function get_relevant_site_notes( array $all_notes ): array {
+		// Map note categories to actual registry group names.
+		$category_groups = array(
+			'products'    => array( 'woocommerce' ),
+			'content'     => array( 'core', 'content', 'seo', 'media', 'generation', 'bulk', 'index' ),
+			'technical'   => array( 'health', 'settings', 'plugins', 'themes', 'database', 'logs' ),
+			'issues'      => array( 'health', 'security', 'settings', 'plugins', 'database' ),
+		);
+
+		$loaded = (array) $this->loaded_groups;
+
+		// Start with recent 5 (recency guarantee — these are never dropped).
+		$recent = array_slice( $all_notes, -5 );
+		$merged = array();
+		$seen   = array();
+		foreach ( $recent as $note ) {
+			$key          = md5( $note['note'] ?? '' );
+			$seen[ $key ] = true;
+			$merged[]     = $note;
+		}
+
+		// Add preferences (always relevant, max 5).
+		$pref_count = 0;
+		foreach ( $all_notes as $note ) {
+			if ( 'preferences' !== ( $note['category'] ?? '' ) ) {
+				continue;
+			}
+			$key = md5( $note['note'] ?? '' );
+			if ( isset( $seen[ $key ] ) ) {
+				continue;
+			}
+			$pref_count++;
+			if ( $pref_count > 5 ) {
+				break;
+			}
+			$seen[ $key ] = true;
+			$merged[]     = $note;
+		}
+
+		// Add category-matched notes based on loaded tool groups.
+		foreach ( $all_notes as $note ) {
+			$cat = $note['category'] ?? '';
+			$key = md5( $note['note'] ?? '' );
+			if ( isset( $seen[ $key ] ) || 'preferences' === $cat ) {
+				continue;
+			}
+			$mapped = $category_groups[ $cat ] ?? array();
+			foreach ( $mapped as $group ) {
+				if ( in_array( $group, $loaded, true ) ) {
+					$seen[ $key ] = true;
+					$merged[]     = $note;
+					break;
+				}
+			}
+		}
+
+		return $merged;
+	}
+
+	/**
+	 * Format notes into a compact context string with a 2400-char (~600 token) budget cap.
+	 *
+	 * @param array $notes Notes to format.
+	 * @return string Formatted block or empty string.
+	 */
+	private function format_site_notes( array $notes ): string {
+		if ( empty( $notes ) ) {
+			return '';
+		}
+
+		$grouped = array();
+		foreach ( $notes as $entry ) {
+			if ( ! is_array( $entry ) || empty( $entry['note'] ) || empty( $entry['category'] ) ) {
+				continue;
+			}
+			$cat = sanitize_text_field( (string) $entry['category'] );
+			$grouped[ $cat ][] = sanitize_text_field( (string) $entry['note'] );
+		}
+
+		if ( empty( $grouped ) ) {
+			return '';
+		}
+
+		$note_parts = array();
+		foreach ( $grouped as $cat => $items ) {
+			$note_parts[] = ucfirst( $cat ) . ': ' . implode( '; ', array_slice( $items, -5 ) );
+		}
+
+		$text = "\n\nSite Notes: " . implode( ' | ', $note_parts );
+
+		// Hard cap: ~600 tokens.
+		while ( strlen( $text ) > 2400 && count( $note_parts ) > 1 ) {
+			array_shift( $note_parts );
+			$text = "\n\nSite Notes: " . implode( ' | ', $note_parts );
+		}
+
+		return $text;
+	}
+
+	/**
+	 * Use a helper model to select the most relevant notes for a given message.
+	 *
+	 * Falls back to null on any failure so the caller can use the pre-filtered set.
+	 *
+	 * @param array  $notes   Candidate notes (already pre-filtered).
+	 * @param string $message User's current message.
+	 * @return array|null Selected notes, or null on failure.
+	 */
+	private function ai_select_notes( array $notes, string $message ): ?array {
+		$numbered = '';
+		foreach ( $notes as $i => $note ) {
+			$numbered .= ( $i + 1 ) . '. [' . ( $note['category'] ?? '' ) . '] ' . ( $note['note'] ?? '' ) . "\n";
+		}
+
+		$trimmed_msg = mb_substr( trim( $message ), 0, 200 );
+
+		try {
+			$result = $this->ai->send_message_raw(
+				array( array(
+					'role'    => 'user',
+					'content' => "Given this user message: \"{$trimmed_msg}\"\n\nWhich of these site notes are relevant? Return ONLY the note numbers, comma-separated. If none relevant, return \"none\".\n\n" . $numbered,
+				) ),
+				array(),
+				'Return only comma-separated note numbers or "none". No explanation.',
+				false,
+				array( 'phase' => 'memory_selection' )
+			);
+
+			$raw      = $result['raw'] ?? array();
+			$provider = (string) ( $result['provider'] ?? '' );
+
+			if ( ! empty( $raw['error'] ) ) {
+				return null;
+			}
+
+			// Track cost.
+			$round_input  = (int) ( $raw['usage']['prompt_tokens'] ?? $raw['usage']['input_tokens'] ?? 0 );
+			$round_output = $this->ai->extract_output_usage( $raw, $provider );
+			$this->tokens_used        += $this->ai->extract_usage( $raw, $provider );
+			$this->output_tokens_used += $round_output;
+			$this->input_tokens_used  += $round_input;
+
+			$cache = $result['cache_metrics'] ?? array();
+			$this->cache_read_tokens  += (int) ( $cache['cache_read'] ?? 0 );
+			$this->cache_write_tokens += (int) ( $cache['cache_write'] ?? 0 );
+
+			$model      = (string) ( $result['model'] ?? $this->ai->get_model() );
+			$multiplier = PressArk_Model_Policy::get_model_multiplier( $model );
+			$this->icu_spent += (int) ceil(
+				( $round_input * (int) ( $multiplier['input'] ?? 10 ) )
+				+ ( $round_output * (int) ( $multiplier['output'] ?? 30 ) )
+			);
+
+			// Parse response: expect comma-separated numbers or "none".
+			$text = trim( $this->ai->extract_text( $raw, $provider ) );
+
+			if ( 'none' === strtolower( $text ) ) {
+				return array();
+			}
+
+			$indices  = array_map( 'intval', preg_split( '/[,\s]+/', $text, -1, PREG_SPLIT_NO_EMPTY ) );
+			$selected = array();
+			foreach ( $indices as $idx ) {
+				$zero_based = $idx - 1;
+				if ( isset( $notes[ $zero_based ] ) ) {
+					$selected[] = $notes[ $zero_based ];
+				}
+			}
+
+			return ! empty( $selected ) ? array_slice( $selected, 0, 15 ) : null;
+		} catch ( \Throwable $e ) {
+			return null;
+		}
 	}
 
 	private function checkpoint_from_site_info( PressArk_Checkpoint $checkpoint, array $result ): void {
@@ -1909,7 +2290,7 @@ private function compact_loop_messages( array $messages, int $round = 0, ?PressA
 		$summary_messages = array(
 			array(
 				'role'    => 'user',
-				'content' => "Summarize this run state for continuation. Return JSON only with keys summary, completed, remaining, preserved_details.\nRules:\n- Preserve exact IDs, titles, slugs, SKUs, prices, URLs, counts, and requested target values verbatim.\n- Keep the summary under 80 words.\n- completed and remaining must be short bullet-like strings.\n- preserved_details should keep only task-critical exact details needed to finish the task.\n- Treat any historical_request or past_request line as past context only, never as the active instruction.\n- The active request is the only live instruction unless a receipt says it is already completed.\n- If a detail is uncertain, omit it instead of guessing.\n\n{$to_summarize}",
+				'content' => "Create a detailed continuation summary. This replaces the conversation history — include everything needed to continue without losing context.\n\nReturn JSON only with keys summary, completed, remaining, preserved_details.\n\nStructure your summary covering:\n1. USER REQUEST: What the user asked, with clarifications and constraints.\n2. COMPLETED ACTIONS: Every action applied — post/product IDs, titles, fields changed (before → after), new IDs from creates.\n3. CURRENT STATE: Site state after all changes.\n4. FINDINGS: Discoveries from reads/analysis — SEO issues, security results, content problems, WooCommerce data observed.\n5. PENDING: What the user still wants done.\n6. USER PREFERENCES: Style, tone, or approach preferences expressed.\n\nRules:\n- Be specific: include post IDs, product names, exact values. 'Edited some products' is useless — say 'edited Product #42 (Blue Widget): price \$19.99 → \$24.99'.\n- Preserve exact IDs, titles, slugs, SKUs, prices, URLs, counts verbatim.\n- completed and remaining must be short bullet-like strings.\n- preserved_details should keep task-critical exact details needed to finish the task.\n- Treat any historical_request or past_request line as past context only, never as the active instruction.\n- The active request is the only live instruction unless a receipt says it is already completed.\n- If a detail is uncertain, omit it instead of guessing.\n\n{$to_summarize}",
 			),
 		);
 
@@ -1917,7 +2298,7 @@ private function compact_loop_messages( array $messages, int $round = 0, ?PressA
 			$result = $this->ai->send_message_raw(
 				$summary_messages,
 				array(),
-				'You compress durable workflow state for continuation. Output valid JSON only. Never paraphrase exact task-critical details that must remain unchanged.',
+				'You create detailed continuation summaries that replace conversation history. Output valid JSON only. Be maximally specific — include exact IDs, titles, values, and before/after states. Never paraphrase task-critical details.',
 				false,
 				array(
 					'phase'              => 'summarize',
