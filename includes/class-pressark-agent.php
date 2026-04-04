@@ -1170,6 +1170,11 @@ class PressArk_Agent {
 		// v2.4.0: Include checkpoint for frontend round-trip.
 		if ( $checkpoint && ! $checkpoint->is_empty() ) {
 			$checkpoint->set_loaded_tool_groups( $this->loaded_groups );
+			if ( in_array( (string) ( $data['type'] ?? '' ), array( 'preview', 'confirm_card' ), true )
+				&& '' === $checkpoint->get_workflow_stage()
+			) {
+				$checkpoint->set_workflow_stage( 'preview' );
+			}
 			$base['checkpoint'] = $checkpoint->to_array();
 			$replay_sidecar     = $checkpoint->get_replay_sidecar();
 			if ( ! empty( $replay_sidecar ) ) {

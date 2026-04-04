@@ -76,9 +76,6 @@ class PressArk_Run_Approval_Service {
 		// Checkpoint bookkeeping (mirrors class-chat.php handle_confirm).
 		$checkpoint = self::load_run_checkpoint( $run );
 		if ( $checkpoint ) {
-			if ( ! empty( $run['workflow_state'] ) && is_array( $run['workflow_state'] ) ) {
-				$checkpoint->absorb_workflow_state( $run['workflow_state'] );
-			}
 			$action_args = is_array( $action['params'] ?? null ) ? $action['params'] : array();
 			if ( empty( $action_args ) ) {
 				$action_args = $action;
@@ -211,9 +208,6 @@ class PressArk_Run_Approval_Service {
 		// Checkpoint bookkeeping for each executed action.
 		$checkpoint = self::load_run_checkpoint( $run );
 		if ( $checkpoint ) {
-			if ( ! empty( $run['workflow_state'] ) && is_array( $run['workflow_state'] ) ) {
-				$checkpoint->absorb_workflow_state( $run['workflow_state'] );
-			}
 			foreach ( $pending as $idx => $item ) {
 				$action = $item['action'] ?? $item;
 				$op_name = $action['type'] ?? '';
@@ -313,9 +307,6 @@ class PressArk_Run_Approval_Service {
 				$preview->discard( $session_id );
 				$checkpoint = self::load_run_checkpoint( $run );
 				if ( $checkpoint ) {
-					if ( ! empty( $run['workflow_state'] ) && is_array( $run['workflow_state'] ) ) {
-						$checkpoint->absorb_workflow_state( $run['workflow_state'] );
-					}
 					$checkpoint->add_blocker( (string) $blocked_reason );
 					self::persist_run_checkpoint( $run, $checkpoint );
 				}
@@ -346,9 +337,6 @@ class PressArk_Run_Approval_Service {
 		// Checkpoint bookkeeping (mirrors class-chat.php handle_preview_keep).
 		$checkpoint = self::load_run_checkpoint( $run );
 		if ( $checkpoint ) {
-			if ( ! empty( $run['workflow_state'] ) && is_array( $run['workflow_state'] ) ) {
-				$checkpoint->absorb_workflow_state( $run['workflow_state'] );
-			}
 			$checkpoint->record_execution_preview( $session_calls, $result );
 			foreach ( $session_calls as $call ) {
 				$checkpoint->add_approval( (string) ( $call['name'] ?? $call['type'] ?? 'preview_apply' ) );
@@ -390,6 +378,9 @@ class PressArk_Run_Approval_Service {
 		}
 
 		$checkpoint->sync_execution_goal( (string) ( $run['message'] ?? '' ) );
+		if ( ! empty( $run['workflow_state'] ) && is_array( $run['workflow_state'] ) ) {
+			$checkpoint->absorb_run_snapshot( $run['workflow_state'] );
+		}
 		return $checkpoint;
 	}
 

@@ -253,25 +253,60 @@ class PressArk_Run_Store {
 		return is_array( $decoded ) && ! empty( $decoded ) ? $decoded : null;
 	}
 
+	/**
+	 * Build the approval-boundary snapshot stored on a run.
+	 *
+	 * New agent-owned runs persist a full checkpoint snapshot here so preview
+	 * and confirm handlers can recover continuation state even when the chat has
+	 * not been saved yet. Legacy workflow-era payloads are passed through as-is.
+	 *
+	 * @param array  $result Execution result about to pause.
+	 * @param string $stage  Stage to stamp when the snapshot lacks one.
+	 * @return array|null
+	 */
+	public static function build_pause_state( array $result, string $stage = 'preview' ): ?array {
+		$state = is_array( $result['checkpoint'] ?? null ) ? $result['checkpoint'] : array();
+
+		if ( empty( $state ) ) {
+			$state = is_array( $result['workflow_state'] ?? null ) ? $result['workflow_state'] : array();
+		}
+
+		if ( empty( $state ) ) {
+			return null;
+		}
+
+		if ( '' !== $stage && empty( $state['workflow_stage'] ) ) {
+			$state['workflow_stage'] = sanitize_key( $stage );
+		}
+
+		if ( empty( $state['loaded_tool_groups'] ) && ! empty( $result['loaded_groups'] ) && is_array( $result['loaded_groups'] ) ) {
+			$state['loaded_tool_groups'] = array_values( array_unique( array_filter(
+				array_map( 'sanitize_text_field', $result['loaded_groups'] )
+			) ) );
+		}
+
+		return $state;
+	}
+
 	// ── Lifecycle Transitions ────────────────────────────────────────
 
 	/**
 	 * Pause at preview boundary: running → awaiting_preview.
 	 *
-	 * Persists the workflow state and preview session ID so the server
-	 * can resume execution when the user clicks Keep.
+	 * Persists the pause snapshot and preview session ID so the server can
+	 * recover continuation state when the user clicks Keep.
 	 *
 	 * @param string      $run_id             Run ID.
 	 * @param string      $preview_session_id Preview session ID from PressArk_Preview.
-	 * @param array|null  $workflow_state      Serialized workflow state.
-	 * @param string|null $workflow_class      Workflow class name (e.g. PressArk_Workflow_Content_Edit).
+	 * @param array|null  $pause_state         Serialized pause snapshot.
+	 * @param string|null $legacy_workflow_class Legacy workflow class name for historical rows.
 	 * @return bool True if transition succeeded.
 	 */
 	public function pause_for_preview(
 		string  $run_id,
 		string  $preview_session_id,
-		?array  $workflow_state = null,
-		?string $workflow_class = null
+		?array  $pause_state = null,
+		?string $legacy_workflow_class = null
 	): bool {
 		global $wpdb;
 
@@ -282,12 +317,12 @@ class PressArk_Run_Store {
 		);
 		$formats = array( '%s', '%s', '%s' );
 
-		if ( $workflow_state !== null ) {
-			$data['workflow_state'] = wp_json_encode( $workflow_state );
+		if ( $pause_state !== null ) {
+			$data['workflow_state'] = wp_json_encode( $pause_state );
 			$formats[]              = '%s';
 		}
-		if ( $workflow_class !== null ) {
-			$data['workflow_class'] = $workflow_class;
+		if ( $legacy_workflow_class !== null ) {
+			$data['workflow_class'] = $legacy_workflow_class;
 			$formats[]              = '%s';
 		}
 
@@ -310,15 +345,15 @@ class PressArk_Run_Store {
 	 *
 	 * @param string      $run_id          Run ID.
 	 * @param array       $pending_actions Pending actions awaiting confirmation.
-	 * @param array|null  $workflow_state   Serialized workflow state.
-	 * @param string|null $workflow_class   Workflow class name.
+	 * @param array|null  $pause_state      Serialized pause snapshot.
+	 * @param string|null $legacy_workflow_class Legacy workflow class name for historical rows.
 	 * @return bool True if transition succeeded.
 	 */
 	public function pause_for_confirm(
 		string  $run_id,
 		array   $pending_actions,
-		?array  $workflow_state = null,
-		?string $workflow_class = null
+		?array  $pause_state = null,
+		?string $legacy_workflow_class = null
 	): bool {
 		global $wpdb;
 
@@ -329,12 +364,12 @@ class PressArk_Run_Store {
 		);
 		$formats = array( '%s', '%s', '%s' );
 
-		if ( $workflow_state !== null ) {
-			$data['workflow_state'] = wp_json_encode( $workflow_state );
+		if ( $pause_state !== null ) {
+			$data['workflow_state'] = wp_json_encode( $pause_state );
 			$formats[]              = '%s';
 		}
-		if ( $workflow_class !== null ) {
-			$data['workflow_class'] = $workflow_class;
+		if ( $legacy_workflow_class !== null ) {
+			$data['workflow_class'] = $legacy_workflow_class;
 			$formats[]              = '%s';
 		}
 

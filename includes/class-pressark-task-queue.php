@@ -520,22 +520,18 @@ class PressArk_Task_Queue {
 				$run_store   = new PressArk_Run_Store();
 
 				if ( 'preview' === $result_type ) {
-					$wf_state = $result['workflow_state'] ?? null;
-					$wf_class = is_array( $wf_state ) ? ( $wf_state['workflow_class'] ?? null ) : null;
+					$pause_state = PressArk_Run_Store::build_pause_state( $result, 'preview' );
 					$run_store->pause_for_preview(
 						$run_id,
 						$result['preview_session_id'] ?? '',
-						$wf_state,
-						$wf_class
+						$pause_state
 					);
 				} elseif ( 'confirm_card' === $result_type ) {
-					$wf_state = $result['workflow_state'] ?? null;
-					$wf_class = is_array( $wf_state ) ? ( $wf_state['workflow_class'] ?? null ) : null;
+					$pause_state = PressArk_Run_Store::build_pause_state( $result, 'preview' );
 					$run_store->pause_for_confirm(
 						$run_id,
 						$result['pending_actions'] ?? array(),
-						$wf_state,
-						$wf_class
+						$pause_state
 					);
 				} else {
 					$result = PressArk_Pipeline::settle_run( $run_id, $result );

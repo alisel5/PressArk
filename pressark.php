@@ -203,12 +203,6 @@ spl_autoload_register( static function ( string $class ): void {
 		'PressArk_Watchdog_Preferences'  => 'includes/class-pressark-watchdog-preferences.php',
 		'PressArk_Watchdog_Templates'    => 'includes/class-pressark-watchdog-templates.php',
 		'PressArk_WC_Events'             => 'includes/class-pressark-wc-events.php',
-		'PressArk_Workflow_Content_Create' => 'includes/class-pressark-workflow-content-create.php',
-		'PressArk_Workflow_Content_Edit' => 'includes/class-pressark-workflow-content-edit.php',
-		'PressArk_Workflow_Router'       => 'includes/class-pressark-workflow-router.php',
-		'PressArk_Workflow_Runner'       => 'includes/class-pressark-workflow-runner.php',
-		'PressArk_Workflow_SEO_Fix'      => 'includes/class-pressark-workflow-seo-fix.php',
-		'PressArk_Workflow_Woo_Ops'      => 'includes/class-pressark-workflow-woo-ops.php',
 		'PressArk'                       => 'includes/class-pressark.php',
 	);
 

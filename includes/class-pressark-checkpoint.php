@@ -874,6 +874,30 @@ class PressArk_Checkpoint {
 		}
 	}
 
+	/**
+	 * Absorb a durable run snapshot into this checkpoint.
+	 *
+	 * New agent-owned runs persist a full checkpoint snapshot at approval
+	 * boundaries. Legacy workflow-era runs persisted a narrower workflow_state
+	 * array. This bridge accepts either shape so resume/approval flows keep
+	 * working after workflow execution has been removed.
+	 *
+	 * @param array $snapshot Run-owned pause snapshot.
+	 * @param array $fallback Optional fallback values for legacy workflow state.
+	 */
+	public function absorb_run_snapshot( array $snapshot, array $fallback = array() ): void {
+		if ( empty( $snapshot ) ) {
+			return;
+		}
+
+		if ( self::looks_like_checkpoint_snapshot( $snapshot ) ) {
+			$this->replace_with( self::merge( $this, self::from_array( $snapshot ) ) );
+			return;
+		}
+
+		$this->absorb_workflow_state( $snapshot, $fallback );
+	}
+
 	public function absorb_workflow_state( array $workflow_state, array $fallback = array() ): void {
 		if ( ! empty( $workflow_state['workflow_stage'] ) ) {
 			$this->set_workflow_stage( (string) $workflow_state['workflow_stage'] );
@@ -1105,6 +1129,58 @@ class PressArk_Checkpoint {
 		}
 
 		return count( $client ) >= count( $server ) ? $client : $server;
+	}
+
+	/**
+	 * Replace the in-memory checkpoint state with another checkpoint instance.
+	 */
+	private function replace_with( self $other ): void {
+		$this->goal               = $other->goal;
+		$this->entities           = $other->entities;
+		$this->facts              = $other->facts;
+		$this->pending            = $other->pending;
+		$this->constraints        = $other->constraints;
+		$this->outcomes           = $other->outcomes;
+		$this->retrieval          = $other->retrieval;
+		$this->execution          = $other->execution;
+		$this->turn               = $other->turn;
+		$this->updated_at         = $other->updated_at;
+		$this->selected_target    = $other->selected_target;
+		$this->workflow_stage     = $other->workflow_stage;
+		$this->approvals          = $other->approvals;
+		$this->blockers           = $other->blockers;
+		$this->context_capsule    = $other->context_capsule;
+		$this->loaded_tool_groups = $other->loaded_tool_groups;
+		$this->bundle_ids         = $other->bundle_ids;
+		$this->replay_state       = $other->replay_state;
+		$this->plan_state         = $other->plan_state;
+	}
+
+	/**
+	 * Detect whether a run snapshot is already shaped like a full checkpoint.
+	 */
+	private static function looks_like_checkpoint_snapshot( array $snapshot ): bool {
+		foreach ( array(
+			'goal',
+			'entities',
+			'facts',
+			'pending',
+			'constraints',
+			'outcomes',
+			'retrieval',
+			'execution',
+			'turn',
+			'updated_at',
+			'context_capsule',
+			'replay_state',
+			'plan_state',
+		) as $key ) {
+			if ( array_key_exists( $key, $snapshot ) ) {
+				return true;
+			}
+		}
+
+		return false;
 	}
 
 	/**

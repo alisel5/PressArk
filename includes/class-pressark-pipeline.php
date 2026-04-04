@@ -3,7 +3,7 @@
  * PressArk Pipeline — Unified post-execution orchestration.
  *
  * Extracted from class-chat.php process_chat() and class-pressark-task-queue.php
- * finalize_result(). All paths (workflow, agent, legacy, async) share this
+ * finalize_result(). All paths (agent, legacy, async) share this
  * single settlement/tracking/response-building pipeline.
  *
  * @package PressArk
@@ -86,11 +86,10 @@ class PressArk_Pipeline {
 	 * Normalizes usage data from any result shape:
 	 * - Agent: input_tokens, output_tokens (top-level keys)
 	 * - Legacy: usage.prompt_tokens, usage.completion_tokens (nested keys)
-	 * - Workflow: tokens_used only (no breakdown)
 	 * - Async: same as agent
 	 *
-	 * @param array  $result Raw result from agent/workflow/legacy.
-	 * @param string $route  'agent' | 'workflow' | 'legacy' | 'async'.
+	 * @param array  $result Raw result from agent/legacy/async.
+	 * @param string $route  'agent' | 'legacy' | 'async'.
 	 * @return array Token status from reservation->settle().
 	 */
 	public function settle( array $result, string $route = 'agent' ): array {
@@ -182,7 +181,7 @@ class PressArk_Pipeline {
 	/**
 	 * Build pending_actions array from raw tool calls.
 	 *
-	 * Eliminates the duplicate confirm_card building in workflow/agent paths.
+	 * Eliminates duplicate confirm_card building across execution paths.
 	 *
 	 * @param array    $tool_calls  Raw tool calls from AI response.
 	 * @param callable $preview_fn  Preview generator (e.g. chat->generate_preview).
@@ -213,8 +212,8 @@ class PressArk_Pipeline {
 	 *
 	 * Preserves all path-specific fields while sharing the common base.
 	 *
-	 * @param array  $result       Raw result from agent/workflow/legacy.
-	 * @param string $route        'agent' | 'workflow' | 'legacy'.
+	 * @param array  $result       Raw result from agent/legacy/async.
+	 * @param string $route        'agent' | 'legacy' | 'async'.
 	 * @param array  $token_status Settlement result.
 	 * @return WP_REST_Response
 	 */
@@ -247,7 +246,6 @@ class PressArk_Pipeline {
 			'agent_rounds',
 			'icu_spent',
 			'task_type',
-			'workflow_class',
 			'loaded_groups',
 			'tool_loading',
 			'exit_reason',
@@ -265,8 +263,8 @@ class PressArk_Pipeline {
 			$data['budget'] = $this->build_budget_response( (array) $result['budget'], $result, $token_status );
 		}
 
-		// Steps (agent + workflow paths).
-		if ( in_array( $route, array( 'agent', 'workflow' ), true ) ) {
+		// Steps for interactive, tool-capable paths.
+		if ( 'agent' === $route ) {
 			$data['steps'] = $result['steps'] ?? array();
 		}
 
@@ -282,7 +280,7 @@ class PressArk_Pipeline {
 			$data['diff']               = $result['diff'] ?? array();
 		}
 
-		// v3.1.0: workflow_state is now server-internal only (persisted in run store).
+		// v3.1.0: workflow_state is now a server-internal pause snapshot (persisted in run store).
 		// Deliberately omitted from the public response.
 
 		// Error flag.
@@ -340,14 +338,14 @@ class PressArk_Pipeline {
 	// ── Run Lifecycle (v3.1.0) ────────────────────────────────────
 
 	/**
-	 * Settle a durable run record, optionally resuming workflow verify.
+	 * Settle a durable run record.
 	 *
 	 * Central authority for run settlement — used by confirm, preview keep,
 	 * and async worker instead of calling Run_Store directly.
 	 *
 	 * @param string $run_id Run ID to settle.
 	 * @param array  $result Execution result.
-	 * @return array Result, potentially enriched with verification.
+	 * @return array Result with run_id attached.
 	 */
 	public static function settle_run( string $run_id, array $result ): array {
 		$run_store = new PressArk_Run_Store();
@@ -355,14 +353,6 @@ class PressArk_Pipeline {
 
 		if ( ! $run || (int) $run['user_id'] !== get_current_user_id() ) {
 			return $result;
-		}
-
-		// Resume workflow verify if the run originated from a workflow.
-		if ( ! empty( $run['workflow_class'] ) && ! empty( $run['workflow_state'] ) ) {
-			$verification = self::resume_workflow_verify( $run, $result );
-			if ( $verification ) {
-				$result['verification'] = $verification;
-			}
 		}
 
 		$run_store->settle( $run['run_id'], $result );
@@ -382,50 +372,16 @@ class PressArk_Pipeline {
 		$run_store->fail( $run_id, $reason );
 	}
 
-	/**
-	 * Resume the workflow verify phase after preview keep or confirm.
-	 *
-	 * @param array $run    Run record from PressArk_Run_Store.
-	 * @param array $result Result from Preview::keep() or confirm execution.
-	 * @return array|null Verification result, or null if class not found.
-	 */
-	private static function resume_workflow_verify( array $run, array $result ): ?array {
-		$class = $run['workflow_class'];
-		if ( ! class_exists( $class ) ) {
-			return null;
-		}
-
-		try {
-			$tier      = $run['tier'] ?? 'free';
-			$connector = new PressArk_AI_Connector( $tier );
-			$logger    = new PressArk_Action_Logger();
-			$engine    = new PressArk_Action_Engine( $logger );
-
-			/** @var PressArk_Workflow_Runner $workflow */
-			$workflow = new $class( $connector, $engine, $tier );
-			$workflow->restore_state( $run['workflow_state'] );
-
-			return $workflow->run_post_apply( $result );
-		} catch ( \Throwable $e ) {
-			PressArk_Error_Tracker::error( 'Pipeline', 'Workflow verify failed', array( 'run_id' => $run['run_id'], 'error' => $e->getMessage() ) );
-			return array(
-				'type'     => 'final_response',
-				'message'  => 'Changes applied, but verification encountered an issue: ' . $e->getMessage(),
-				'is_error' => true,
-			);
-		}
-	}
-
 	// ── Full Finalize ──────────────────────────────────────────────
 
 	/**
 	 * One-call finalization for all execution paths.
 	 *
 	 * Replaces the duplicated settle → track → release → reconcile sequence
-	 * that was previously copied across workflow, agent, and legacy paths.
+	 * that was previously copied across agent and legacy paths.
 	 *
 	 * @param array  $result Raw result from any execution path.
-	 * @param string $route  'agent' | 'workflow' | 'legacy'.
+	 * @param string $route  'agent' | 'legacy' | 'async'.
 	 * @return array{token_status: array, response: WP_REST_Response}
 	 */
 	public function finalize( array $result, string $route ): array {

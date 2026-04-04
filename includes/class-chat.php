@@ -1162,7 +1162,7 @@ class PressArk_Chat {
 	 * Process a streaming chat request.
 	 *
 	 * Uses SSE to stream tokens and step events in real-time.
-	 * Falls back to non-streaming for workflow/legacy routes.
+	 * Falls back to non-streaming for legacy routes.
 	 *
 	 * @since 4.4.0
 	 */
@@ -1204,14 +1204,15 @@ class PressArk_Chat {
 					}
 				);
 			} else {
-				// Workflow / Legacy — no streaming, emit full result at end.
-				$result = match ( $routing['route'] ) {
-					PressArk_Router::ROUTE_WORKFLOW => $routing['handler']->run(
-						$ctx['message'], $ctx['conversation'], $ctx['screen'], $ctx['post_id'] ),
-					PressArk_Router::ROUTE_LEGACY => $this->run_legacy_raw(
-						$ctx['message'], $ctx['conversation'], $ctx['deep_mode'],
-						$ctx['post_id'], $ctx['screen'], $ctx['connector'] ),
-				};
+				// Legacy path — no streaming, emit full result at end.
+				$result = $this->run_legacy_raw(
+					$ctx['message'],
+					$ctx['conversation'],
+					$ctx['deep_mode'],
+					$ctx['post_id'],
+					$ctx['screen'],
+					$ctx['connector']
+				);
 			}
 
 			if ( ! empty( $result['cancelled'] ) || $run_cancel_check() ) {
@@ -1232,22 +1233,18 @@ class PressArk_Chat {
 			$result_type = $result['type'] ?? 'final_response';
 
 			if ( 'preview' === $result_type ) {
-				$wf_state = $result['workflow_state'] ?? null;
-				$wf_class = is_array( $wf_state ) ? ( $wf_state['workflow_class'] ?? null ) : null;
+				$pause_state = PressArk_Run_Store::build_pause_state( $result, 'preview' );
 				$run_store->pause_for_preview(
 					$ctx['run_id'],
 					$result['preview_session_id'] ?? '',
-					$wf_state,
-					$wf_class
+					$pause_state
 				);
 			} elseif ( 'confirm_card' === $result_type ) {
-				$wf_state = $result['workflow_state'] ?? null;
-				$wf_class = is_array( $wf_state ) ? ( $wf_state['workflow_class'] ?? null ) : null;
+				$pause_state = PressArk_Run_Store::build_pause_state( $result, 'preview' );
 				$run_store->pause_for_confirm(
 					$ctx['run_id'],
 					$result['pending_actions'] ?? array(),
-					$wf_state,
-					$wf_class
+					$pause_state
 				);
 			}
 
@@ -1256,22 +1253,6 @@ class PressArk_Chat {
 				$cp = PressArk_Checkpoint::from_array( $result['checkpoint'] );
 				$cp->touch();
 				$cp->save( $ctx['chat_id'], $ctx['user_id'] );
-			}
-
-			// Enrich workflow checkpoint.
-			if ( $ctx['chat_id'] > 0
-				&& PressArk_Router::ROUTE_WORKFLOW === $routing['route']
-				&& isset( $routing['handler'] )
-			) {
-				$wf_cp = PressArk_Checkpoint::load( $ctx['chat_id'], $ctx['user_id'] ) ?? new PressArk_Checkpoint();
-				$this->enrich_workflow_checkpoint(
-					$wf_cp,
-					$result,
-					method_exists( $routing['handler'], 'get_tool_groups' ) ? $routing['handler']->get_tool_groups() : array(),
-					$ctx['message']
-				);
-				$wf_cp->touch();
-				$wf_cp->save( $ctx['chat_id'], $ctx['user_id'] );
 			}
 
 			// Finalize (settle tokens, track, release slot).
@@ -1327,10 +1308,9 @@ class PressArk_Chat {
 			$agent->set_run_context( $run_id, (int) $chat_id );
 
 			$result = match ( $routing['route'] ) {
-				PressArk_Router::ROUTE_WORKFLOW => $routing['handler']->run( $ctx['message'], $ctx['conversation'], $ctx['screen'], $ctx['post_id'] ),
-				PressArk_Router::ROUTE_AGENT   => $agent->run(
+				PressArk_Router::ROUTE_AGENT  => $agent->run(
 					$ctx['message'], $ctx['conversation'], $ctx['deep_mode'], $ctx['screen'], $ctx['post_id'], $ctx['loaded_groups'], $ctx['checkpoint_data'], $run_cancel_check ),
-				PressArk_Router::ROUTE_LEGACY  => $this->run_legacy_raw(
+				PressArk_Router::ROUTE_LEGACY => $this->run_legacy_raw(
 					$ctx['message'], $ctx['conversation'], $ctx['deep_mode'], $ctx['post_id'], $ctx['screen'], $ctx['connector'] ),
 			};
 
@@ -1349,53 +1329,33 @@ class PressArk_Chat {
 			// Attach run_id to result so pipeline passes it to the response.
 			$result['run_id'] = $run_id;
 
-			// ── Persist run state on approval boundaries ─────────
+			// Persist run state on approval boundaries.
 			$result_type = $result['type'] ?? 'final_response';
 
 			if ( 'preview' === $result_type ) {
-				$wf_state = $result['workflow_state'] ?? null;
-				$wf_class = is_array( $wf_state ) ? ( $wf_state['workflow_class'] ?? null ) : null;
+				$pause_state = PressArk_Run_Store::build_pause_state( $result, 'preview' );
 				$run_store->pause_for_preview(
 					$run_id,
 					$result['preview_session_id'] ?? '',
-					$wf_state,
-					$wf_class
+					$pause_state
 				);
 			} elseif ( 'confirm_card' === $result_type ) {
-				$wf_state = $result['workflow_state'] ?? null;
-				$wf_class = is_array( $wf_state ) ? ( $wf_state['workflow_class'] ?? null ) : null;
+				$pause_state = PressArk_Run_Store::build_pause_state( $result, 'preview' );
 				$run_store->pause_for_confirm(
 					$run_id,
 					$result['pending_actions'] ?? array(),
-					$wf_state,
-					$wf_class
+					$pause_state
 				);
 			}
 
-			// ── Persist checkpoint server-side ───────────────────
+			// Persist checkpoint server-side.
 			if ( $chat_id > 0 && ! empty( $result['checkpoint'] ) ) {
 				$cp = PressArk_Checkpoint::from_array( $result['checkpoint'] );
 				$cp->touch();
 				$cp->save( $chat_id, $ctx['user_id'] );
 			}
 
-			// ── Enrich checkpoint from workflow results ──────────
-			if ( $chat_id > 0
-				&& PressArk_Router::ROUTE_WORKFLOW === $routing['route']
-				&& isset( $routing['handler'] )
-			) {
-				$wf_cp = PressArk_Checkpoint::load( $chat_id, $ctx['user_id'] ) ?? new PressArk_Checkpoint();
-				$this->enrich_workflow_checkpoint(
-					$wf_cp,
-					$result,
-					method_exists( $routing['handler'], 'get_tool_groups' ) ? $routing['handler']->get_tool_groups() : array(),
-					$ctx['message']
-				);
-				$wf_cp->touch();
-				$wf_cp->save( $chat_id, $ctx['user_id'] );
-			}
-
-			// ── Finalize (settle tokens, track, release slot) ────
+			// Finalize (settle tokens, track, release slot).
 			$finalized = $pipeline->finalize( $result, $routing['route'] );
 
 			if ( ! empty( $result['cancelled'] ) ) {
@@ -1666,7 +1626,7 @@ class PressArk_Chat {
 	 * Handle action confirmation (approve or cancel).
 	 *
 	 * v3.1.0: Run-aware. If run_id is provided, looks up the originating run,
-	 * restores workflow state, and executes the post-apply verify phase.
+	 * restores the persisted pause snapshot, and executes the post-apply verify phase.
 	 * Falls back to legacy behavior if run_id is empty (backward compat).
 	 *
 	 * v3.7.2: Server-authoritative action loading. When run_id is provided,
@@ -1821,9 +1781,6 @@ class PressArk_Chat {
 			}
 
 			$checkpoint = $this->load_or_bootstrap_run_checkpoint( $run );
-			if ( ! empty( $run['workflow_state'] ) && is_array( $run['workflow_state'] ) ) {
-				$checkpoint->absorb_workflow_state( $run['workflow_state'] );
-			}
 			$checkpoint->record_execution_write( (string) ( $action['type'] ?? '' ), $action_args, $result );
 			if ( ! empty( $result['success'] ) ) {
 				$checkpoint->clear_blockers();
@@ -1885,7 +1842,7 @@ class PressArk_Chat {
 	 * Handle preview keep — promote staged changes to live.
 	 *
 	 * v3.1.0: Run-aware. Looks up the originating run by preview session ID,
-	 * restores workflow state, and executes the post-apply verify phase.
+	 * restores the persisted pause snapshot, and executes the post-apply verify phase.
 	 * Falls back to legacy behavior if no run record exists (backward compat).
 	 */
 	public function handle_preview_keep( WP_REST_Request $request ): WP_REST_Response {
@@ -1919,9 +1876,6 @@ class PressArk_Chat {
 				$result = PressArk_Pipeline::settle_run( $run['run_id'], $result );
 
 				$checkpoint = $this->load_or_bootstrap_run_checkpoint( $run );
-				if ( ! empty( $run['workflow_state'] ) && is_array( $run['workflow_state'] ) ) {
-					$checkpoint->absorb_workflow_state( $run['workflow_state'] );
-				}
 				$checkpoint->record_execution_preview( $session_calls, $result );
 				foreach ( $session_calls as $call ) {
 					$checkpoint->add_approval( (string) ( $call['name'] ?? $call['type'] ?? 'preview_apply' ) );
@@ -2021,7 +1975,7 @@ class PressArk_Chat {
 		}
 	}
 
-	// v3.1.0: Workflow resume logic moved to PressArk_Pipeline::settle_run().
+	// v3.1.0: Run settlement continuation logic lives in PressArk_Pipeline::settle_run().
 
 	/**
 	 * Load the checkpoint for a durable run, or bootstrap a new one.
@@ -2041,6 +1995,9 @@ class PressArk_Chat {
 		}
 
 		$checkpoint->sync_execution_goal( (string) ( $run['message'] ?? '' ) );
+		if ( ! empty( $run['workflow_state'] ) && is_array( $run['workflow_state'] ) ) {
+			$checkpoint->absorb_run_snapshot( $run['workflow_state'] );
+		}
 		return $checkpoint;
 	}
 
@@ -2054,39 +2011,6 @@ class PressArk_Chat {
 
 		if ( $chat_id > 0 ) {
 			$checkpoint->save( $chat_id, $user_id );
-		}
-	}
-
-	/**
-	 * Copy workflow state into the durable checkpoint without replaying transcript text.
-	 */
-	private function enrich_workflow_checkpoint(
-		PressArk_Checkpoint $checkpoint,
-		array $result,
-		array $tool_groups = array(),
-		string $source_message = ''
-	): void {
-		if ( '' !== trim( $source_message ) ) {
-			$checkpoint->sync_execution_goal( $source_message );
-		}
-
-		$workflow_state = is_array( $result['workflow_state'] ?? null ) ? $result['workflow_state'] : array();
-		$checkpoint->absorb_workflow_state( $workflow_state, array( 'tool_groups' => $tool_groups ) );
-
-		if ( ! empty( $result['is_error'] ) ) {
-			$checkpoint->add_blocker( (string) ( $result['message'] ?? 'Workflow failed.' ) );
-		} else {
-			$checkpoint->clear_blockers();
-		}
-
-		if ( empty( $workflow_state['workflow_stage'] ) ) {
-			$result_type = $result['type'] ?? 'final_response';
-			$stage_map   = array(
-				'preview'        => 'preview',
-				'confirm_card'   => 'preview',
-				'final_response' => 'settled',
-			);
-			$checkpoint->set_workflow_stage( $stage_map[ $result_type ] ?? 'settled' );
 		}
 	}
 
