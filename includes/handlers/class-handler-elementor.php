@@ -511,6 +511,10 @@ class PressArk_Handler_Elementor extends PressArk_Handler_Base {
 		$err = $this->require_elementor(); if ($err) return $err;
 
 		$widget_type = sanitize_text_field( $params['widget_type'] ?? '' );
+		$mode        = sanitize_key( (string) ( $params['mode'] ?? ( $widget_type ? 'detail' : 'summary' ) ) );
+		if ( ! in_array( $mode, array( 'summary', 'detail' ), true ) ) {
+			$mode = $widget_type ? 'detail' : 'summary';
+		}
 		$elementor   = new PressArk_Elementor();
 
 		if ( $widget_type ) {
@@ -520,11 +524,40 @@ class PressArk_Handler_Elementor extends PressArk_Handler_Base {
 				/* translators: %s: widget type name */
 				return array( 'success' => false, 'message' => sprintf( __( "Widget type '%s' not found.", 'pressark' ), $widget_type ) );
 			}
+			if ( 'summary' === $mode ) {
+				$content_fields = array_values( array_map(
+					static function ( array $field ) {
+						return array_filter( array(
+							'name'  => $field['name'] ?? '',
+							'label' => $field['label'] ?? '',
+							'type'  => $field['type'] ?? '',
+						), static function ( $value ) {
+							return '' !== $value;
+						} );
+					},
+					(array) ( $schema['content_fields'] ?? array() )
+				) );
+
+				return array(
+					'success' => true,
+					'message' => sprintf( __( "Summary for '%1\$s': %2\$s content fields, %3\$s style fields.", 'pressark' ), $widget_type, count( $schema['content_fields'] ?? array() ), count( $schema['style_fields'] ?? array() ) ),
+					'data'    => array(
+						'name'           => $widget_type,
+						'title'          => $schema['title'] ?? $widget_type,
+						'categories'     => $schema['categories'] ?? array(),
+						'content_fields' => array_slice( $content_fields, 0, 12 ),
+						'style_field_count' => count( $schema['style_fields'] ?? array() ),
+						'detail_hint'    => __( 'Use mode=detail to load the full widget schema.', 'pressark' ),
+						'mode'           => 'summary',
+					),
+				);
+			}
+
 			return array(
 				'success' => true,
 				/* translators: 1: widget type name, 2: content field count, 3: style field count */
 				'message' => sprintf( __( "Schema for '%1\$s': %2\$s content fields, %3\$s style fields.", 'pressark' ), $widget_type, count( $schema['content_fields'] ?? array() ), count( $schema['style_fields'] ?? array() ) ),
-				'data'    => $schema,
+				'data'    => array_merge( $schema, array( 'mode' => 'detail' ) ),
 			);
 		}
 
@@ -548,6 +581,7 @@ class PressArk_Handler_Elementor extends PressArk_Handler_Base {
 				'total'   => count( $summary ),
 				'widgets' => $summary,
 				'hint'    => __( 'Use widget_type to get full schema with all fields for a specific widget.', 'pressark' ),
+				'mode'    => 'summary',
 			),
 		);
 	}

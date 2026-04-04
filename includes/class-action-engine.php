@@ -106,6 +106,64 @@ class PressArk_Action_Engine {
 				);
 			}
 
+			// v5.5.0: Central preflight — canonicalization, rerouting, and guards.
+			$preflight = PressArk_Preflight::check( $type, $params );
+
+			switch ( $preflight['action'] ?? PressArk_Preflight::ACTION_PROCEED ) {
+				case PressArk_Preflight::ACTION_BLOCK:
+					return array(
+						'success'     => false,
+						'message'     => $preflight['reason'] ?? __( 'Blocked by preflight check.', 'pressark' ),
+						'hint'        => $preflight['hint'] ?? '',
+						'action_type' => $type,
+						'preflight'   => $preflight,
+					);
+
+				case PressArk_Preflight::ACTION_REROUTE:
+					// Swap tool and params — re-enter execute_single with the canonical tool.
+					$rerouted_action = array(
+						'type'   => $preflight['tool'],
+						'params' => $preflight['params'] ?? array(),
+					);
+
+					PressArk_Error_Tracker::info(
+						'Preflight',
+						'Rerouted tool call',
+						array(
+							'from'   => $type,
+							'to'     => $preflight['tool'],
+							'reason' => $preflight['reason'] ?? '',
+						)
+					);
+
+					$rerouted_result = $this->execute_single( $rerouted_action, $skip_log );
+
+					// Annotate the result so the model knows a reroute happened.
+					$rerouted_result['preflight_reroute'] = array(
+						'original_tool'  => $type,
+						'rerouted_to'    => $preflight['tool'],
+						'reason'         => $preflight['reason'] ?? '',
+						'hint'           => $preflight['hint'] ?? '',
+					);
+
+					return $rerouted_result;
+
+				case PressArk_Preflight::ACTION_REWRITE:
+					// Same tool, adjusted params.
+					$params = $preflight['params'] ?? $params;
+					PressArk_Error_Tracker::info(
+						'Preflight',
+						'Rewrote tool params',
+						array( 'tool' => $type, 'reason' => $preflight['reason'] ?? '' )
+					);
+					break;
+
+				case PressArk_Preflight::ACTION_PROCEED:
+				default:
+					// No intervention.
+					break;
+			}
+
 			$tool_group      = PressArk_Operation_Registry::get_group( $type );
 			$tool_capability = PressArk_Operation_Registry::classify( $type, $params );
 
@@ -130,7 +188,51 @@ class PressArk_Action_Engine {
 				}
 			}
 
-			// v5.3.0: Fire pre_execute policy hooks.
+			// v5.4.0: Policy engine evaluation — deny/ask before execution.
+			if ( class_exists( 'PressArk_Policy_Engine' ) ) {
+				$exec_context = $skip_log
+					? PressArk_Policy_Engine::CONTEXT_AGENT_READ
+					: PressArk_Policy_Engine::CONTEXT_INTERACTIVE;
+
+				$verdict = PressArk_Policy_Engine::evaluate( $type, $params, $exec_context );
+
+				if ( PressArk_Policy_Engine::is_denied( $verdict ) ) {
+					return array(
+						'success'        => false,
+						'message'        => implode( ' ', $verdict['reasons'] ?? array( 'Blocked by policy.' ) ),
+						'action_type'    => $type,
+						'policy_verdict' => $verdict,
+					);
+				}
+
+				// ASK verdicts in the action engine don't block — the existing
+				// preview/confirm flow already handles interactive confirmation.
+				// We surface the verdict for callers that need it (e.g., agentic loop).
+				if ( PressArk_Policy_Engine::is_ask( $verdict ) && $skip_log ) {
+					// In agent-read context, ask = deny (no human to confirm).
+					return array(
+						'success'        => false,
+						'message'        => implode( ' ', $verdict['reasons'] ?? array( 'Requires human confirmation.' ) ),
+						'action_type'    => $type,
+						'policy_verdict' => $verdict,
+					);
+				}
+			}
+
+			// v5.4.0: Global pre-operation hook (can transform params or block).
+			if ( class_exists( 'PressArk_Policy_Engine' ) ) {
+				$pre_check = PressArk_Policy_Engine::pre_operation( $type, $params, $exec_context ?? PressArk_Policy_Engine::CONTEXT_INTERACTIVE );
+				if ( ! $pre_check['proceed'] ) {
+					return array(
+						'success'     => false,
+						'message'     => $pre_check['reason'] ?? __( 'Blocked by pre-operation filter.', 'pressark' ),
+						'action_type' => $type,
+					);
+				}
+				$params = $pre_check['params'];
+			}
+
+			// v5.3.0: Fire per-operation pre_execute policy hooks.
 			$pre_hooks = PressArk_Operation_Registry::get_policy_hooks( $type, 'pre_execute' );
 			foreach ( $pre_hooks as $hook_name ) {
 				$params = apply_filters( $hook_name, $params, $type );
@@ -140,10 +242,20 @@ class PressArk_Action_Engine {
 
 			$result['action_type'] = $type;
 
-			// v5.3.0: Fire post_execute policy hooks.
+			// v5.3.0: Fire per-operation post_execute policy hooks.
 			$post_hooks = PressArk_Operation_Registry::get_policy_hooks( $type, 'post_execute' );
 			foreach ( $post_hooks as $hook_name ) {
 				$result = apply_filters( $hook_name, $result, $type, $params );
+			}
+
+			// v5.4.0: Global post-operation hook (can transform result).
+			if ( class_exists( 'PressArk_Policy_Engine' ) ) {
+				$result = PressArk_Policy_Engine::post_operation(
+					$type,
+					$result,
+					$params,
+					$exec_context ?? PressArk_Policy_Engine::CONTEXT_INTERACTIVE
+				);
 			}
 
 			if ( ( $result['success'] ?? false ) && ! empty( $tool_group ) && 'read' !== $tool_capability ) {

@@ -68,6 +68,9 @@ class PressArk_Agent {
 	private string                 $actual_provider = '';    // Provider used in API calls.
 	private string                 $actual_model    = '';    // Model used in API calls.
 	private array                  $steps       = array();
+	private ?PressArk_Token_Budget_Manager $budget_manager = null;
+	private array                  $budget_report = array();
+	private array                  $history_budget = array();
 
 	// v2.3.1: Conversation-scoped tool loading state.
 	private array  $loaded_groups      = array();
@@ -90,6 +93,8 @@ class PressArk_Agent {
 
 	// v4.0.0: Automation context for unattended runs.
 	private ?array $automation_context = null;
+	private string $run_id             = '';
+	private int    $chat_id            = 0;
 
 	public function __construct(
 		PressArk_AI_Connector  $ai,
@@ -111,6 +116,14 @@ class PressArk_Agent {
 	 */
 	public function set_async_context( string $task_id ): void {
 		$this->engine->set_async_context( $task_id );
+	}
+
+	/**
+	 * Set durable run metadata for prompt-side tool-result artifact storage.
+	 */
+	public function set_run_context( string $run_id, int $chat_id = 0 ): void {
+		$this->run_id  = sanitize_key( $run_id );
+		$this->chat_id = max( 0, $chat_id );
 	}
 
 	/**
@@ -255,6 +268,9 @@ class PressArk_Agent {
 		$this->actual_provider     = '';
 		$this->actual_model        = '';
 		$this->steps               = array();
+		$this->budget_manager      = null;
+		$this->budget_report       = array();
+		$this->history_budget      = array();
 		$this->loaded_groups       = $loaded_groups;
 		$this->discover_calls      = 0;
 		$this->discover_zero_hits  = 0;
@@ -295,9 +311,31 @@ class PressArk_Agent {
 				'content' => $plan_items,
 			);
 			$emit_fn( 'plan', $plan_items );
+
+			// v5.3.0: Transition plan state — mark the plan as approved and
+			// ready for execution when multi-step plans are generated.
+			$checkpoint->set_plan_phase( 'executing' );
+			$checkpoint->set_plan_text( implode( "\n", $this->plan_steps ) );
 		}
 
+		// v5.3.0: Mark the first actionable task as in_progress.
+		$this->advance_task_graph( $checkpoint );
+
 		$this->ai->resolve_for_task( $task_type, $deep_mode );
+		$this->budget_manager = $this->ai->build_token_budget_manager();
+		$this->history_budget = $this->budget_manager->recommended_history_config( $deep_mode );
+
+		// Compressed history (v2.4.0: checkpoint-aware, v5.4.0 budget-aware).
+		$history = PressArk_History_Manager::prepare(
+			$conversation,
+			$deep_mode,
+			$checkpoint,
+			$this->history_budget
+		);
+
+		// Build initial messages array from compressed history or durable
+		// replay state when a continuation resumes from a checkpoint.
+		$messages = $this->build_initial_loop_messages( $history, $message, $checkpoint );
 
 		// Local heuristics guarantee critical domains (like content editing)
 		// are available even when the planner returns a conservative group set.
@@ -317,38 +355,26 @@ class PressArk_Agent {
 				3
 			)
 		);
-		$effective_groups = array_values( array_unique(
-			array_merge( $this->loaded_groups, $preload_groups )
+
+		// v2.3.1: Start with base tools + sticky conversation-scoped groups.
+		// v5.4.0: Heuristic preloads are admitted only if they fit the
+		// current prompt budget.
+		$loader   = new PressArk_Tool_Loader();
+		$tool_set = $loader->resolve( $message, $conversation, $this->tier, $this->loaded_groups, array(
+			'candidate_groups'      => $preload_groups,
+			'budget_manager'        => $this->budget_manager,
+			'conversation_messages' => $messages,
 		) );
 
-		// v2.3.1: Start with base tools + conversation-scoped + preloaded groups.
-		$loader   = new PressArk_Tool_Loader();
-		$tool_set = $loader->resolve( $message, $conversation, $this->tier, $effective_groups );
-
-		$tool_defs = $tool_set['schemas'];
+		$tool_defs                = $tool_set['schemas'];
 		$this->initial_tool_count = $tool_set['tool_count'];
+		$this->budget_report      = (array) ( $tool_set['budget'] ?? array() );
 
 		// Track preloaded groups in loaded_groups for subsequent rounds.
 		$this->loaded_groups = $tool_set['groups'];
 
 		// Record initial groups for observability.
 		$initial_groups = $tool_set['groups'];
-
-		// Compressed history (v2.4.0: checkpoint-aware).
-		$history = PressArk_History_Manager::prepare( $conversation, $deep_mode, $checkpoint );
-
-		// Build initial messages array from compressed history.
-		$messages = array();
-		foreach ( $history as $msg ) {
-			$role = $msg['role'] ?? 'user';
-			if ( in_array( $role, array( 'user', 'assistant' ), true ) ) {
-				$messages[] = array(
-					'role'    => $role,
-					'content' => $msg['content'] ?? '',
-				);
-			}
-		}
-		$messages[] = array( 'role' => 'user', 'content' => $message );
 
 		// ─── THE AGENTIC LOOP ────────────────────────────────────────────────
 		$build_cancelled_result = fn(): array => $this->build_result( array(
@@ -383,14 +409,36 @@ class PressArk_Agent {
 				default => 5000,
 			};
 			$estimated_tokens = $this->estimate_messages_tokens( $messages );
-			if ( $estimated_tokens > $compaction_threshold || $this->should_compact_live_context( $messages, $token_budget, $estimated_tokens ) ) {
-				$messages         = $this->compact_loop_messages( $messages, $round, $checkpoint );
-				$estimated_tokens = $this->estimate_messages_tokens( $messages );
-			} elseif ( $this->should_prime_context_capsule( $messages, $checkpoint, $token_budget ) ) {
+			$system_prompt    = $this->build_round_system_prompt(
+				$screen,
+				$post_id,
+				$message,
+				$task_type,
+				$tool_set,
+				$checkpoint,
+				$messages
+			);
+			$request_budget   = (array) ( $tool_set['budget'] ?? array() );
+
+			if ( $estimated_tokens > $compaction_threshold || $this->should_compact_live_context( $messages, $token_budget, $estimated_tokens, $request_budget ) ) {
+				$compaction_reason = $this->resolve_live_compaction_reason( $estimated_tokens, $compaction_threshold, $request_budget );
+				$messages          = $this->compact_loop_messages( $messages, $round, $checkpoint, $request_budget, $compaction_reason );
+				$estimated_tokens  = $this->estimate_messages_tokens( $messages );
+				$system_prompt     = $this->build_round_system_prompt(
+					$screen,
+					$post_id,
+					$message,
+					$task_type,
+					$tool_set,
+					$checkpoint,
+					$messages
+				);
+				$request_budget    = (array) ( $tool_set['budget'] ?? array() );
+			} elseif ( $this->should_prime_context_capsule( $messages, $checkpoint, $token_budget, $request_budget ) ) {
 				$this->prime_context_capsule( $checkpoint, $messages, $round );
 			}
 
-			if ( $round > 1 && $this->should_pause_for_request_budget() ) {
+			if ( $round > 1 && $this->should_pause_for_request_budget( $request_budget ) ) {
 				$this->emit_step( 'compressing_context', '_context_compaction', array() );
 				$emit_fn(
 					'step',
@@ -401,6 +449,7 @@ class PressArk_Agent {
 					)
 				);
 				$this->prime_context_capsule( $checkpoint, $messages, $round, true );
+				$this->record_compaction_pause( $checkpoint, $messages, $round, 'request_headroom_pause', $request_budget );
 				return $this->build_result( array(
 					'type'                => 'final_response',
 					'message'             => '',
@@ -410,12 +459,23 @@ class PressArk_Agent {
 				), $tool_set, $initial_groups, $checkpoint );
 			}
 
+			$repair_context = $this->repair_replay_messages( $messages, $checkpoint, 'provider_call', $round );
+			$messages       = $repair_context['messages'];
+			$estimated_tokens = $this->estimate_messages_tokens( $messages );
+			$system_prompt    = $this->build_round_system_prompt(
+				$screen,
+				$post_id,
+				$message,
+				$task_type,
+				$tool_set,
+				$checkpoint,
+				$messages
+			);
+
 			// Debug logging (enable via PRESSARK_DEBUG constant).
 			if ( defined( 'PRESSARK_DEBUG' ) && PRESSARK_DEBUG ) {
 				PressArk_Error_Tracker::debug( 'Agent', sprintf( 'Round %d | Messages: %d | OutputTokens: %d/%d | TotalTokens: %d | EstInput: %d', $round, count( $messages ), $this->output_tokens_used, $token_budget, $this->tokens_used, $estimated_tokens ) );
 			}
-
-			$system_prompt = $this->build_round_system_prompt( $screen, $post_id, $message, $task_type, $tool_set, $checkpoint );
 
 			// Call API — returns raw response + effective provider string.
 			$api_result = $ai_call( $messages, $tool_defs, $system_prompt, $deep_mode );
@@ -469,6 +529,7 @@ class PressArk_Agent {
 			// Budget check after API response — prevent overspend.
 			if ( $this->output_tokens_used >= $token_budget ) {
 				$this->prime_context_capsule( $checkpoint, $messages, $round );
+				$this->record_compaction_pause( $checkpoint, $messages, $round, 'token_budget_pause', $request_budget );
 				$text = $this->ai->extract_text( $raw, $provider );
 				return $this->build_result( array(
 					'type'        => 'final_response',
@@ -480,11 +541,24 @@ class PressArk_Agent {
 
 			// Get stop reason from raw response (source of truth).
 			$stop_reason = $this->ai->extract_stop_reason( $raw, $provider );
+			$assistant_text = $this->ai->extract_text( $raw, $provider );
+			$assistant_tool_calls = 'tool_use' === $stop_reason
+				? $this->ai->extract_tool_calls( $raw, $provider )
+				: array();
 
 			// RULE 1: Always append full assistant response BEFORE processing tool calls.
 			$messages[] = $this->ai->build_assistant_message( $raw, $provider );
+			$this->sync_replay_snapshot( $checkpoint, $messages );
+			$this->observe_post_compaction_turn(
+				$checkpoint,
+				$round,
+				$stop_reason,
+				$assistant_tool_calls,
+				$assistant_text,
+				$request_budget
+			);
 
-			if ( 'tool_use' === $stop_reason && $this->should_pause_for_request_budget() ) {
+			if ( 'tool_use' === $stop_reason && $this->should_pause_for_request_budget( $request_budget ) ) {
 				$this->emit_step( 'compressing_context', '_context_compaction', array() );
 				$emit_fn(
 					'step',
@@ -495,6 +569,7 @@ class PressArk_Agent {
 					)
 				);
 				$this->prime_context_capsule( $checkpoint, $messages, $round, true );
+				$this->record_compaction_pause( $checkpoint, $messages, $round, 'request_headroom_pause', $request_budget );
 				return $this->build_result( array(
 					'type'                => 'final_response',
 					'message'             => '',
@@ -512,7 +587,7 @@ class PressArk_Agent {
 			$tool_calls = array();
 
 			if ( 'tool_use' !== $stop_reason ) {
-				$text     = $this->ai->extract_text( $raw, $provider );
+				$text     = $assistant_text;
 				$recovery = $this->maybe_recover_leaked_tool_call( $text, $messages, $round, $leaked_retry, $emit_fn );
 				if ( ! empty( $recovery['retry'] ) ) {
 					continue;
@@ -534,7 +609,7 @@ class PressArk_Agent {
 
 			// ── TOOL CALLS ───────────────────────────────────────────────────
 			if ( 'tool_use' === $stop_reason ) {
-				$tool_calls = $this->ai->extract_tool_calls( $raw, $provider );
+				$tool_calls = $assistant_tool_calls;
 
 				if ( empty( $tool_calls ) ) {
 					// stop_reason was tool_use but no tool calls extracted — parse error.
@@ -573,6 +648,7 @@ class PressArk_Agent {
 				$tool_calls = $this->filter_duplicate_tool_calls( $tool_calls, $checkpoint, $duplicate_results );
 				if ( ! empty( $duplicate_results ) ) {
 					$this->append_tool_results( $messages, $duplicate_results, $provider );
+					$this->sync_replay_snapshot( $checkpoint, $messages );
 					if ( empty( $tool_calls ) ) {
 						continue;
 					}
@@ -619,17 +695,11 @@ class PressArk_Agent {
 					return $build_cancelled_result();
 				}
 
-				// v2.4.0: Compact large tool results for in-loop messages.
-				$compacted = array_map(
-					fn( $tr ) => array(
-						'tool_use_id' => $tr['tool_use_id'],
-						'result'      => $this->compact_tool_result( $tr['result'] ),
-					),
-					$tool_results
-				);
+				$compacted = $this->prepare_tool_results_for_prompt( $tool_results, $round, $checkpoint );
 
 				// RULE 3: ALL results in provider-correct format (compacted for loop).
 				$this->append_tool_results( $messages, $compacted, $provider );
+				$this->sync_replay_snapshot( $checkpoint, $messages );
 
 				// v3.2.0: Spin detection — check if this round's tool calls
 				// are identical to the previous round's (agent is looping).
@@ -671,16 +741,10 @@ class PressArk_Agent {
 					return $build_cancelled_result();
 				}
 
-				// v2.4.0: Compact large read results for in-loop messages.
-				$compacted_reads = array_map(
-					fn( $tr ) => array(
-						'tool_use_id' => $tr['tool_use_id'],
-						'result'      => $this->compact_tool_result( $tr['result'] ),
-					),
-					$read_results
-				);
+				$compacted_reads = $this->prepare_tool_results_for_prompt( $read_results, $round, $checkpoint );
 
 				$this->append_tool_results( $messages, $compacted_reads, $provider );
+				$this->sync_replay_snapshot( $checkpoint, $messages );
 			}
 
 			// ── PREVIEWABLE WRITES → Live preview ────────────────────────────
@@ -795,7 +859,7 @@ class PressArk_Agent {
 			// Meta-tool fast path (handles its own step events).
 			$meta_result = $this->handle_meta_tool( $tc, $loader, $tool_set, $tool_defs );
 			if ( null !== $meta_result ) {
-				$slot_results[ $i ] = $meta_result;
+				$slot_results[ $i ] = array_merge( $meta_result, array( 'tool_name' => $tc['name'] ) );
 				continue;
 			}
 
@@ -804,6 +868,7 @@ class PressArk_Agent {
 			if ( null !== $bundle_stub ) {
 				$slot_results[ $i ] = array(
 					'tool_use_id' => $tc['id'],
+					'tool_name'   => $tc['name'],
 					'result'      => $bundle_stub,
 				);
 				continue;
@@ -873,7 +938,10 @@ class PressArk_Agent {
 			// Map orchestrated results back to their original positions.
 			foreach ( $orchestrated['results'] as $j => $entry ) {
 				$original_pos = $execute_indices[ $j ];
-				$slot_results[ $original_pos ] = $entry;
+				$slot_results[ $original_pos ] = array_merge(
+					$entry,
+					array( 'tool_name' => $execute_calls[ $j ]['name'] ?? '' )
+				);
 			}
 		}
 
@@ -1052,6 +1120,16 @@ class PressArk_Agent {
 	 * @return array Complete result array.
 	 */
 	private function build_result( array $data, array $tool_set, array $initial_groups, ?PressArk_Checkpoint $checkpoint = null ): array {
+		$deferred_groups = array_values( array_filter( array_map(
+			static function ( $candidate ) {
+				if ( is_array( $candidate ) ) {
+					return (string) ( $candidate['group'] ?? $candidate['name'] ?? '' );
+				}
+				return is_string( $candidate ) ? $candidate : '';
+			},
+			(array) ( $tool_set['deferred_groups'] ?? array() )
+		) ) );
+
 		$base = array_merge( $data, array(
 			'steps'              => $this->steps,
 			'tokens_used'        => $this->tokens_used,
@@ -1073,11 +1151,16 @@ class PressArk_Agent {
 				'final_groups'    => array_values( array_unique(
 					! empty( $this->loaded_groups ) ? $this->loaded_groups : ( $tool_set['groups'] ?? array() )
 				) ),
+				'deferred_groups' => $deferred_groups,
 				'discover_calls'  => $this->discover_calls,
 				'load_calls'      => $this->load_calls,
 				'initial_count'   => $this->initial_tool_count,
 				'final_count'     => $tool_set['tool_count'] ?? 0,
+				'capability_map_variant' => (string) ( $tool_set['capability_map_variant'] ?? '' ),
+				'history_budget'  => $this->history_budget,
 			),
+			'budget' => ! empty( $tool_set['budget'] ) ? $tool_set['budget'] : $this->budget_report,
+			'compaction' => $checkpoint ? (array) ( $checkpoint->get_context_capsule()['compaction'] ?? array() ) : array(),
 			'plan' => array(
 				'steps'        => $this->plan_steps,
 				'current_step' => $this->plan_step,
@@ -1088,6 +1171,10 @@ class PressArk_Agent {
 		if ( $checkpoint && ! $checkpoint->is_empty() ) {
 			$checkpoint->set_loaded_tool_groups( $this->loaded_groups );
 			$base['checkpoint'] = $checkpoint->to_array();
+			$replay_sidecar     = $checkpoint->get_replay_sidecar();
+			if ( ! empty( $replay_sidecar ) ) {
+				$base['replay'] = $replay_sidecar;
+			}
 		}
 
 		return $base;
@@ -1490,6 +1577,42 @@ class PressArk_Agent {
 			'get_site_overview', 'get_site_map' => $this->checkpoint_from_site_info( $checkpoint, $result ),
 			default                            => null,
 		};
+
+		// v5.3.0: After recording results, resolve dependency graph.
+		$this->advance_task_graph( $checkpoint );
+	}
+
+	/**
+	 * Advance the task graph: resolve blocked tasks and mark the next
+	 * actionable task as in_progress.
+	 *
+	 * @since 5.3.0
+	 */
+	private function advance_task_graph( PressArk_Checkpoint $checkpoint ): void {
+		$execution = $checkpoint->get_execution();
+		if ( empty( $execution['tasks'] ) ) {
+			return;
+		}
+
+		$execution = PressArk_Execution_Ledger::resolve_blocked( $execution );
+
+		// Find the next actionable task and mark it in_progress.
+		$next = PressArk_Execution_Ledger::next_actionable_task( $execution );
+		if ( $next && 'pending' === $next['status'] ) {
+			$execution = PressArk_Execution_Ledger::mark_task_in_progress( $execution, $next['key'] );
+		}
+
+		// Write back (checkpoint will persist it).
+		$this->update_checkpoint_execution( $checkpoint, $execution );
+	}
+
+	/**
+	 * Write execution ledger back to the checkpoint.
+	 *
+	 * @since 5.3.0
+	 */
+	private function update_checkpoint_execution( PressArk_Checkpoint $checkpoint, array $execution ): void {
+		$checkpoint->set_execution( $execution );
 	}
 
 	private function checkpoint_from_read_content( PressArk_Checkpoint $checkpoint, array $data ): void {
@@ -1639,9 +1762,37 @@ class PressArk_Agent {
 		int $post_id,
 		string $message,
 		string $task_type,
-		array $tool_set,
-		PressArk_Checkpoint $checkpoint
+		array &$tool_set,
+		PressArk_Checkpoint $checkpoint,
+		array $messages
 	): string {
+		$prompt_sections = $this->build_round_prompt_sections(
+			$screen,
+			$post_id,
+			$message,
+			$task_type,
+			$tool_set,
+			$checkpoint
+		);
+		$tool_set        = $this->apply_budgeted_tool_support_sections( $tool_set, $prompt_sections, $messages );
+
+		$capability_map = $tool_set['capability_map'] ?? '';
+		if ( ! empty( $capability_map ) ) {
+			$this->append_round_prompt_section(
+				$prompt_sections['volatile'],
+				$prompt_sections['labels']['volatile'],
+				'capability_map',
+				$capability_map
+			);
+		}
+
+		$tool_set['prompt_assembly'] = array(
+			'stable_sections'   => array_values( array_unique( (array) ( $prompt_sections['labels']['stable'] ?? array() ) ) ),
+			'volatile_sections' => array_values( array_unique( (array) ( $prompt_sections['labels']['volatile'] ?? array() ) ) ),
+		);
+
+		return $this->compose_round_prompt_sections( $prompt_sections );
+
 		$context       = new PressArk_Context();
 		$system_prompt = $context->build( $screen, $post_id );
 
@@ -1706,22 +1857,9 @@ class PressArk_Agent {
 			$system_prompt .= "\n\n" . $plan_block;
 		}
 
-		$capability_map = $tool_set['capability_map'] ?? '';
-		if ( ! empty( $capability_map ) ) {
-			$map_text = $capability_map;
-			if ( $this->model_rounds > 0 ) {
-				$map_text = PressArk_Tool_Catalog::instance()->get_compact_capability_map(
-					(array) ( $tool_set['groups'] ?? array() )
-				);
-			}
-			if ( 'generate' === $task_type ) {
-				$map_text = ! empty( $map_text )
-					? "IMPORTANT: Create the content first with currently loaded tools. Load SEO or specialty groups only after the content exists.\n\n" . $map_text
-					: 'IMPORTANT: Create the content first with currently loaded tools. Load SEO or specialty groups only after the content exists.';
-			}
-			if ( ! empty( $map_text ) ) {
-				$system_prompt .= "\n\n" . $map_text;
-			}
+		if ( 'generate' === $task_type ) {
+			$system_prompt .= "\n\nIMPORTANT: Create the content first with currently loaded tools. "
+				. 'Load SEO or specialty groups only after the content exists.';
 		}
 
 		// v4.2.x: Adjust caution level based on environment.
@@ -1738,7 +1876,242 @@ class PressArk_Agent {
 			$system_prompt .= $site_memory;
 		}
 
+		$tool_set       = $this->apply_budgeted_tool_support( $tool_set, $system_prompt, $messages );
+		$capability_map = $tool_set['capability_map'] ?? '';
+		if ( ! empty( $capability_map ) ) {
+			$system_prompt .= "\n\n" . $capability_map;
+		}
+
 		return $system_prompt;
+	}
+
+	private function build_round_prompt_sections(
+		string $screen,
+		int $post_id,
+		string $message,
+		string $task_type,
+		array $tool_set,
+		PressArk_Checkpoint $checkpoint
+	): array {
+		$context  = new PressArk_Context();
+		$sections = array(
+			'stable'   => array(),
+			'volatile' => array(),
+			'labels'   => array(
+				'stable'   => array(),
+				'volatile' => array(),
+			),
+		);
+
+		$this->append_round_prompt_section(
+			$sections['volatile'],
+			$sections['labels']['volatile'],
+			'current_context',
+			$context->build( $screen, $post_id )
+		);
+
+		if ( $this->automation_context ) {
+			$this->append_round_prompt_section(
+				$sections['stable'],
+				$sections['labels']['stable'],
+				'automation_context',
+				PressArk_AI_Connector::build_automation_addendum( $this->automation_context )
+			);
+		}
+
+		$conditional_blocks = PressArk_AI_Connector::get_conditional_blocks(
+			$task_type,
+			$screen,
+			(array) ( $this->loaded_groups ?: ( $tool_set['groups'] ?? array() ) )
+		);
+		$this->append_round_prompt_section(
+			$sections['stable'],
+			$sections['labels']['stable'],
+			'conditional_blocks',
+			$conditional_blocks
+		);
+
+		$task_skills = PressArk_Skills::get_dynamic_task_scoped( $task_type, array(
+			'has_woo'       => class_exists( 'WooCommerce' ),
+			'has_elementor' => defined( 'ELEMENTOR_VERSION' ),
+		) );
+		$this->append_round_prompt_section(
+			$sections['stable'],
+			$sections['labels']['stable'],
+			'task_scoped_skills',
+			$task_skills
+		);
+
+		$execution_guard = PressArk_Execution_Ledger::build_runtime_guard( $checkpoint->get_execution() );
+		if ( ! empty( $execution_guard ) && self::is_continuation_message( $message ) ) {
+			$this->append_round_prompt_section(
+				$sections['volatile'],
+				$sections['labels']['volatile'],
+				'execution_guard',
+				$execution_guard
+			);
+		}
+
+		if ( $checkpoint->has_unapplied_confirms() ) {
+			$pending_names = array_map(
+				fn( $p ) => $p['action'] . ( $p['target'] ? ' on ' . $p['target'] : '' ),
+				$checkpoint->get_pending()
+			);
+			$this->append_round_prompt_section(
+				$sections['volatile'],
+				$sections['labels']['volatile'],
+				'pending_confirmation',
+				"## Pending Confirmation\n"
+				. "You previously proposed these write actions but they were NOT applied yet â€” "
+				. "the user has not clicked Approve on the confirm card:\n- "
+				. implode( "\n- ", $pending_names )
+				. "\nDo NOT claim these actions are done. If the user asks you to proceed, "
+				. "re-emit the tool calls so a new confirm card is generated."
+			);
+		}
+
+		if ( count( $this->plan_steps ) > 1 ) {
+			$plan_lines = array();
+			foreach ( $this->plan_steps as $i => $step ) {
+				$plan_lines[] = ( $i + 1 ) . '. ' . $step;
+			}
+			$plan_block = "PLAN:\n" . implode( "\n", $plan_lines );
+			if ( $this->plan_step <= count( $this->plan_steps ) ) {
+				$plan_block .= "\nYou are on step {$this->plan_step}. Complete each step before moving to the next.";
+			}
+			$this->append_round_prompt_section(
+				$sections['volatile'],
+				$sections['labels']['volatile'],
+				'execution_plan',
+				$plan_block
+			);
+		}
+
+		if ( 'generate' === $task_type ) {
+			$this->append_round_prompt_section(
+				$sections['stable'],
+				$sections['labels']['stable'],
+				'generation_order',
+				'IMPORTANT: Create the content first with currently loaded tools. Load SEO or specialty groups only after the content exists.'
+			);
+		}
+
+		$env_type = function_exists( 'wp_get_environment_type' ) ? wp_get_environment_type() : 'production';
+		if ( 'production' !== $env_type ) {
+			$this->append_round_prompt_section(
+				$sections['stable'],
+				$sections['labels']['stable'],
+				'environment_note',
+				"ENVIRONMENT NOTE: This is a {$env_type} environment. You can be less cautious about experimental changes â€” they won't affect the live site. Still use the preview/confirm flow, but don't over-warn about risks."
+			);
+		}
+
+		$this->append_round_prompt_section(
+			$sections['volatile'],
+			$sections['labels']['volatile'],
+			'site_memory',
+			$this->resolve_site_notes( $message )
+		);
+
+		return $sections;
+	}
+
+	private function append_round_prompt_section( array &$bucket, array &$labels, string $label, string $content ): void {
+		$content = trim( $content );
+		if ( '' === $content ) {
+			return;
+		}
+
+		$bucket[] = $content;
+		$labels[] = sanitize_key( $label );
+	}
+
+	private function compose_round_prompt_group( array $sections ): string {
+		return PressArk_AI_Connector::join_prompt_sections( $sections );
+	}
+
+	private function compose_round_prompt_sections( array $sections ): string {
+		$parts    = array();
+		$stable   = $this->compose_round_prompt_group( (array) ( $sections['stable'] ?? array() ) );
+		$volatile = $this->compose_round_prompt_group( (array) ( $sections['volatile'] ?? array() ) );
+
+		if ( '' !== $stable ) {
+			$parts[] = "## Stable Run Prefix\n" . $stable;
+		}
+		if ( '' !== $volatile ) {
+			$parts[] = "## Volatile Run State\n" . $volatile;
+		}
+
+		return PressArk_AI_Connector::join_prompt_sections( $parts );
+	}
+
+	private function apply_budgeted_tool_support_sections( array $tool_set, array $prompt_sections, array $messages ): array {
+		$capability_maps = (array) ( $tool_set['capability_maps'] ?? array() );
+		if ( empty( $capability_maps ) ) {
+			$capability_maps = PressArk_Tool_Catalog::instance()->get_capability_maps(
+				(array) ( $tool_set['groups'] ?? array() )
+			);
+		}
+
+		$stable_prompt    = $this->compose_round_prompt_group( (array) ( $prompt_sections['stable'] ?? array() ) );
+		$volatile_prompt  = $this->compose_round_prompt_group( (array) ( $prompt_sections['volatile'] ?? array() ) );
+		$base_prompt_text = $this->compose_round_prompt_sections( $prompt_sections );
+		$preference_order = $this->model_rounds > 0
+			? array( 'compact', 'minimal', 'full' )
+			: array( 'full', 'compact', 'minimal' );
+
+		if ( ! $this->budget_manager instanceof PressArk_Token_Budget_Manager ) {
+			$variant = '';
+			foreach ( $preference_order as $candidate ) {
+				if ( ! empty( $capability_maps[ $candidate ] ) ) {
+					$variant = $candidate;
+					break;
+				}
+			}
+			$tool_set['capability_maps']        = $capability_maps;
+			$tool_set['capability_map_variant'] = $variant;
+			$tool_set['capability_map']         = '' !== $variant ? (string) ( $capability_maps[ $variant ] ?? '' ) : '';
+			return $tool_set;
+		}
+
+		list( $conversation_messages, $tool_result_messages ) = $this->split_messages_for_budget( $messages );
+		$base_ledger = $this->budget_manager->build_request_ledger( array(
+			'dynamic_prompt'          => $base_prompt_text,
+			'dynamic_prompt_stable'   => $stable_prompt,
+			'dynamic_prompt_volatile' => $volatile_prompt,
+			'loaded_tool_schemas'     => (array) ( $tool_set['schemas'] ?? array() ),
+			'conversation'            => $conversation_messages,
+			'tool_results'            => $tool_result_messages,
+			'deferred_candidates'     => (array) ( $tool_set['deferred_groups'] ?? array() ),
+		) );
+		$variant    = $this->budget_manager->choose_support_variant(
+			$capability_maps,
+			$base_ledger,
+			$preference_order
+		);
+		$map_text   = '' !== $variant ? (string) ( $capability_maps[ $variant ] ?? '' ) : '';
+		$ledger_sections = $prompt_sections;
+		if ( '' !== $map_text ) {
+			$ledger_sections['volatile'][] = $map_text;
+		}
+		$ledger_prompt   = $this->compose_round_prompt_sections( $ledger_sections );
+		$ledger_volatile = $this->compose_round_prompt_group( (array) ( $ledger_sections['volatile'] ?? array() ) );
+
+		$tool_set['capability_maps']        = $capability_maps;
+		$tool_set['capability_map_variant'] = $variant;
+		$tool_set['capability_map']         = $map_text;
+		$tool_set['budget']                 = $this->budget_manager->build_request_ledger( array(
+			'dynamic_prompt'          => $ledger_prompt,
+			'dynamic_prompt_stable'   => $stable_prompt,
+			'dynamic_prompt_volatile' => $ledger_volatile,
+			'loaded_tool_schemas'     => (array) ( $tool_set['schemas'] ?? array() ),
+			'conversation'            => $conversation_messages,
+			'tool_results'            => $tool_result_messages,
+			'deferred_candidates'     => (array) ( $tool_set['deferred_groups'] ?? array() ),
+		) );
+		$this->budget_report                = (array) $tool_set['budget'];
+
+		return $tool_set;
 	}
 
 	// ── Site Memory ──────────────────────────────────────────────────
@@ -1752,6 +2125,131 @@ class PressArk_Agent {
 	 *
 	 * @param string $message Current user message (used for AI selection context).
 	 * @return string Formatted notes block or empty string.
+	 */
+	/**
+	 * Choose the richest capability/resource support text that fits the
+	 * current round budget.
+	 *
+	 * @param array  $tool_set           Current tool set.
+	 * @param string $system_prompt_base Dynamic prompt text before support text.
+	 * @param array  $messages           Current loop messages.
+	 * @return array
+	 */
+	private function apply_budgeted_tool_support( array $tool_set, string $system_prompt_base, array $messages ): array {
+		$capability_maps = (array) ( $tool_set['capability_maps'] ?? array() );
+		if ( empty( $capability_maps ) ) {
+			$capability_maps = PressArk_Tool_Catalog::instance()->get_capability_maps(
+				(array) ( $tool_set['groups'] ?? array() )
+			);
+		}
+
+		$preference_order = $this->model_rounds > 0
+			? array( 'compact', 'minimal', 'full' )
+			: array( 'full', 'compact', 'minimal' );
+
+		if ( ! $this->budget_manager instanceof PressArk_Token_Budget_Manager ) {
+			$variant = '';
+			foreach ( $preference_order as $candidate ) {
+				if ( ! empty( $capability_maps[ $candidate ] ) ) {
+					$variant = $candidate;
+					break;
+				}
+			}
+			$tool_set['capability_maps']        = $capability_maps;
+			$tool_set['capability_map_variant'] = $variant;
+			$tool_set['capability_map']         = '' !== $variant ? (string) ( $capability_maps[ $variant ] ?? '' ) : '';
+			return $tool_set;
+		}
+
+		list( $conversation_messages, $tool_result_messages ) = $this->split_messages_for_budget( $messages );
+		$base_ledger = $this->budget_manager->build_request_ledger( array(
+			'dynamic_prompt'      => $system_prompt_base,
+			'loaded_tool_schemas' => (array) ( $tool_set['schemas'] ?? array() ),
+			'conversation'        => $conversation_messages,
+			'tool_results'        => $tool_result_messages,
+			'deferred_candidates' => (array) ( $tool_set['deferred_groups'] ?? array() ),
+		) );
+		$variant    = $this->budget_manager->choose_support_variant(
+			$capability_maps,
+			$base_ledger,
+			$preference_order
+		);
+		$map_text   = '' !== $variant ? (string) ( $capability_maps[ $variant ] ?? '' ) : '';
+		$ledger_prompt = '' !== $map_text
+			? $system_prompt_base . "\n\n" . $map_text
+			: $system_prompt_base;
+
+		$tool_set['capability_maps']        = $capability_maps;
+		$tool_set['capability_map_variant'] = $variant;
+		$tool_set['capability_map']         = $map_text;
+		$tool_set['budget']                 = $this->budget_manager->build_request_ledger( array(
+			'dynamic_prompt'      => $ledger_prompt,
+			'loaded_tool_schemas' => (array) ( $tool_set['schemas'] ?? array() ),
+			'conversation'        => $conversation_messages,
+			'tool_results'        => $tool_result_messages,
+			'deferred_candidates' => (array) ( $tool_set['deferred_groups'] ?? array() ),
+		) );
+		$this->budget_report                = (array) $tool_set['budget'];
+
+		return $tool_set;
+	}
+
+	/**
+	 * Split loop messages into conversational context versus tool-result
+	 * payloads for budget accounting.
+	 *
+	 * @param array $messages Current loop messages.
+	 * @return array{0: array, 1: array}
+	 */
+	private function split_messages_for_budget( array $messages ): array {
+		$conversation = array();
+		$tool_results = array();
+
+		foreach ( $messages as $msg ) {
+			$role = $msg['role'] ?? 'user';
+			if ( 'tool' === $role || $this->is_budget_tool_result_message( $msg ) ) {
+				$tool_results[] = $msg;
+				continue;
+			}
+
+			if ( in_array( $role, array( 'user', 'assistant' ), true ) ) {
+				$conversation[] = $msg;
+			}
+		}
+
+		return array( $conversation, $tool_results );
+	}
+
+	/**
+	 * Detect Anthropic-style tool-result messages that use a user role with
+	 * tool_result content blocks.
+	 *
+	 * @param array $message Message candidate.
+	 * @return bool
+	 */
+	private function is_budget_tool_result_message( array $message ): bool {
+		if ( 'user' !== ( $message['role'] ?? '' ) || ! is_array( $message['content'] ?? null ) || empty( $message['content'] ) ) {
+			return false;
+		}
+
+		foreach ( $message['content'] as $block ) {
+			if ( ! is_array( $block ) || 'tool_result' !== ( $block['type'] ?? '' ) ) {
+				return false;
+			}
+		}
+
+		return true;
+	}
+
+	/**
+	 * Resolve and format relevant site notes for injection into the system prompt.
+	 *
+	 * Two-path selection:
+	 * - inject all when note count is small
+	 * - category-filter, then AI-select if still large
+	 *
+	 * @param string $message Current user message.
+	 * @return string
 	 */
 	private function resolve_site_notes( string $message ): string {
 		$raw       = get_option( 'pressark_site_notes', '[]' );
@@ -1988,6 +2486,14 @@ class PressArk_Agent {
 	 * @return array Compacted result.
 	 */
 	private function compact_tool_result( array $result, int $result_age = 0 ): array {
+		if ( ! empty( $result['_artifactized'] ) ) {
+			return $result;
+		}
+
+		if ( isset( $result['data'] ) && is_array( $result['data'] ) && 'tool_result_artifact' === ( $result['data']['resource_type'] ?? '' ) ) {
+			return $result;
+		}
+
 		// Age-based compaction: results from 3+ rounds ago get 1-line summaries.
 		if ( $result_age >= 3 ) {
 			$tool   = $result['_tool_name'] ?? 'tool';
@@ -2086,6 +2592,10 @@ class PressArk_Agent {
 			return $result;
 		}
 
+		if ( PressArk_Tool_Result_Artifacts::should_preserve_full_result( $tool_name, $result ) ) {
+			return $result;
+		}
+
 		return array(
 			'success' => false,
 			'error'   => 'tool_output_limit_exceeded',
@@ -2117,6 +2627,125 @@ class PressArk_Agent {
 	// ── Infrastructure ──────────────────────────────────────────────────
 
 	/**
+	 * Build the live loop transcript, restoring checkpoint replay state when a
+	 * continuation resumes after an approval or budget boundary.
+	 */
+	private function build_initial_loop_messages( array $history, string $message, PressArk_Checkpoint $checkpoint ): array {
+		$fallback_messages = array();
+		foreach ( $history as $msg ) {
+			$role = $msg['role'] ?? 'user';
+			if ( in_array( $role, array( 'user', 'assistant' ), true ) ) {
+				$fallback_messages[] = array(
+					'role'    => $role,
+					'content' => $msg['content'] ?? '',
+				);
+			}
+		}
+		$fallback_messages[] = array( 'role' => 'user', 'content' => $message );
+
+		$messages = $fallback_messages;
+		if ( self::is_continuation_message( $message ) && class_exists( 'PressArk_Replay_Integrity' ) ) {
+			$replay_messages = $checkpoint->get_replay_messages();
+			$resume_event    = array(
+				'type'                   => 'resume',
+				'phase'                  => 'resume_boundary',
+				'source'                 => ! empty( $replay_messages ) ? 'checkpoint_replay' : 'conversation_reconstruction',
+				'used_checkpoint_replay' => ! empty( $replay_messages ),
+				'at'                     => gmdate( 'c' ),
+			);
+
+			if ( ! empty( $replay_messages ) ) {
+				$messages   = PressArk_Replay_Integrity::canonicalize_messages( $replay_messages );
+				$messages[] = array( 'role' => 'user', 'content' => $message );
+			}
+
+			$resume_event['message_count_before'] = $this->count_replay_messages( $messages );
+			$repair                              = $this->repair_replay_messages( $messages, $checkpoint, 'resume_boundary', 0 );
+			$messages                            = $repair['messages'];
+			$resume_event['message_count_after'] = $this->count_replay_messages( $messages );
+			$resume_event['repaired']            = ! empty( $repair['changed'] );
+			$checkpoint->set_last_replay_resume( $resume_event );
+			$this->sync_replay_snapshot( $checkpoint, $messages );
+
+			return $messages;
+		}
+
+		$this->sync_replay_snapshot( $checkpoint, $messages );
+		return $messages;
+	}
+
+	/**
+	 * Canonical message count for replay telemetry.
+	 */
+	private function count_replay_messages( array $messages ): int {
+		if ( ! class_exists( 'PressArk_Replay_Integrity' ) ) {
+			return count( $messages );
+		}
+
+		return count( PressArk_Replay_Integrity::canonicalize_messages( $messages ) );
+	}
+
+	/**
+	 * Repair transcript structure before provider calls or resume boundaries.
+	 *
+	 * @return array{messages:array,changed:bool,event:array}
+	 */
+	private function repair_replay_messages(
+		array $messages,
+		?PressArk_Checkpoint $checkpoint,
+		string $phase,
+		int $round = 0
+	): array {
+		if ( ! class_exists( 'PressArk_Replay_Integrity' ) ) {
+			return array(
+				'messages' => $messages,
+				'changed'  => false,
+				'event'    => array(),
+			);
+		}
+
+		$repair   = PressArk_Replay_Integrity::repair_messages( $messages, $phase );
+		$messages = $repair['messages'];
+
+		if ( $checkpoint ) {
+			if ( ! empty( $repair['changed'] ) ) {
+				$event = (array) ( $repair['event'] ?? array() );
+				if ( $round > 0 && empty( $event['round'] ) ) {
+					$event['round'] = $round;
+				}
+				$checkpoint->add_replay_event( $event );
+
+				if ( defined( 'PRESSARK_DEBUG' ) && PRESSARK_DEBUG ) {
+					PressArk_Error_Tracker::debug( 'Replay', sprintf( 'Transcript repaired at %s (round %d).', $phase, max( 0, $round ) ) );
+				}
+			}
+
+			$this->sync_replay_snapshot( $checkpoint, $messages );
+		}
+
+		return array(
+			'messages' => $messages,
+			'changed'  => ! empty( $repair['changed'] ),
+			'event'    => (array) ( $repair['event'] ?? array() ),
+		);
+	}
+
+	/**
+	 * Persist a bounded replay transcript snapshot to checkpoint sidecar state.
+	 */
+	private function sync_replay_snapshot( ?PressArk_Checkpoint $checkpoint, array $messages ): void {
+		if ( ! $checkpoint || ! class_exists( 'PressArk_Replay_Integrity' ) ) {
+			return;
+		}
+
+		$state               = $checkpoint->get_replay_state();
+		$snapshot            = PressArk_Replay_Integrity::snapshot_messages( $messages );
+		$state['messages']   = (array) ( $snapshot['messages'] ?? array() );
+		$state['updated_at'] = gmdate( 'c' );
+		$checkpoint->set_replay_state( $state );
+	}
+
+	/**
 	 * Append tool results to messages array in the correct provider format.
 	 *
 	 * @param array  &$messages     Messages array (modified by reference).
@@ -2138,11 +2767,62 @@ class PressArk_Agent {
 	}
 
 	/**
+	 * Prepare read results for prompt insertion.
+	 *
+	 * Large, high-value reads are first externalized into run-scoped artifacts.
+	 * Anything still inline then falls back to the legacy compaction path.
+	 *
+	 * @param array[]                  $tool_results Read tool results.
+	 * @param int                      $round        Current loop round.
+	 * @param PressArk_Checkpoint|null $checkpoint   Optional replay checkpoint.
+	 * @return array[]
+	 */
+	private function prepare_tool_results_for_prompt( array $tool_results, int $round, ?PressArk_Checkpoint $checkpoint = null ): array {
+		if ( empty( $tool_results ) ) {
+			return array();
+		}
+
+		$artifacts = new PressArk_Tool_Result_Artifacts(
+			$this->run_id,
+			$this->chat_id,
+			get_current_user_id(),
+			$round
+		);
+
+		$prepared = $artifacts->prepare_batch(
+			$tool_results,
+			$checkpoint ? $checkpoint->get_replay_replacements() : array()
+		);
+
+		if ( $checkpoint ) {
+			$checkpoint->merge_replay_replacements( $artifacts->get_replacement_journal() );
+			foreach ( $artifacts->get_replacement_events() as $event ) {
+				if ( empty( $event['round'] ) ) {
+					$event['round'] = $round;
+				}
+				$checkpoint->add_replay_event( $event );
+			}
+		}
+
+		return array_map(
+			function ( array $tr ): array {
+				if ( ! empty( $tr['_artifactized'] ) || ! empty( $tr['result']['_artifactized'] ) ) {
+					return $tr;
+				}
+
+				$tr['result'] = $this->compact_tool_result( $tr['result'] );
+				return $tr;
+			},
+			$prepared
+		);
+	}
+
+	/**
 	 * Estimate token count for messages array.
 	 * Uses 4 chars/token heuristic.
 	 */
 	private function estimate_messages_tokens( array $messages ): int {
-		return (int) ( strlen( wp_json_encode( $messages ) ) / 4 );
+		return $this->estimate_value_tokens( $messages );
 	}
 
 	/**
@@ -2152,6 +2832,10 @@ class PressArk_Agent {
 	 * @return int
 	 */
 	private function estimate_value_tokens( $value ): int {
+		if ( $this->budget_manager instanceof PressArk_Token_Budget_Manager ) {
+			return $this->budget_manager->estimate_value_tokens( $value );
+		}
+
 		$serialized = is_string( $value ) ? $value : wp_json_encode( $value );
 		if ( ! is_string( $serialized ) ) {
 			$serialized = '';
@@ -2173,7 +2857,66 @@ class PressArk_Agent {
 	 * @param int   $round    Current round number (for budget decisions).
 	 * @return array Compacted messages array.
 	 */
-private function compact_loop_messages( array $messages, int $round = 0, ?PressArk_Checkpoint $checkpoint = null ): array {
+private function compact_loop_messages_legacy( array $messages, int $round = 0, ?PressArk_Checkpoint $checkpoint = null, array $request_budget = array(), string $reason = 'message_threshold' ): array {
+		if ( count( $messages ) > 5 ) {
+			$first_user_message = $messages[0];
+			$recent             = array_slice( $messages, -4 );
+			$dropped_count      = count( $messages ) - 5;
+			$middle             = array_slice( $messages, 1, -4 );
+			$marker             = $checkpoint ? $this->build_compaction_marker( $checkpoint, $round ) : '';
+
+			$capsule = $this->build_context_capsule( $middle, $checkpoint );
+			if ( ! empty( $capsule ) ) {
+				if ( $checkpoint ) {
+					$checkpoint->set_context_capsule( $capsule );
+				}
+				$summary_text = $this->build_context_capsule_text( $capsule );
+				$summary      = array(
+					'role'    => 'user',
+					'content' => "[Context compaction boundary {$marker}]\nTrigger: {$reason}. Treat the summary below as historical state only.\n[Conversation summary (rounds 1-{$dropped_count})]\n{$summary_text}\n[End compaction boundary {$marker} â€” continuing from latest results below.]",
+				);
+				$compacted    = array_merge( array( $first_user_message, $summary ), $recent );
+				if ( $checkpoint ) {
+					$this->record_compaction_event(
+						$checkpoint,
+						$round,
+						$reason,
+						$messages,
+						$compacted,
+						$request_budget,
+						$marker,
+						'capsule_summary'
+					);
+				}
+				return $compacted;
+			}
+
+			$summary = array(
+				'role'    => 'user',
+				'content' => sprintf(
+					'[Context compaction boundary %s] Trigger: %s. %d earlier tool call rounds were compacted. The task continues from the latest results below. [End compaction boundary %s]',
+					$marker,
+					$reason,
+					$dropped_count,
+					$marker
+				),
+			);
+			$compacted = array_merge( array( $first_user_message, $summary ), $recent );
+			if ( $checkpoint ) {
+				$this->record_compaction_event(
+					$checkpoint,
+					$round,
+					$reason,
+					$messages,
+					$compacted,
+					$request_budget,
+					$marker,
+					'context_note'
+				);
+			}
+			return $compacted;
+		}
+
 		if ( count( $messages ) <= 5 ) {
 			return $messages;
 		}
@@ -2205,6 +2948,116 @@ private function compact_loop_messages( array $messages, int $round = 0, ?PressA
 		);
 
 		return array_merge( array( $first_user_message, $summary ), $recent );
+	}
+
+	/**
+	 * Compact messages mid-loop while preserving whole assistant API rounds.
+	 */
+	private function compact_loop_messages( array $messages, int $round = 0, ?PressArk_Checkpoint $checkpoint = null, array $request_budget = array(), string $reason = 'message_threshold' ): array {
+		if ( count( $messages ) <= 5 ) {
+			return $messages;
+		}
+
+		$first_user_message = $messages[0];
+		$window             = class_exists( 'PressArk_Replay_Integrity' )
+			? PressArk_Replay_Integrity::select_round_compaction_window( $messages, 2, 4 )
+			: array(
+				'recent_messages'  => array_slice( $messages, -4 ),
+				'dropped_messages' => array_slice( $messages, 1, -4 ),
+				'dropped_rounds'   => 0,
+				'kept_rounds'      => 0,
+				'used_rounds'      => false,
+			);
+		$recent             = ! empty( $window['recent_messages'] ) ? (array) $window['recent_messages'] : array_slice( $messages, -4 );
+		$middle             = ! empty( $window['dropped_messages'] ) ? (array) $window['dropped_messages'] : array_slice( $messages, 1, -4 );
+		$dropped_count      = count( $middle );
+
+		if ( $dropped_count <= 0 ) {
+			return $messages;
+		}
+
+		$marker  = $checkpoint ? $this->build_compaction_marker( $checkpoint, $round ) : '';
+		$capsule = $this->build_context_capsule( $middle, $checkpoint );
+
+		if ( ! empty( $capsule ) ) {
+			if ( $checkpoint ) {
+				$checkpoint->set_context_capsule( $capsule );
+			}
+			$summary_text = $this->build_context_capsule_text( $capsule );
+			$summary      = array(
+				'role'    => 'user',
+				'content' => "[Context compaction boundary {$marker}]\nTrigger: {$reason}. Treat the summary below as historical state only.\n[Conversation summary]\n{$summary_text}\n[End compaction boundary {$marker}; continue from the latest round below.]",
+			);
+			$compacted    = array_merge( array( $first_user_message, $summary ), $recent );
+			if ( $checkpoint ) {
+				$this->record_compaction_event(
+					$checkpoint,
+					$round,
+					$reason,
+					$messages,
+					$compacted,
+					$request_budget,
+					$marker,
+					'capsule_summary'
+				);
+				$checkpoint->add_replay_event( array(
+					'type'                 => 'compaction',
+					'phase'                => 'live_loop',
+					'source'               => ! empty( $window['used_rounds'] ) ? 'api_rounds' : 'tail_window',
+					'reason'               => $reason,
+					'round'                => max( 1, $round ),
+					'message_count_before' => count( $messages ),
+					'message_count_after'  => count( $compacted ),
+					'dropped_messages'     => $dropped_count,
+					'dropped_rounds'       => max( 0, (int) ( $window['dropped_rounds'] ?? 0 ) ),
+					'kept_rounds'          => max( 0, (int) ( $window['kept_rounds'] ?? 0 ) ),
+					'at'                   => gmdate( 'c' ),
+				) );
+				$this->sync_replay_snapshot( $checkpoint, $compacted );
+			}
+			return $compacted;
+		}
+
+		$summary = array(
+			'role'    => 'user',
+			'content' => sprintf(
+				'[Context compaction boundary %s] Trigger: %s. %d earlier message(s) across %d completed round(s) were compacted. The task continues from the latest round below. [End compaction boundary %s]',
+				$marker,
+				$reason,
+				$dropped_count,
+				max( 0, (int) ( $window['dropped_rounds'] ?? 0 ) ),
+				$marker
+			),
+		);
+		$compacted = array_merge( array( $first_user_message, $summary ), $recent );
+		if ( $checkpoint ) {
+			$this->record_compaction_event(
+				$checkpoint,
+				$round,
+				$reason,
+				$messages,
+				$compacted,
+				$request_budget,
+				$marker,
+				'context_note'
+			);
+			$checkpoint->add_replay_event( array(
+				'type'                 => 'compaction',
+				'phase'                => 'live_loop',
+				'source'               => ! empty( $window['used_rounds'] ) ? 'api_rounds' : 'tail_window',
+				'reason'               => $reason,
+				'round'                => max( 1, $round ),
+				'message_count_before' => count( $messages ),
+				'message_count_after'  => count( $compacted ),
+				'dropped_messages'     => $dropped_count,
+				'dropped_rounds'       => max( 0, (int) ( $window['dropped_rounds'] ?? 0 ) ),
+				'kept_rounds'          => max( 0, (int) ( $window['kept_rounds'] ?? 0 ) ),
+				'at'                   => gmdate( 'c' ),
+			) );
+			$this->sync_replay_snapshot( $checkpoint, $compacted );
+		}
+
+		return $compacted;
 	}
 
 	/**
@@ -2354,7 +3207,7 @@ private function compact_loop_messages( array $messages, int $round = 0, ?PressA
 	 * whether using DeepSeek V3 or Claude Opus 4.
 	 */
 
-	private function should_prime_context_capsule( array $messages, ?PressArk_Checkpoint $checkpoint, int $token_budget ): bool {
+	private function should_prime_context_capsule( array $messages, ?PressArk_Checkpoint $checkpoint, int $token_budget, array $request_budget = array() ): bool {
 		if ( ! $checkpoint || count( $messages ) < 4 ) {
 			return false;
 		}
@@ -2362,7 +3215,8 @@ private function compact_loop_messages( array $messages, int $round = 0, ?PressA
 		$soft_output_limit = (int) floor( $token_budget * self::SOFT_OUTPUT_BUDGET_RATIO );
 		$soft_total_limit  = (int) floor( self::MAX_REQUEST_TOKENS * self::SOFT_PRIME_TOKEN_RATIO );
 		$needs_capsule     = $this->output_tokens_used >= $soft_output_limit
-			|| $this->tokens_used >= $soft_total_limit;
+			|| $this->tokens_used >= $soft_total_limit
+			|| $this->should_prime_for_request_headroom( $request_budget );
 
 		if ( ! $needs_capsule ) {
 			return false;
@@ -2377,7 +3231,7 @@ private function compact_loop_messages( array $messages, int $round = 0, ?PressA
 		return ! $updated_at || ( time() - $updated_at ) >= 30;
 	}
 
-	private function should_compact_live_context( array $messages, int $token_budget, ?int $estimated_tokens = null ): bool {
+	private function should_compact_live_context( array $messages, int $token_budget, ?int $estimated_tokens = null, array $request_budget = array() ): bool {
 		if ( count( $messages ) <= 5 ) {
 			return false;
 		}
@@ -2386,12 +3240,66 @@ private function compact_loop_messages( array $messages, int $round = 0, ?PressA
 		$soft_total_limit  = (int) floor( self::MAX_REQUEST_TOKENS * self::SOFT_COMPACTION_TOKEN_RATIO );
 
 		return $this->output_tokens_used >= $soft_output_limit
-			|| $this->tokens_used >= $soft_total_limit;
+			|| $this->tokens_used >= $soft_total_limit
+			|| $this->should_compact_for_request_headroom( $request_budget );
 	}
 
-	private function should_pause_for_request_budget(): bool {
+	private function should_pause_for_request_budget( array $request_budget = array() ): bool {
 		$remaining_tokens = self::MAX_REQUEST_TOKENS - $this->tokens_used;
-		return $remaining_tokens <= self::PAUSE_HEADROOM_TOKENS;
+		return $remaining_tokens <= self::PAUSE_HEADROOM_TOKENS
+			|| ( ! empty( $request_budget ) && ( empty( $request_budget['fits_context_window'] ) || (int) ( $request_budget['remaining_tokens'] ?? 0 ) <= 0 ) );
+	}
+
+	private function resolve_request_headroom_floor( array $request_budget = array() ): int {
+		$reserved = (array) ( $request_budget['reserved'] ?? array() );
+		$floor    = (int) ceil(
+			(
+				(int) ( $reserved['follow_up_tools'] ?? 0 )
+				+ (int) ( $reserved['safety_margin'] ?? 0 )
+			) / 2
+		);
+
+		return max( 1024, min( 4096, $floor ?: 1024 ) );
+	}
+
+	private function should_prime_for_request_headroom( array $request_budget = array() ): bool {
+		if ( empty( $request_budget ) ) {
+			return false;
+		}
+
+		$remaining = max( 0, (int) ( $request_budget['remaining_tokens'] ?? 0 ) );
+		$floor     = $this->resolve_request_headroom_floor( $request_budget );
+		$pressure  = (string) ( $request_budget['context_pressure'] ?? '' );
+
+		return empty( $request_budget['fits_context_window'] )
+			|| $remaining <= max( 1536, $floor * 2 )
+			|| ( 'critical' === $pressure && $remaining <= max( 3072, $floor * 3 ) );
+	}
+
+	private function should_compact_for_request_headroom( array $request_budget = array() ): bool {
+		if ( empty( $request_budget ) ) {
+			return false;
+		}
+
+		$remaining = max( 0, (int) ( $request_budget['remaining_tokens'] ?? 0 ) );
+		$floor     = $this->resolve_request_headroom_floor( $request_budget );
+		$pressure  = (string) ( $request_budget['context_pressure'] ?? '' );
+
+		return empty( $request_budget['fits_context_window'] )
+			|| $remaining <= $floor
+			|| ( 'critical' === $pressure && $remaining <= max( 2048, $floor * 2 ) );
+	}
+
+	private function resolve_live_compaction_reason( int $estimated_tokens, int $compaction_threshold, array $request_budget = array() ): string {
+		if ( $this->should_compact_for_request_headroom( $request_budget ) ) {
+			return 'reserved_headroom';
+		}
+
+		if ( $estimated_tokens > $compaction_threshold ) {
+			return 'message_threshold';
+		}
+
+		return 'token_ratio';
 	}
 
 	private function has_ai_compaction_headroom(): bool {
@@ -2412,6 +3320,126 @@ private function compact_loop_messages( array $messages, int $round = 0, ?PressA
 		}
 	}
 
+	private function build_compaction_marker( PressArk_Checkpoint $checkpoint, int $round ): string {
+		$capsule    = $checkpoint->get_context_capsule();
+		$compaction = is_array( $capsule['compaction'] ?? null ) ? (array) $capsule['compaction'] : array();
+		$count      = max( 0, (int) ( $compaction['count'] ?? 0 ) ) + 1;
+
+		return sanitize_key( sprintf( 'cmp_r%d_c%d', max( 1, $round ), $count ) );
+	}
+
+	private function record_compaction_event(
+		PressArk_Checkpoint $checkpoint,
+		int $round,
+		string $reason,
+		array $before_messages,
+		array $after_messages,
+		array $request_budget = array(),
+		string $marker = '',
+		string $summary_mode = 'capsule_summary'
+	): void {
+		$capsule    = $checkpoint->get_context_capsule();
+		$compaction = is_array( $capsule['compaction'] ?? null ) ? (array) $capsule['compaction'] : array();
+		$marker     = '' !== $marker ? sanitize_key( $marker ) : $this->build_compaction_marker( $checkpoint, $round );
+		$event      = array(
+			'marker'                  => $marker,
+			'reason'                  => sanitize_key( $reason ),
+			'round'                   => max( 1, $round ),
+			'before_messages'         => count( $before_messages ),
+			'after_messages'          => count( $after_messages ),
+			'dropped_messages'        => max( 0, count( $before_messages ) - count( $after_messages ) ),
+			'estimated_tokens_before' => $this->estimate_messages_tokens( $before_messages ),
+			'estimated_tokens_after'  => $this->estimate_messages_tokens( $after_messages ),
+			'remaining_tokens'        => max( 0, (int) ( $request_budget['remaining_tokens'] ?? 0 ) ),
+			'context_pressure'        => sanitize_key( (string) ( $request_budget['context_pressure'] ?? '' ) ),
+			'summary_mode'            => sanitize_key( $summary_mode ),
+			'at'                      => gmdate( 'c' ),
+		);
+
+		$compaction['count']                  = max( 0, (int) ( $compaction['count'] ?? 0 ) ) + 1;
+		$compaction['last_marker']            = $marker;
+		$compaction['last_reason']            = $event['reason'];
+		$compaction['last_round']             = $event['round'];
+		$compaction['last_at']                = $event['at'];
+		$compaction['last_event']             = $event;
+		$compaction['pending_post_compaction'] = array(
+			'marker' => $marker,
+			'reason' => $event['reason'],
+			'round'  => $event['round'],
+			'at'     => $event['at'],
+		);
+
+		$capsule['compaction'] = $compaction;
+		if ( empty( $capsule['updated_at'] ) ) {
+			$capsule['updated_at'] = gmdate( 'c' );
+		}
+		$checkpoint->set_context_capsule( $capsule );
+	}
+
+	private function record_compaction_pause(
+		?PressArk_Checkpoint $checkpoint,
+		array $messages,
+		int $round,
+		string $reason,
+		array $request_budget = array()
+	): void {
+		if ( ! $checkpoint ) {
+			return;
+		}
+
+		$marker = $this->build_compaction_marker( $checkpoint, $round );
+		$this->record_compaction_event(
+			$checkpoint,
+			$round,
+			$reason,
+			$messages,
+			$messages,
+			$request_budget,
+			$marker,
+			'checkpoint_capsule'
+		);
+	}
+
+	private function observe_post_compaction_turn(
+		?PressArk_Checkpoint $checkpoint,
+		int $round,
+		string $stop_reason,
+		array $tool_calls,
+		string $text,
+		array $request_budget = array()
+	): void {
+		if ( ! $checkpoint ) {
+			return;
+		}
+
+		$capsule    = $checkpoint->get_context_capsule();
+		$compaction = is_array( $capsule['compaction'] ?? null ) ? (array) $capsule['compaction'] : array();
+		$pending    = is_array( $compaction['pending_post_compaction'] ?? null ) ? (array) $compaction['pending_post_compaction'] : array();
+		if ( empty( $pending['marker'] ) ) {
+			return;
+		}
+
+		$trimmed = trim( $text );
+		$healthy = '' !== $trimmed || ! empty( $tool_calls );
+
+		$compaction['first_post_compaction'] = array(
+			'marker'          => sanitize_key( (string) $pending['marker'] ),
+			'reason'          => sanitize_key( (string) ( $pending['reason'] ?? '' ) ),
+			'observed_round'  => max( 1, $round ),
+			'stop_reason'     => sanitize_key( $stop_reason ),
+			'tool_calls'      => count( $tool_calls ),
+			'had_text'        => '' !== $trimmed,
+			'healthy'         => $healthy,
+			'remaining_tokens'=> max( 0, (int) ( $request_budget['remaining_tokens'] ?? 0 ) ),
+			'context_pressure'=> sanitize_key( (string) ( $request_budget['context_pressure'] ?? '' ) ),
+			'at'              => gmdate( 'c' ),
+		);
+		unset( $compaction['pending_post_compaction'] );
+
+		$capsule['compaction'] = $compaction;
+		$checkpoint->set_context_capsule( $capsule );
+	}
+
 	private function build_context_capsule( array $messages, ?PressArk_Checkpoint $checkpoint = null, bool $force_ai = false ): array {
 		$task              = $this->resolve_capsule_task( $checkpoint, $messages );
 		$historical_tasks  = $this->extract_historical_requests( $messages, $task );
@@ -2425,6 +3453,10 @@ private function compact_loop_messages( array $messages, int $round = 0, ?PressA
 		$created_post_ids  = array();
 		$preserved_details = $this->collect_preserved_detail_lines( $checkpoint, $messages );
 		$compression_model = '';
+		$existing_capsule  = $checkpoint ? $checkpoint->get_context_capsule() : array();
+		$compaction_state  = is_array( $existing_capsule['compaction'] ?? null )
+			? (array) $existing_capsule['compaction']
+			: array();
 
 		if ( $checkpoint ) {
 			$exec = $checkpoint->get_execution();
@@ -2498,7 +3530,6 @@ private function compact_loop_messages( array $messages, int $round = 0, ?PressA
 		// (from the pause-and-continue path) bypass the cooldown.
 		$skip_ai_cooldown = false;
 		if ( ! $force_ai && $checkpoint ) {
-			$existing_capsule    = $checkpoint->get_context_capsule();
 			$existing_updated_at = strtotime( (string) ( $existing_capsule['updated_at'] ?? '' ) );
 			if ( $existing_updated_at && ( time() - $existing_updated_at ) < 45 ) {
 				$skip_ai_cooldown = true;
@@ -2531,6 +3562,7 @@ private function compact_loop_messages( array $messages, int $round = 0, ?PressA
 			'created_post_ids'    => array_values( array_unique( array_filter( $created_post_ids ) ) ),
 			'scope'               => array_values( array_unique( array_filter( array_map( 'sanitize_text_field', $scope ) ) ) ),
 			'compression_model'   => $compression_model,
+			'compaction'          => $compaction_state,
 			'updated_at'          => gmdate( 'c' ),
 		);
 

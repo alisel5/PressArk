@@ -419,6 +419,10 @@ class PressArk_Handler_Diagnostics extends PressArk_Handler_Base {
 
 		$type = $params['type'] ?? 'wp_template';
 		$slug = $params['slug'] ?? '';
+		$mode = sanitize_key( (string) ( $params['mode'] ?? ( ! empty( $slug ) ? 'detail' : 'summary' ) ) );
+		if ( ! in_array( $mode, array( 'summary', 'detail', 'raw' ), true ) ) {
+			$mode = ! empty( $slug ) ? 'detail' : 'summary';
+		}
 
 		// Single template by slug.
 		if ( ! empty( $slug ) ) {
@@ -450,7 +454,7 @@ class PressArk_Handler_Diagnostics extends PressArk_Handler_Base {
 				$index++;
 			}
 
-			return array(
+			$detail = array(
 				'slug'        => $template->slug,
 				'title'       => $template->title,
 				'type'        => $type,
@@ -462,6 +466,45 @@ class PressArk_Handler_Diagnostics extends PressArk_Handler_Base {
 				'blocks'      => $block_tree,
 				'issues'      => $issues,
 				'edit_hint'   => __( 'Use edit_template with slug and block_index to modify a specific block.', 'pressark' ),
+			);
+
+			if ( 'summary' === $mode ) {
+				$block_labels = array_values( array_filter( array_map(
+					static function ( array $block ): string {
+						return (string) ( $block['label'] ?? $block['name'] ?? '' );
+					},
+					$block_tree
+				) ) );
+
+				return array(
+					'slug'        => $template->slug,
+					'title'       => $template->title,
+					'type'        => $type,
+					'source'      => $template->source,
+					'origin'      => $template->origin ?? 'theme',
+					'has_custom'  => $template->source === 'custom',
+					'description' => $template->description,
+					'block_count' => count( $block_tree ),
+					'block_types' => array_slice( $block_labels, 0, 10 ),
+					'issues'      => $issues,
+					'detail_hint' => __( 'Use mode=detail for block-level structure or mode=raw for raw template markup.', 'pressark' ),
+					'mode'        => 'summary',
+				);
+			}
+
+			if ( 'raw' === $mode ) {
+				$detail['content'] = $template->content;
+				$detail['mode']    = 'raw';
+				return $detail;
+			}
+
+			$detail['mode'] = 'detail';
+			return $detail;
+		}
+
+		if ( 'raw' === $mode ) {
+			return array(
+				'error' => __( 'Raw template reads require a specific slug. Use get_templates with slug and mode=raw.', 'pressark' ),
 			);
 		}
 
@@ -489,6 +532,7 @@ class PressArk_Handler_Diagnostics extends PressArk_Handler_Base {
 			'count'     => count( $result ),
 			'templates' => $result,
 			'hint'      => __( 'Use get_templates with slug for block-level detail on a specific template.', 'pressark' ),
+			'mode'      => 'detail' === $mode ? 'detail' : 'summary',
 		);
 	}
 

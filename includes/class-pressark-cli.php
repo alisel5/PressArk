@@ -15,7 +15,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 class PressArk_CLI extends WP_CLI_Command {
 
 	/**
-	 * Show tier, token usage, model, provider, and BYOK status.
+	 * Show tier, billing status, model, provider, and BYOK status.
 	 *
 	 * ## EXAMPLES
 	 *
@@ -40,15 +40,21 @@ class PressArk_CLI extends WP_CLI_Command {
 		);
 
 		if ( ! $is_byok ) {
-			$bank   = new PressArk_Token_Bank();
-			$status = $bank->get_status();
-			$budget = PressArk_Entitlements::token_budget( $tier );
-			$used   = (int) ( $status['tokens_used'] ?? 0 );
-			$remain = (int) ( $status['tokens_remaining'] ?? $budget );
-
-			$rows[] = array( 'Field' => 'Token Budget',    'Value' => number_format( $budget ) );
-			$rows[] = array( 'Field' => 'Tokens Used',     'Value' => number_format( $used ) );
-			$rows[] = array( 'Field' => 'Tokens Remaining', 'Value' => number_format( $remain ) );
+			$plan_info = PressArk_Entitlements::get_plan_info( $tier );
+			$rows[] = array( 'Field' => 'Billing Tier', 'Value' => PressArk_Entitlements::tier_label( (string) ( $plan_info['billing_tier'] ?? $tier ) ) . ' (' . (string) ( $plan_info['billing_tier'] ?? $tier ) . ')' );
+			$rows[] = array( 'Field' => 'Billing Authority', 'Value' => (string) ( $plan_info['billing_authority'] ?? 'token_bank' ) );
+			$rows[] = array( 'Field' => 'Monthly Included ICU Budget', 'Value' => number_format( (int) ( $plan_info['monthly_included_icu_budget'] ?? $plan_info['monthly_icu_budget'] ?? 0 ) ) );
+			$rows[] = array( 'Field' => 'Monthly Included Remaining', 'Value' => number_format( (int) ( $plan_info['monthly_included_remaining'] ?? $plan_info['monthly_remaining'] ?? 0 ) ) );
+			$rows[] = array( 'Field' => 'Purchased Credits Remaining', 'Value' => number_format( (int) ( $plan_info['purchased_credits_remaining'] ?? $plan_info['credits_remaining'] ?? 0 ) ) );
+			if ( ! empty( $plan_info['legacy_bonus_remaining'] ) ) {
+				$rows[] = array( 'Field' => 'Legacy Bonus Remaining', 'Value' => number_format( (int) $plan_info['legacy_bonus_remaining'] ) );
+			}
+			$rows[] = array( 'Field' => 'Total Spendable Remaining', 'Value' => number_format( (int) ( $plan_info['total_remaining'] ?? 0 ) ) );
+			$rows[] = array( 'Field' => 'Budget Pressure', 'Value' => (string) ( $plan_info['budget_pressure_state'] ?? 'normal' ) );
+			$rows[] = array( 'Field' => 'Using Purchased Credits', 'Value' => ! empty( $plan_info['using_purchased_credits'] ) ? 'Yes' : 'No' );
+			if ( ! empty( $plan_info['billing_contract_mismatch'] ) ) {
+				$rows[] = array( 'Field' => 'Billing Contract', 'Value' => 'Mismatch (bank catalog authoritative)' );
+			}
 		}
 
 		$rows[] = array( 'Field' => 'Plugin Version', 'Value' => PRESSARK_VERSION );
@@ -57,7 +63,7 @@ class PressArk_CLI extends WP_CLI_Command {
 	}
 
 	/**
-	 * Show detailed token and action quota breakdown.
+	 * Show detailed ICU, planning-token, and action quota breakdown.
 	 *
 	 * ## EXAMPLES
 	 *
@@ -70,30 +76,40 @@ class PressArk_CLI extends WP_CLI_Command {
 		$tier    = $license->get_tier();
 		$is_byok = PressArk_Entitlements::is_byok();
 
-		// -- Token usage --
-		WP_CLI::log( '── Token Usage ──' );
+		// -- Billing usage --
+		WP_CLI::log( '── Billing Usage ──' );
 
 		if ( $is_byok ) {
-			WP_CLI::log( 'BYOK enabled — token usage is unmetered.' );
+			WP_CLI::log( 'BYOK enabled — bundled ICU credits are bypassed.' );
 		} else {
-			$bank   = new PressArk_Token_Bank();
-			$status = $bank->get_status();
-			$budget = PressArk_Entitlements::token_budget( $tier );
-			$used   = (int) ( $status['tokens_used'] ?? 0 );
-			$remain = (int) ( $status['tokens_remaining'] ?? $budget );
+			$plan_info = PressArk_Entitlements::get_plan_info( $tier );
+			$budget    = (int) ( $plan_info['monthly_included_icu_budget'] ?? $plan_info['monthly_icu_budget'] ?? 0 );
+			$used      = (int) ( $plan_info['icus_used'] ?? 0 );
+			$remain    = (int) ( $plan_info['total_remaining'] ?? 0 );
+			$pct       = $budget > 0 ? round( ( $used / $budget ) * 100, 1 ) : 0;
 
-			$pct = $budget > 0 ? round( ( $used / $budget ) * 100, 1 ) : 0;
-
-			WP_CLI::log( sprintf( '  Budget:    %s tokens', number_format( $budget ) ) );
-			WP_CLI::log( sprintf( '  Used:      %s tokens (%s%%)', number_format( $used ), $pct ) );
-			WP_CLI::log( sprintf( '  Remaining: %s tokens', number_format( $remain ) ) );
+			WP_CLI::log( sprintf( '  Billing Tier:                %s', (string) ( $plan_info['billing_tier'] ?? $tier ) ) );
+			WP_CLI::log( sprintf( '  Billing Authority:           %s', (string) ( $plan_info['billing_authority'] ?? 'token_bank' ) ) );
+			WP_CLI::log( sprintf( '  Monthly Included ICU Budget: %s', number_format( $budget ) ) );
+			WP_CLI::log( sprintf( '  ICUs Used This Cycle:        %s (%s%%)', number_format( $used ), $pct ) );
+			WP_CLI::log( sprintf( '  Monthly Included Remaining:  %s', number_format( (int) ( $plan_info['monthly_included_remaining'] ?? $plan_info['monthly_remaining'] ?? 0 ) ) ) );
+			WP_CLI::log( sprintf( '  Purchased Credits Remaining: %s', number_format( (int) ( $plan_info['purchased_credits_remaining'] ?? $plan_info['credits_remaining'] ?? 0 ) ) ) );
+			if ( ! empty( $plan_info['legacy_bonus_remaining'] ) ) {
+				WP_CLI::log( sprintf( '  Legacy Bonus Remaining:      %s', number_format( (int) $plan_info['legacy_bonus_remaining'] ) ) );
+			}
+			WP_CLI::log( sprintf( '  Total Spendable Remaining:   %s', number_format( $remain ) ) );
+			WP_CLI::log( sprintf( '  Budget Pressure:             %s', (string) ( $plan_info['budget_pressure_state'] ?? 'normal' ) ) );
+			WP_CLI::log( sprintf( '  Using Purchased Credits:     %s', ! empty( $plan_info['using_purchased_credits'] ) ? 'Yes' : 'No' ) );
+			if ( ! empty( $plan_info['billing_contract_mismatch'] ) ) {
+				WP_CLI::log( '  Billing Contract:            Mismatch (bank catalog authoritative)' );
+			}
 		}
 
-		// -- Token stats (local) --
+		// -- Local Provider Tokens --
 		$token_stats = PressArk_Usage_Tracker::get_token_stats();
 		if ( $token_stats['request_count'] > 0 ) {
 			WP_CLI::log( '' );
-			WP_CLI::log( '── This Month (Local) ──' );
+			WP_CLI::log( '── Local Provider Tokens ──' );
 			WP_CLI::log( sprintf( '  Requests:   %s', number_format( $token_stats['request_count'] ) ) );
 			WP_CLI::log( sprintf( '  Input:      %s tokens', number_format( $token_stats['total_input'] ) ) );
 			WP_CLI::log( sprintf( '  Output:     %s tokens', number_format( $token_stats['total_output'] ) ) );
@@ -111,14 +127,14 @@ class PressArk_CLI extends WP_CLI_Command {
 			WP_CLI::log( '── Free Tier Action Quotas ──' );
 
 			$plan_info = PressArk_Entitlements::get_plan_info( $tier );
-			if ( ! empty( $plan_info['group_usage'] ) ) {
+			if ( ! empty( $plan_info['group_usage']['per_group'] ) ) {
 				$rows = array();
-				foreach ( $plan_info['group_usage'] as $group => $data ) {
+				foreach ( (array) $plan_info['group_usage']['per_group'] as $group => $used ) {
 					$rows[] = array(
 						'Group'     => $group,
-						'Used'      => $data['used'],
-						'Limit'     => $data['limit'],
-						'Remaining' => max( 0, $data['limit'] - $data['used'] ),
+						'Used'      => (int) $used,
+						'Limit'     => (int) ( $plan_info['group_usage']['total_limit'] ?? 0 ),
+						'Remaining' => (int) ( $plan_info['group_usage']['total_remaining'] ?? 0 ),
 					);
 				}
 				WP_CLI\Utils\format_items( 'table', $rows, array( 'Group', 'Used', 'Limit', 'Remaining' ) );
@@ -135,8 +151,8 @@ class PressArk_CLI extends WP_CLI_Command {
 		$config = PressArk_Entitlements::tier_config( $tier );
 		$limits = array(
 			array( 'Limit' => 'Max Agent Rounds',       'Value' => (string) $config['max_agent_rounds'] ),
-			array( 'Limit' => 'Agent Token Budget',     'Value' => number_format( $config['agent_token_budget'] ) ),
-			array( 'Limit' => 'Workflow Token Budget',   'Value' => number_format( $config['workflow_token_budget'] ) ),
+			array( 'Limit' => 'Agent Prompt Budget',    'Value' => number_format( $config['agent_token_budget'] ) . ' planning tokens' ),
+			array( 'Limit' => 'Workflow Prompt Budget', 'Value' => number_format( $config['workflow_token_budget'] ) . ' planning tokens' ),
 			array( 'Limit' => 'Burst/min',              'Value' => (string) $config['burst_per_min'] ),
 			array( 'Limit' => 'Hourly Limit',           'Value' => (string) $config['hourly_limit'] ),
 			array( 'Limit' => 'Concurrency',            'Value' => (string) $config['concurrency'] ),

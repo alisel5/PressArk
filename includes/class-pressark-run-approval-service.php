@@ -89,6 +89,14 @@ class PressArk_Run_Approval_Service {
 				$checkpoint->clear_blockers();
 				$checkpoint->add_approval( (string) ( $action['type'] ?? 'confirmed_action' ) );
 				$checkpoint->set_workflow_stage( 'settled' );
+				$checkpoint->clear_plan_state(); // v5.3.0
+
+				// v5.4.0: Evidence-based verification for confirmed actions.
+				$tool_name      = (string) ( $action['type'] ?? '' );
+				$verify_result  = self::run_verification( $tool_name, $result, $action_args, $engine, $checkpoint );
+				if ( null !== $verify_result ) {
+					$result['verification'] = $verify_result;
+				}
 			} else {
 				$checkpoint->add_blocker( (string) ( $result['message'] ?? 'Confirmed action failed.' ) );
 			}
@@ -133,11 +141,26 @@ class PressArk_Run_Approval_Service {
 			$action = $item['action'] ?? $item;
 			$op_name = $action['type'] ?? '';
 
-			// Policy check.
-			$check = PressArk_Automation_Policy::check( $op_name, $policy, $action['params'] ?? array() );
-			if ( ! $check['allowed'] ) {
-				$blocked[] = $check['reason'] ?? "Blocked: {$op_name}";
-				continue;
+			// v5.4.0: Route through Policy Engine (falls back to Automation_Policy
+			// when no custom rules are registered).
+			if ( class_exists( 'PressArk_Policy_Engine' ) ) {
+				$verdict = PressArk_Policy_Engine::evaluate(
+					$op_name,
+					$action['params'] ?? array(),
+					PressArk_Policy_Engine::CONTEXT_AUTOMATION,
+					array( 'policy' => $policy, 'run_id' => $run_id, 'user_id' => $user_id )
+				);
+				if ( ! PressArk_Policy_Engine::is_allowed( $verdict ) ) {
+					$blocked[] = implode( ' ', $verdict['reasons'] ?? array( "Blocked: {$op_name}" ) );
+					continue;
+				}
+			} else {
+				// Legacy fallback.
+				$check = PressArk_Automation_Policy::check( $op_name, $policy, $action['params'] ?? array() );
+				if ( ! $check['allowed'] ) {
+					$blocked[] = $check['reason'] ?? "Blocked: {$op_name}";
+					continue;
+				}
 			}
 
 			$result = $engine->execute_single( $action );
@@ -199,6 +222,12 @@ class PressArk_Run_Approval_Service {
 					$checkpoint->record_execution_write( $op_name, $action_args, $results_by_index[ $idx ] );
 					if ( ! empty( $results_by_index[ $idx ]['success'] ) ) {
 						$checkpoint->add_approval( $op_name ?: 'confirmed_action' );
+
+						// v5.4.0: Evidence-based verification for batch-approved actions.
+						$verify_result = self::run_verification( $op_name, $results_by_index[ $idx ], $action_args, $engine, $checkpoint );
+						if ( null !== $verify_result ) {
+							$results_by_index[ $idx ]['verification'] = $verify_result;
+						}
 					} else {
 						$checkpoint->add_blocker( (string) ( $results_by_index[ $idx ]['message'] ?? ( 'Confirmed action failed: ' . $op_name ) ) );
 					}
@@ -210,6 +239,7 @@ class PressArk_Run_Approval_Service {
 			if ( $all_succeeded ) {
 				$checkpoint->clear_blockers();
 				$checkpoint->set_workflow_stage( 'settled' );
+				$checkpoint->clear_plan_state(); // v5.3.0
 			}
 			self::persist_run_checkpoint( $run, $checkpoint );
 			$merged['checkpoint'] = $checkpoint->to_array();
@@ -256,9 +286,29 @@ class PressArk_Run_Approval_Service {
 		$session_calls = $preview->get_session_tool_calls( $session_id );
 
 		foreach ( $session_calls as $call ) {
-			$op_name = $call['name'] ?? $call['type'] ?? '';
-			$check   = PressArk_Automation_Policy::check( $op_name, $policy, $call['arguments'] ?? array() );
-			if ( ! $check['allowed'] ) {
+			$op_name  = $call['name'] ?? $call['type'] ?? '';
+			$op_args  = $call['arguments'] ?? array();
+			$blocked_reason = null;
+
+			// v5.4.0: Route through Policy Engine for preview-keep.
+			if ( class_exists( 'PressArk_Policy_Engine' ) ) {
+				$verdict = PressArk_Policy_Engine::evaluate(
+					$op_name,
+					$op_args,
+					PressArk_Policy_Engine::CONTEXT_PREVIEW,
+					array( 'policy' => $policy, 'run_id' => $run_id, 'user_id' => $user_id )
+				);
+				if ( ! PressArk_Policy_Engine::is_allowed( $verdict ) ) {
+					$blocked_reason = implode( ' ', $verdict['reasons'] ?? array( $op_name ) );
+				}
+			} else {
+				$check = PressArk_Automation_Policy::check( $op_name, $policy, $op_args );
+				if ( ! $check['allowed'] ) {
+					$blocked_reason = $check['reason'] ?? $op_name;
+				}
+			}
+
+			if ( null !== $blocked_reason ) {
 				// Discard the preview and fail.
 				$preview->discard( $session_id );
 				$checkpoint = self::load_run_checkpoint( $run );
@@ -266,14 +316,14 @@ class PressArk_Run_Approval_Service {
 					if ( ! empty( $run['workflow_state'] ) && is_array( $run['workflow_state'] ) ) {
 						$checkpoint->absorb_workflow_state( $run['workflow_state'] );
 					}
-					$checkpoint->add_blocker( (string) ( $check['reason'] ?? $op_name ) );
+					$checkpoint->add_blocker( (string) $blocked_reason );
 					self::persist_run_checkpoint( $run, $checkpoint );
 				}
-				PressArk_Pipeline::fail_run( $run_id, 'Preview blocked by automation policy: ' . ( $check['reason'] ?? $op_name ) );
+				PressArk_Pipeline::fail_run( $run_id, 'Preview blocked by policy: ' . $blocked_reason );
 				return array(
 					'success'        => false,
-					'message'        => 'Preview contained operations outside automation policy.',
-					'policy_blocked' => array( $check['reason'] ?? $op_name ),
+					'message'        => 'Preview contained operations outside policy.',
+					'policy_blocked' => array( $blocked_reason ),
 				);
 			}
 		}
@@ -306,6 +356,7 @@ class PressArk_Run_Approval_Service {
 			if ( ! empty( $result['success'] ) ) {
 				$checkpoint->clear_blockers();
 				$checkpoint->set_workflow_stage( 'settled' );
+				$checkpoint->clear_plan_state(); // v5.3.0
 			} else {
 				$checkpoint->add_blocker( (string) ( $result['message'] ?? 'Preview apply failed.' ) );
 			}
@@ -358,6 +409,88 @@ class PressArk_Run_Approval_Service {
 	/**
 	 * Attach continuation metadata grounded in the execution ledger.
 	 */
+	/**
+	 * Run evidence-based verification for a completed write action.
+	 *
+	 * Checks if the operation has a verification policy, builds a read-back
+	 * tool call, executes it, evaluates the result, and records evidence in
+	 * the checkpoint. Returns the evaluation result or null if no verification
+	 * was performed.
+	 *
+	 * @since 5.4.0
+	 *
+	 * @param string                $tool_name  Write tool that just executed.
+	 * @param array                 $result     Execution result from the handler.
+	 * @param array                 $write_args Original write arguments.
+	 * @param PressArk_Action_Engine $engine     Action engine for executing read-back.
+	 * @param PressArk_Checkpoint   $checkpoint Checkpoint for recording evidence.
+	 * @return array|null Evaluation result or null.
+	 */
+	private static function run_verification(
+		string $tool_name,
+		array $result,
+		array $write_args,
+		PressArk_Action_Engine $engine,
+		PressArk_Checkpoint $checkpoint
+	): ?array {
+		if ( ! class_exists( 'PressArk_Verification' ) ) {
+			return null;
+		}
+
+		$policy = PressArk_Verification::get_policy( $tool_name, $result );
+		if ( ! $policy || 'none' === ( $policy['strategy'] ?? 'none' ) ) {
+			// Nudge-only policies: attach the nudge but no automated read-back.
+			$nudge = PressArk_Verification::build_nudge( $tool_name, $result );
+			if ( $nudge ) {
+				return array(
+					'nudge'  => $nudge,
+					'status' => 'nudge_only',
+				);
+			}
+			return null;
+		}
+
+		$readback_call = PressArk_Verification::build_readback( $policy, $result, $write_args );
+		if ( ! $readback_call ) {
+			return null;
+		}
+
+		// Execute the read-back tool call.
+		try {
+			$readback_result = $engine->execute_read( $readback_call['name'], $readback_call['arguments'] );
+		} catch ( \Throwable $e ) {
+			// Read-back failed — degrade gracefully.
+			$nudge = PressArk_Verification::build_nudge( $tool_name, $result );
+			return array(
+				'nudge'  => $nudge,
+				'status' => 'readback_failed',
+				'error'  => $e->getMessage(),
+			);
+		}
+
+		// Evaluate the read-back against the write intent.
+		$eval = PressArk_Verification::evaluate( $policy, $write_args, $readback_result );
+
+		// Record in checkpoint.
+		$checkpoint->record_verification(
+			$tool_name,
+			$readback_result,
+			$eval['passed'],
+			$eval['evidence']
+		);
+
+		// Build nudge for model consumption.
+		$nudge = PressArk_Verification::build_nudge( $tool_name, $result, $eval );
+
+		return array(
+			'passed'     => $eval['passed'],
+			'evidence'   => $eval['evidence'],
+			'mismatches' => $eval['mismatches'],
+			'nudge'      => $nudge,
+			'status'     => $eval['passed'] ? 'verified' : 'uncertain',
+		);
+	}
+
 	private static function attach_continuation_context( array $result, array $run, ?PressArk_Checkpoint $checkpoint = null ): array {
 		$result['continuation'] = array(
 			'original_message' => $run['message'] ?? '',
@@ -373,16 +506,31 @@ class PressArk_Run_Approval_Service {
 			$execution = $checkpoint->get_execution();
 			$progress  = PressArk_Execution_Ledger::progress_snapshot( $execution );
 			$blockers  = $checkpoint->get_blockers();
+			$replay    = $checkpoint->get_replay_sidecar();
 
 			$result['continuation']['execution']          = $execution;
 			$result['continuation']['progress']           = $progress;
 			$result['continuation']['blockers']           = $blockers;
 			$result['continuation']['should_auto_resume'] = ! empty( $progress['should_auto_resume'] ) && empty( $blockers );
+			if ( ! empty( $replay ) ) {
+				$result['continuation']['replay'] = $replay;
+				$result['replay']                 = $replay;
+			}
 
 			if ( ! empty( $progress['is_complete'] ) ) {
 				$result['continuation']['completion_message'] = 'All requested steps are complete. Do not continue automatically.';
 			} elseif ( ! empty( $blockers ) ) {
 				$result['continuation']['pause_message'] = 'Auto-resume paused because unresolved blockers remain.';
+			}
+
+			// v5.4.0: Attach verification summary to continuation context.
+			$v_summary = PressArk_Execution_Ledger::verification_summary( $execution );
+			if ( $v_summary['verified'] > 0 || $v_summary['uncertain'] > 0 ) {
+				$result['continuation']['verification_summary'] = $v_summary;
+			}
+			if ( $v_summary['uncertain'] > 0 ) {
+				$result['continuation']['verification_warning'] = $v_summary['uncertain']
+					. ' action(s) have uncertain verification. Confirm with a read tool before reporting completion.';
 			}
 		}
 

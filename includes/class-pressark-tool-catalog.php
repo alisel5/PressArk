@@ -530,7 +530,7 @@ class PressArk_Tool_Catalog {
 	 * @param string[] $loaded_groups Group names already loaded.
 	 * @return string Compact text for system prompt, or empty if all groups loaded.
 	 */
-	public function get_capability_map( array $loaded_groups ): string {
+	public function get_capability_map( array $loaded_groups, string $resource_detail = 'full' ): string {
 		$has_woo       = class_exists( 'WooCommerce' );
 		$has_elementor = class_exists( '\\Elementor\\Plugin' );
 		$loaded_set    = array_flip( $this->normalize_string_list( $loaded_groups ) );
@@ -596,7 +596,7 @@ class PressArk_Tool_Catalog {
 			. implode( "\n", $lines );
 
 		// v5.1.0: Append resource summary when bridge is available.
-		$resource_context = PressArk_Capability_Bridge::get_context_resources( $loaded_groups );
+		$resource_context = PressArk_Capability_Bridge::get_context_resources( $loaded_groups, $resource_detail );
 		if ( '' !== $resource_context ) {
 			$map .= "\n\n" . $resource_context;
 		}
@@ -671,8 +671,63 @@ class PressArk_Tool_Catalog {
 			return '';
 		}
 
-		return "OTHER GROUPS (use discover_tools or load_tools when needed):\n"
+		$map = "OTHER GROUPS (use discover_tools or load_tools when needed):\n"
 			. implode( "\n", $lines );
+
+		$resource_context = PressArk_Capability_Bridge::get_context_resources( $loaded_groups, 'compact' );
+		if ( '' !== $resource_context ) {
+			$map .= "\n\n" . $resource_context;
+		}
+
+		return $map;
+	}
+
+	/**
+	 * Build the smallest on-demand capability hint.
+	 *
+	 * Used under budget pressure when even the compact capability map is
+	 * more prompt than the round can comfortably afford.
+	 *
+	 * @param string[] $loaded_groups Group names already loaded.
+	 * @return string
+	 */
+	public function get_minimal_capability_map( array $loaded_groups ): string {
+		$all_groups = array_values( array_filter(
+			PressArk_Operation_Registry::group_names(),
+			fn( $group ) => ! in_array( $group, $loaded_groups, true ) && 'discovery' !== $group
+		) );
+
+		if ( empty( $all_groups ) ) {
+			return '';
+		}
+
+		$hint = 'More tools are available on demand via discover_tools/load_tools.';
+		$hint .= ' Groups: ' . implode( ', ', array_slice( $all_groups, 0, 10 ) );
+		if ( count( $all_groups ) > 10 ) {
+			$hint .= ', +' . ( count( $all_groups ) - 10 ) . ' more';
+		}
+
+		$resource_context = PressArk_Capability_Bridge::get_context_resources( $loaded_groups, 'minimal' );
+		if ( '' !== $resource_context ) {
+			$hint .= "\n\n" . $resource_context;
+		}
+
+		return $hint;
+	}
+
+	/**
+	 * Build all capability-map variants up front so callers can downgrade the
+	 * support text later without rebuilding strings.
+	 *
+	 * @param string[] $loaded_groups Group names already loaded.
+	 * @return array<string, string>
+	 */
+	public function get_capability_maps( array $loaded_groups ): array {
+		return array(
+			'full'    => $this->get_capability_map( $loaded_groups, 'full' ),
+			'compact' => $this->get_compact_capability_map( $loaded_groups ),
+			'minimal' => $this->get_minimal_capability_map( $loaded_groups ),
+		);
 	}
 
 	/**

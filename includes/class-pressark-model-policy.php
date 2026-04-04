@@ -252,6 +252,7 @@ class PressArk_Model_Policy {
 	 *                       multiple tool_use blocks without a parameter.
 	 * streaming           — supports streaming responses.
 	 * max_output          — max output tokens per request.
+	 * context_window      — conservative planning window for prompt budgeting.
 	 * cost_per_mtok       — approximate cost per million tokens (input, for routing).
 	 */
 	private const PROVIDER_CAPABILITIES = array(
@@ -261,6 +262,7 @@ class PressArk_Model_Policy {
 			'parallel_tool_calls' => false, // Native multi-tool — no request param needed.
 			'streaming'           => true,
 			'max_output'          => 8192,
+			'context_window'      => 200000,
 			'cost_per_mtok'       => 1.0,
 		),
 		'openai' => array(
@@ -269,6 +271,7 @@ class PressArk_Model_Policy {
 			'parallel_tool_calls' => true,
 			'streaming'           => true,
 			'max_output'          => 16384,
+			'context_window'      => 128000,
 			'cost_per_mtok'       => 0.75,
 		),
 		'deepseek' => array(
@@ -277,6 +280,7 @@ class PressArk_Model_Policy {
 			'parallel_tool_calls' => true,
 			'streaming'           => true,
 			'max_output'          => 8192,
+			'context_window'      => 64000,
 			'cost_per_mtok'       => 0.26,
 		),
 		'minimax' => array(
@@ -285,6 +289,7 @@ class PressArk_Model_Policy {
 			'parallel_tool_calls' => true,
 			'streaming'           => true,
 			'max_output'          => 8192,
+			'context_window'      => 64000,
 			'cost_per_mtok'       => 0.30,
 		),
 		'moonshotai' => array(
@@ -293,6 +298,7 @@ class PressArk_Model_Policy {
 			'parallel_tool_calls' => true,
 			'streaming'           => true,
 			'max_output'          => 8192,
+			'context_window'      => 128000,
 			'cost_per_mtok'       => 0.45,
 		),
 		'z-ai' => array(
@@ -301,7 +307,17 @@ class PressArk_Model_Policy {
 			'parallel_tool_calls' => true,
 			'streaming'           => true,
 			'max_output'          => 8192,
+			'context_window'      => 64000,
 			'cost_per_mtok'       => 0.72,
+		),
+		'gemini' => array(
+			'prompt_caching'      => false,
+			'tool_calling'        => true,
+			'parallel_tool_calls' => true,
+			'streaming'           => true,
+			'max_output'          => 8192,
+			'context_window'      => 128000,
+			'cost_per_mtok'       => 0.45,
 		),
 		'openrouter' => array(
 			'prompt_caching'      => false,
@@ -309,8 +325,30 @@ class PressArk_Model_Policy {
 			'parallel_tool_calls' => true, // Passed through to underlying model.
 			'streaming'           => true,
 			'max_output'          => 8192,
+			'context_window'      => 128000,
 			'cost_per_mtok'       => 0.0, // Varies by model.
 		),
+	);
+
+	/**
+	 * Conservative model-prefix planning windows.
+	 *
+	 * These are used only for local prompt budgeting, not as a claim about the
+	 * provider's hard API contract. Deployments can override them via filter.
+	 */
+	private const MODEL_CONTEXT_WINDOWS = array(
+		'anthropic/claude' => 200000,
+		'openai/gpt-5'     => 200000,
+		'openai/o3-pro'    => 200000,
+		'openai/o4-mini'   => 200000,
+		'openai/gpt-4.1'   => 128000,
+		'openai/gpt-4o'    => 128000,
+		'google/gemini'    => 128000,
+		'gemini'           => 128000,
+		'deepseek/'        => 64000,
+		'minimax/'         => 64000,
+		'moonshotai/'      => 128000,
+		'z-ai/'            => 64000,
 	);
 
 	// ── Model Resolution ───────────────────────────────────────────
@@ -636,6 +674,44 @@ class PressArk_Model_Policy {
 	 */
 	public static function provider_capabilities( string $provider ): array {
 		return self::PROVIDER_CAPABILITIES[ $provider ] ?? self::PROVIDER_CAPABILITIES['openrouter'];
+	}
+
+	/**
+	 * Get the conservative planning context window for a model/provider pair.
+	 *
+	 * This is intentionally treated as a budgeting hint for hydration and
+	 * history sizing rather than a hard transport guarantee.
+	 *
+	 * @since 5.4.0
+	 * @param string $model    Model identifier.
+	 * @param string $provider Provider key.
+	 * @return int
+	 */
+	public static function context_window( string $model = '', string $provider = 'openrouter' ): int {
+		$model = strtolower( trim( $model ) );
+
+		foreach ( self::MODEL_CONTEXT_WINDOWS as $prefix => $window ) {
+			if ( '' !== $model && str_starts_with( $model, $prefix ) ) {
+				return (int) apply_filters( 'pressark_context_window', $window, $model, $provider );
+			}
+		}
+
+		$caps   = self::provider_capabilities( $provider );
+		$window = (int) ( $caps['context_window'] ?? 128000 );
+
+		return (int) apply_filters( 'pressark_context_window', $window, $model, $provider );
+	}
+
+	/**
+	 * Get the provider-level output cap used for reserve planning.
+	 *
+	 * @since 5.4.0
+	 * @param string $provider Provider key.
+	 * @return int
+	 */
+	public static function max_output_tokens( string $provider ): int {
+		$caps = self::provider_capabilities( $provider );
+		return max( 256, (int) ( $caps['max_output'] ?? 8192 ) );
 	}
 
 	/**

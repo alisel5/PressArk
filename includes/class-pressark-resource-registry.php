@@ -79,6 +79,10 @@ class PressArk_Resource_Registry {
 	public static function list( ?string $group = null ): array {
 		self::ensure_booted();
 
+		if ( 'tool-results' === $group ) {
+			return PressArk_Tool_Result_Artifacts::list_resource_entries( get_current_user_id() );
+		}
+
 		$result = array();
 		foreach ( self::$resources as $uri => $def ) {
 			// Skip resources whose plugin dependency is not met.
@@ -96,6 +100,14 @@ class PressArk_Resource_Registry {
 				'mime_type'   => $def['mime_type'],
 			);
 		}
+
+		if ( null === $group ) {
+			$result = array_merge(
+				$result,
+				PressArk_Tool_Result_Artifacts::list_resource_entries( get_current_user_id(), 8 )
+			);
+		}
+
 		return $result;
 	}
 
@@ -107,6 +119,10 @@ class PressArk_Resource_Registry {
 	 */
 	public static function read( string $uri ): array {
 		self::ensure_booted();
+
+		if ( PressArk_Tool_Result_Artifacts::is_tool_result_uri( $uri ) ) {
+			return PressArk_Tool_Result_Artifacts::read_resource( $uri, get_current_user_id() );
+		}
 
 		if ( ! isset( self::$resources[ $uri ] ) ) {
 			return array(
@@ -201,6 +217,9 @@ class PressArk_Resource_Registry {
 				$groups[ $def['group'] ] = true;
 			}
 		}
+		if ( PressArk_Tool_Result_Artifacts::has_resource_entries( get_current_user_id() ) ) {
+			$groups['tool-results'] = true;
+		}
 		return array_keys( $groups );
 	}
 
@@ -209,6 +228,9 @@ class PressArk_Resource_Registry {
 	 */
 	public static function exists( string $uri ): bool {
 		self::ensure_booted();
+		if ( PressArk_Tool_Result_Artifacts::is_tool_result_uri( $uri ) ) {
+			return (bool) ( PressArk_Tool_Result_Artifacts::read_resource( $uri, get_current_user_id() )['success'] ?? false );
+		}
 		return isset( self::$resources[ $uri ] ) && self::dependency_met( self::$resources[ $uri ] );
 	}
 

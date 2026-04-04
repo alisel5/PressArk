@@ -41,6 +41,10 @@ class PressArk_Checkpoint {
 	private array  $context_capsule    = array(); // durable compressed state for long-running continuations
 	private array  $loaded_tool_groups = array(); // [ 'seo', 'content', ... ]
 	private array  $bundle_ids         = array(); // [ 'rb_abc123', ... ] deterministic read-bundle hashes
+	private array  $replay_state       = array(); // durable replay transcript + sidecars
+
+	// v5.3.0: Run-scoped planning state — separates exploration from execution.
+	private array  $plan_state         = array(); // [ 'phase' => '', 'plan_text' => '', 'entered_at' => '', 'approved_at' => '' ]
 
 	// ── Factory / Serialization ─────────────────────────────────────
 
@@ -72,6 +76,13 @@ class PressArk_Checkpoint {
 		$cp->context_capsule    = self::sanitize_context_capsule( $data['context_capsule'] ?? array() );
 		$cp->loaded_tool_groups = array_map( 'sanitize_text_field', array_slice( $data['loaded_tool_groups'] ?? array(), 0, 15 ) );
 		$cp->bundle_ids         = array_map( 'sanitize_text_field', array_slice( $data['bundle_ids'] ?? array(), 0, 20 ) );
+		$cp->replay_state       = class_exists( 'PressArk_Replay_Integrity' )
+			? PressArk_Replay_Integrity::sanitize_state( $data['replay_state'] ?? array() )
+			: array();
+
+		// v5.3.0: Plan state.
+		$cp->plan_state         = self::sanitize_plan_state( $data['plan_state'] ?? array() );
+
 		return $cp;
 	}
 
@@ -97,6 +108,8 @@ class PressArk_Checkpoint {
 			'context_capsule'    => $this->context_capsule,
 			'loaded_tool_groups' => $this->loaded_tool_groups,
 			'bundle_ids'         => $this->bundle_ids,
+			'replay_state'       => $this->replay_state,
+			'plan_state'         => $this->plan_state,
 		);
 	}
 
@@ -277,6 +290,17 @@ class PressArk_Checkpoint {
 			}
 		}
 
+		// v5.3.0: Plan state.
+		if ( ! self::plan_state_is_empty( $this->plan_state ) ) {
+			$phase = $this->plan_state['phase'] ?? '';
+			$parts[] = 'PLAN PHASE: ' . $phase;
+			if ( 'executing' === $phase && ! empty( $this->plan_state['plan_text'] ) ) {
+				$parts[] = 'APPROVED PLAN: ' . mb_substr( $this->plan_state['plan_text'], 0, 300 );
+			} elseif ( 'exploring' === $phase ) {
+				$parts[] = 'MODE: Read-only exploration. Do not propose writes until a plan is formed and approved.';
+			}
+		}
+
 		if ( $this->loaded_tool_groups ) {
 			$parts[] = 'TOOLS: ' . implode( ', ', $this->loaded_tool_groups );
 		}
@@ -325,7 +349,9 @@ class PressArk_Checkpoint {
 			&& empty( $this->blockers )
 			&& empty( $this->context_capsule )
 			&& empty( $this->loaded_tool_groups )
-			&& empty( $this->bundle_ids );
+			&& empty( $this->bundle_ids )
+			&& empty( $this->replay_state )
+			&& self::plan_state_is_empty( $this->plan_state );
 	}
 
 	// ── Mutation Methods (called by agent after tool results) ────────
@@ -454,6 +480,25 @@ class PressArk_Checkpoint {
 	}
 
 	/**
+	 * Record a verification result in the execution ledger.
+	 *
+	 * @since 5.4.0
+	 *
+	 * @param string $tool_name       Write tool that was verified.
+	 * @param array  $readback_result Read-back result.
+	 * @param bool   $passed          Whether verification passed.
+	 * @param string $evidence        Compact evidence string.
+	 */
+	public function record_verification( string $tool_name, array $readback_result, bool $passed, string $evidence = '' ): void {
+		$this->execution = PressArk_Execution_Ledger::record_verification(
+			$this->execution, $tool_name, $readback_result, $passed, $evidence
+		);
+		if ( $passed ) {
+			$this->set_workflow_stage( 'verify' );
+		}
+	}
+
+	/**
 	 * Record all writes from a kept preview session.
 	 */
 	public function record_execution_preview( array $tool_calls, array $result ): void {
@@ -465,6 +510,18 @@ class PressArk_Checkpoint {
 	 */
 	public function get_execution(): array {
 		return $this->execution;
+	}
+
+	/**
+	 * Replace the execution ledger with a new version.
+	 *
+	 * Used by the task graph resolution logic to write back resolved
+	 * dependency states after advancing the graph.
+	 *
+	 * @since 5.3.0
+	 */
+	public function set_execution( array $execution ): void {
+		$this->execution = PressArk_Execution_Ledger::sanitize( $execution );
 	}
 
 	// ── v3.7.0: Extended State Mutators ──────────────────────────────
@@ -566,6 +623,165 @@ class PressArk_Checkpoint {
 
 	public function clear_context_capsule(): void {
 		$this->context_capsule = array();
+	}
+
+	public function set_replay_state( array $state ): void {
+		$this->replay_state = class_exists( 'PressArk_Replay_Integrity' )
+			? PressArk_Replay_Integrity::sanitize_state( $state )
+			: array();
+	}
+
+	public function get_replay_state(): array {
+		return $this->replay_state;
+	}
+
+	public function set_replay_messages( array $messages ): void {
+		$state             = $this->replay_state;
+		$state['messages'] = class_exists( 'PressArk_Replay_Integrity' )
+			? PressArk_Replay_Integrity::sanitize_messages( $messages )
+			: array();
+		$state['updated_at'] = gmdate( 'c' );
+		$this->set_replay_state( $state );
+	}
+
+	public function get_replay_messages(): array {
+		return (array) ( $this->replay_state['messages'] ?? array() );
+	}
+
+	public function merge_replay_replacements( array $entries ): void {
+		$state = $this->replay_state;
+		$state['replacement_journal'] = class_exists( 'PressArk_Replay_Integrity' )
+			? PressArk_Replay_Integrity::sanitize_replacement_journal(
+				array_merge(
+					(array) ( $state['replacement_journal'] ?? array() ),
+					$entries
+				)
+			)
+			: array();
+		$state['updated_at'] = gmdate( 'c' );
+		$this->set_replay_state( $state );
+	}
+
+	public function get_replay_replacements(): array {
+		return (array) ( $this->replay_state['replacement_journal'] ?? array() );
+	}
+
+	public function add_replay_event( array $event ): void {
+		if ( ! class_exists( 'PressArk_Replay_Integrity' ) ) {
+			return;
+		}
+
+		$event = PressArk_Replay_Integrity::sanitize_event( $event );
+		if ( empty( $event['type'] ) ) {
+			return;
+		}
+
+		$state = $this->replay_state;
+		$events = (array) ( $state['events'] ?? array() );
+		$events[] = $event;
+
+		$state['events']      = array_slice( $events, -16 );
+		$state['updated_at']  = gmdate( 'c' );
+		$this->set_replay_state( $state );
+	}
+
+	public function set_last_replay_resume( array $resume ): void {
+		if ( ! class_exists( 'PressArk_Replay_Integrity' ) ) {
+			return;
+		}
+
+		$resume = PressArk_Replay_Integrity::sanitize_event( $resume, 'resume' );
+		if ( empty( $resume['type'] ) ) {
+			return;
+		}
+
+		$state                = $this->replay_state;
+		$state['last_resume'] = $resume;
+		$state['updated_at']  = gmdate( 'c' );
+		$this->set_replay_state( $state );
+	}
+
+	public function get_replay_sidecar(): array {
+		if ( ! class_exists( 'PressArk_Replay_Integrity' ) ) {
+			return array();
+		}
+
+		return PressArk_Replay_Integrity::debug_sidecar( $this->replay_state );
+	}
+
+	// ── v5.3.0: Plan State ──────────────────────────────────────────
+
+	/**
+	 * Enter exploring/planning phase.
+	 *
+	 * @since 5.3.0
+	 * @param string $phase 'exploring' | 'planning' | 'executing'
+	 */
+	public function set_plan_phase( string $phase ): void {
+		$valid = array( 'exploring', 'planning', 'executing', '' );
+		$phase = sanitize_key( $phase );
+		if ( ! in_array( $phase, $valid, true ) ) {
+			return;
+		}
+
+		$this->plan_state['phase'] = $phase;
+
+		if ( 'exploring' === $phase && empty( $this->plan_state['entered_at'] ) ) {
+			$this->plan_state['entered_at'] = gmdate( 'c' );
+		}
+		if ( 'executing' === $phase && empty( $this->plan_state['approved_at'] ) ) {
+			$this->plan_state['approved_at'] = gmdate( 'c' );
+		}
+	}
+
+	/**
+	 * Store the plan text produced during the planning phase.
+	 *
+	 * @since 5.3.0
+	 */
+	public function set_plan_text( string $text ): void {
+		$this->plan_state['plan_text'] = sanitize_textarea_field( mb_substr( $text, 0, 4000 ) );
+	}
+
+	/**
+	 * @since 5.3.0
+	 */
+	public function get_plan_state(): array {
+		return $this->plan_state;
+	}
+
+	/**
+	 * @since 5.3.0
+	 */
+	public function get_plan_phase(): string {
+		return $this->plan_state['phase'] ?? '';
+	}
+
+	/**
+	 * Whether the agent is in a read-only exploration phase.
+	 *
+	 * @since 5.3.0
+	 */
+	public function is_exploring(): bool {
+		return 'exploring' === ( $this->plan_state['phase'] ?? '' );
+	}
+
+	/**
+	 * Whether the agent has an approved plan and is executing.
+	 *
+	 * @since 5.3.0
+	 */
+	public function is_plan_executing(): bool {
+		return 'executing' === ( $this->plan_state['phase'] ?? '' );
+	}
+
+	/**
+	 * Clear plan state (e.g., on settlement).
+	 *
+	 * @since 5.3.0
+	 */
+	public function clear_plan_state(): void {
+		$this->plan_state = array();
 	}
 
 	public function set_loaded_tool_groups( array $groups ): void {
@@ -846,20 +1062,49 @@ class PressArk_Checkpoint {
 		$merged->merge_approvals( $client->approvals );
 		// Blockers: union.
 		$merged->merge_blockers( $client->blockers );
-		// Context capsule: prefer the newer client capsule when present.
-		if ( ! empty( $client->context_capsule ) ) {
-			$merged->context_capsule = $client->context_capsule;
-		}
+		$merged->context_capsule = self::merge_context_capsule_state( $server->context_capsule, $client->context_capsule );
 		// Tool groups: server wins (reflects actual loaded state).
 		if ( empty( $server->loaded_tool_groups ) && ! empty( $client->loaded_tool_groups ) ) {
 			$merged->loaded_tool_groups = $client->loaded_tool_groups;
 		}
 		// Bundle IDs: union (both sides may have recorded reads).
 		$merged->merge_bundle_ids( $client->bundle_ids );
+		$merged->replay_state = class_exists( 'PressArk_Replay_Integrity' )
+			? PressArk_Replay_Integrity::merge_state( $server->replay_state, $client->replay_state )
+			: ( ! empty( $server->replay_state ) ? $server->replay_state : $client->replay_state );
+
+		// v5.3.0: Plan state — server wins (server-owned truth).
+		if ( self::plan_state_is_empty( $server->plan_state ) && ! self::plan_state_is_empty( $client->plan_state ) ) {
+			$merged->plan_state = $client->plan_state;
+		}
 
 		$merged->updated_at = gmdate( 'c' );
 
 		return $merged;
+	}
+
+	private static function merge_context_capsule_state( array $server, array $client ): array {
+		if ( empty( $server ) ) {
+			return $client;
+		}
+		if ( empty( $client ) ) {
+			return $server;
+		}
+
+		$server_ts = strtotime( (string) ( $server['updated_at'] ?? '' ) );
+		$client_ts = strtotime( (string) ( $client['updated_at'] ?? '' ) );
+
+		if ( $server_ts && $client_ts ) {
+			return $client_ts >= $server_ts ? $client : $server;
+		}
+		if ( $client_ts ) {
+			return $client;
+		}
+		if ( $server_ts ) {
+			return $server;
+		}
+
+		return count( $client ) >= count( $server ) ? $client : $server;
 	}
 
 	/**
@@ -975,6 +1220,40 @@ class PressArk_Checkpoint {
 		return in_array( $clean, $valid, true ) ? $clean : '';
 	}
 
+	/**
+	 * Sanitize plan state array.
+	 *
+	 * @since 5.3.0
+	 */
+	private static function sanitize_plan_state( $raw ): array {
+		if ( ! is_array( $raw ) || empty( $raw ) ) {
+			return array();
+		}
+
+		$phase = sanitize_key( $raw['phase'] ?? '' );
+		if ( ! in_array( $phase, array( 'exploring', 'planning', 'executing', '' ), true ) ) {
+			$phase = '';
+		}
+
+		if ( '' === $phase ) {
+			return array();
+		}
+
+		return array(
+			'phase'       => $phase,
+			'plan_text'   => sanitize_textarea_field( mb_substr( (string) ( $raw['plan_text'] ?? '' ), 0, 4000 ) ),
+			'entered_at'  => sanitize_text_field( $raw['entered_at'] ?? '' ),
+			'approved_at' => sanitize_text_field( $raw['approved_at'] ?? '' ),
+		);
+	}
+
+	/**
+	 * @since 5.3.0
+	 */
+	private static function plan_state_is_empty( array $state ): bool {
+		return empty( $state ) || empty( $state['phase'] );
+	}
+
 	private static function sanitize_approvals( array $raw ): array {
 		$clean = array();
 		foreach ( array_slice( $raw, 0, 10 ) as $item ) {
@@ -1036,6 +1315,7 @@ class PressArk_Checkpoint {
 				array_slice( (array) ( $raw['scope'] ?? array() ), 0, 6 )
 			) ) ),
 			'compression_model' => sanitize_text_field( (string) ( $raw['compression_model'] ?? '' ) ),
+			'compaction'        => self::sanitize_context_capsule_compaction( $raw['compaction'] ?? array() ),
 			'updated_at'          => sanitize_text_field( (string) ( $raw['updated_at'] ?? '' ) ),
 		);
 
@@ -1045,6 +1325,96 @@ class PressArk_Checkpoint {
 				return ! ( is_array( $value ) ? empty( $value ) : '' === (string) $value );
 			}
 		);
+	}
+
+	private static function sanitize_context_capsule_compaction( $raw ): array {
+		if ( ! is_array( $raw ) ) {
+			return array();
+		}
+
+		$clean = array(
+			'count'                  => max( 0, (int) ( $raw['count'] ?? 0 ) ),
+			'last_marker'            => sanitize_key( (string) ( $raw['last_marker'] ?? '' ) ),
+			'last_reason'            => sanitize_key( (string) ( $raw['last_reason'] ?? '' ) ),
+			'last_round'             => absint( $raw['last_round'] ?? 0 ),
+			'last_at'                => sanitize_text_field( (string) ( $raw['last_at'] ?? '' ) ),
+			'last_event'             => self::sanitize_compaction_event( $raw['last_event'] ?? array() ),
+			'pending_post_compaction' => self::sanitize_compaction_pending( $raw['pending_post_compaction'] ?? array() ),
+			'first_post_compaction'  => self::sanitize_compaction_observation( $raw['first_post_compaction'] ?? array() ),
+		);
+
+		return array_filter(
+			$clean,
+			static function ( $value, $key ) {
+				if ( 'count' === $key ) {
+					return $value > 0;
+				}
+				return ! ( is_array( $value ) ? empty( $value ) : '' === (string) $value );
+			},
+			ARRAY_FILTER_USE_BOTH
+		);
+	}
+
+	private static function sanitize_compaction_event( $raw ): array {
+		if ( ! is_array( $raw ) ) {
+			return array();
+		}
+
+		return array_filter( array(
+			'marker'                  => sanitize_key( (string) ( $raw['marker'] ?? '' ) ),
+			'reason'                  => sanitize_key( (string) ( $raw['reason'] ?? '' ) ),
+			'round'                   => absint( $raw['round'] ?? 0 ),
+			'before_messages'         => max( 0, (int) ( $raw['before_messages'] ?? 0 ) ),
+			'after_messages'          => max( 0, (int) ( $raw['after_messages'] ?? 0 ) ),
+			'dropped_messages'        => max( 0, (int) ( $raw['dropped_messages'] ?? 0 ) ),
+			'estimated_tokens_before' => max( 0, (int) ( $raw['estimated_tokens_before'] ?? 0 ) ),
+			'estimated_tokens_after'  => max( 0, (int) ( $raw['estimated_tokens_after'] ?? 0 ) ),
+			'remaining_tokens'        => max( 0, (int) ( $raw['remaining_tokens'] ?? 0 ) ),
+			'context_pressure'        => sanitize_key( (string) ( $raw['context_pressure'] ?? '' ) ),
+			'summary_mode'            => sanitize_key( (string) ( $raw['summary_mode'] ?? '' ) ),
+			'at'                      => sanitize_text_field( (string) ( $raw['at'] ?? '' ) ),
+		), static function ( $value ) {
+			return ! ( is_int( $value ) ? 0 === $value : '' === (string) $value );
+		} );
+	}
+
+	private static function sanitize_compaction_pending( $raw ): array {
+		if ( ! is_array( $raw ) ) {
+			return array();
+		}
+
+		return array_filter( array(
+			'marker' => sanitize_key( (string) ( $raw['marker'] ?? '' ) ),
+			'reason' => sanitize_key( (string) ( $raw['reason'] ?? '' ) ),
+			'round'  => absint( $raw['round'] ?? 0 ),
+			'at'     => sanitize_text_field( (string) ( $raw['at'] ?? '' ) ),
+		), static function ( $value ) {
+			return ! ( is_int( $value ) ? 0 === $value : '' === (string) $value );
+		} );
+	}
+
+	private static function sanitize_compaction_observation( $raw ): array {
+		if ( ! is_array( $raw ) ) {
+			return array();
+		}
+
+		return array_filter( array(
+			'marker'           => sanitize_key( (string) ( $raw['marker'] ?? '' ) ),
+			'reason'           => sanitize_key( (string) ( $raw['reason'] ?? '' ) ),
+			'observed_round'   => absint( $raw['observed_round'] ?? 0 ),
+			'stop_reason'      => sanitize_key( (string) ( $raw['stop_reason'] ?? '' ) ),
+			'tool_calls'       => max( 0, (int) ( $raw['tool_calls'] ?? 0 ) ),
+			'had_text'         => ! empty( $raw['had_text'] ),
+			'healthy'          => ! empty( $raw['healthy'] ),
+			'remaining_tokens' => max( 0, (int) ( $raw['remaining_tokens'] ?? 0 ) ),
+			'context_pressure' => sanitize_key( (string) ( $raw['context_pressure'] ?? '' ) ),
+			'at'               => sanitize_text_field( (string) ( $raw['at'] ?? '' ) ),
+		), static function ( $value ) {
+			if ( is_bool( $value ) ) {
+				return true;
+			}
+			return ! ( is_int( $value ) ? 0 === $value : '' === (string) $value );
+		} );
 	}
 
 	private static function sanitize_bundle_args( array $args ): array {

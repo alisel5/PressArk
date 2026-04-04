@@ -583,7 +583,11 @@ class PressArk_Handler_Discovery extends PressArk_Handler_Base {
 	 * @since 5.1.0
 	 */
 	public function read_resource( array $params ): array {
-		$uri = sanitize_text_field( $params['uri'] ?? '' );
+		$uri  = sanitize_text_field( $params['uri'] ?? '' );
+		$mode = sanitize_key( (string) ( $params['mode'] ?? 'summary' ) );
+		if ( ! in_array( $mode, array( 'summary', 'detail', 'raw' ), true ) ) {
+			$mode = 'summary';
+		}
 
 		if ( '' === $uri ) {
 			return $this->error( __( 'Missing "uri" parameter. Use list_resources first to see available resource URIs.', 'pressark' ) );
@@ -597,18 +601,155 @@ class PressArk_Handler_Discovery extends PressArk_Handler_Base {
 
 		$data   = $result['data'];
 		$cached = $result['cached'] ?? false;
+		$meta   = $this->find_resource_meta( $uri );
 
-		// Format for AI consumption.
-		$message = wp_json_encode( $data, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES );
+		if ( 'raw' === $mode ) {
+			$message = is_string( $data )
+				? $data
+				: wp_json_encode( $data, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE );
+			if ( ! is_string( $message ) ) {
+				$message = '';
+			}
+		} elseif ( 'detail' === $mode ) {
+			$message = wp_json_encode( $data, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES );
+			if ( ! is_string( $message ) ) {
+				$message = '';
+			}
+		} else {
+			$summary = $this->summarize_resource_payload( $data );
+			$lines   = array();
+			$label   = $meta['name'] ?? $uri;
+			$lines[] = sprintf( 'Resource: %s', $label );
+			$lines[] = sprintf( 'URI: %s', $uri );
+			if ( ! empty( $meta['group'] ) ) {
+				$lines[] = sprintf( 'Group: %s', $meta['group'] );
+			}
+			if ( ! empty( $meta['description'] ) ) {
+				$lines[] = sprintf( 'Description: %s', $meta['description'] );
+			}
+			$lines[] = sprintf( 'Shape: %s', $summary['shape'] );
+			if ( isset( $summary['count'] ) ) {
+				$lines[] = sprintf( 'Count: %d', $summary['count'] );
+			}
+			if ( ! empty( $summary['keys'] ) ) {
+				$lines[] = 'Top-level keys: ' . implode( ', ', $summary['keys'] );
+			}
+			if ( array_key_exists( 'preview', $summary ) ) {
+				$preview = $summary['preview'];
+				if ( is_array( $preview ) || is_object( $preview ) ) {
+					$preview = wp_json_encode( $preview, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE );
+				}
+				$lines[] = 'Preview: ' . $preview;
+			}
+			$message = implode( "\n", $lines );
+			$data    = array_merge( $summary, array(
+				'uri'   => $uri,
+				'name'  => $meta['name'] ?? '',
+				'group' => $meta['group'] ?? '',
+				'mode'  => 'summary',
+			) );
+		}
+
 		if ( $cached ) {
-			$message .= "\n(cached)";
+			$message .= ( '' !== $message ? "\n" : '' ) . '(cached)';
 		}
 
 		return array(
 			'success' => true,
 			'message' => $message,
 			'data'    => $data,
+			'mode'    => $mode,
+			'uri'     => $uri,
+			'cached'  => $cached,
 		);
+	}
+
+	/**
+	 * Look up resource metadata for a URI.
+	 *
+	 * @param string $uri Resource URI.
+	 * @return array
+	 */
+	private function find_resource_meta( string $uri ): array {
+		foreach ( PressArk_Resource_Registry::list() as $resource ) {
+			if ( $uri === (string) ( $resource['uri'] ?? '' ) ) {
+				return $resource;
+			}
+		}
+
+		return array();
+	}
+
+	/**
+	 * Build a compact structural summary for a resource payload.
+	 *
+	 * @param mixed $data Resource payload.
+	 * @return array
+	 */
+	private function summarize_resource_payload( $data ): array {
+		if ( is_array( $data ) ) {
+			$is_list = empty( $data ) || array_keys( $data ) === range( 0, count( $data ) - 1 );
+			if ( $is_list ) {
+				return array(
+					'shape'   => 'list',
+					'count'   => count( $data ),
+					'preview' => array_map(
+						array( $this, 'summarize_resource_value' ),
+						array_slice( $data, 0, 3 )
+					),
+				);
+			}
+
+			return array(
+				'shape'   => 'object',
+				'count'   => count( $data ),
+				'keys'    => array_slice( array_keys( $data ), 0, 10 ),
+				'preview' => array_map(
+					array( $this, 'summarize_resource_value' ),
+					array_slice( $data, 0, 5, true )
+				),
+			);
+		}
+
+		if ( is_object( $data ) ) {
+			return $this->summarize_resource_payload( get_object_vars( $data ) );
+		}
+
+		return array(
+			'shape'   => gettype( $data ),
+			'preview' => $this->summarize_resource_value( $data ),
+		);
+	}
+
+	/**
+	 * Shrink a resource field value into a safe preview.
+	 *
+	 * @param mixed $value Resource field value.
+	 * @return mixed
+	 */
+	private function summarize_resource_value( $value ) {
+		if ( is_array( $value ) ) {
+			$is_list = empty( $value ) || array_keys( $value ) === range( 0, count( $value ) - 1 );
+			return array(
+				'shape' => $is_list ? 'list' : 'object',
+				'count' => count( $value ),
+				'keys'  => $is_list ? array() : array_slice( array_keys( $value ), 0, 5 ),
+			);
+		}
+
+		if ( is_object( $value ) ) {
+			return $this->summarize_resource_value( get_object_vars( $value ) );
+		}
+
+		if ( is_string( $value ) ) {
+			$clean = preg_replace( '/\s+/', ' ', trim( $value ) );
+			if ( ! is_string( $clean ) ) {
+				$clean = '';
+			}
+			return mb_strlen( $clean ) > 160 ? mb_substr( $clean, 0, 160 ) . '…' : $clean;
+		}
+
+		return $value;
 	}
 
 	/**

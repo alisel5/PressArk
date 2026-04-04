@@ -66,9 +66,18 @@ class PressArk_Handler_Content extends PressArk_Handler_Base {
 		}
 
 		// v2.4.0: mode-aware content reading.
-		$mode = sanitize_text_field( $params['mode'] ?? 'light' );
+		// v5.4.0: expose summary/detail/raw aliases without breaking the
+		// existing light/structured/full contract.
+		$requested_mode = sanitize_text_field( $params['mode'] ?? 'light' );
+		$mode_aliases   = array(
+			'summary' => 'light',
+			'detail'  => 'structured',
+			'raw'     => 'full',
+		);
+		$mode          = $mode_aliases[ $requested_mode ] ?? $requested_mode;
 		if ( ! in_array( $mode, array( 'light', 'structured', 'full' ), true ) ) {
-			$mode = 'light';
+			$requested_mode = 'light';
+			$mode           = 'light';
 		}
 
 		$section    = sanitize_text_field( $params['section'] ?? '' );
@@ -79,6 +88,11 @@ class PressArk_Handler_Content extends PressArk_Handler_Base {
 			'structured' => $this->read_content_structured( $post ),
 			'full'       => $this->read_content_full( $post ),
 		};
+
+		if ( ! empty( $result['success'] ) && isset( $result['data'] ) && is_array( $result['data'] ) && $requested_mode !== $mode ) {
+			$result['data']['mode']           = $requested_mode;
+			$result['data']['_resolved_mode'] = $mode;
+		}
 
 		// Section trimming for full mode — reduces token usage on long content.
 		if ( $result['success'] && 'full' === $mode && $section && isset( $result['data']['content'] ) ) {
@@ -457,8 +471,8 @@ class PressArk_Handler_Content extends PressArk_Handler_Base {
 			return array( 'success' => false, 'message' => __( 'Invalid post ID.', 'pressark' ) );
 		}
 
-		// Route WC products through edit_product for proper hook firing.
-		// wp_update_post on products misses woocommerce_update_product hooks.
+		// Defense-in-depth: WC product rerouting.
+		// Primary guard is now PressArk_Preflight::rule_wc_product_content_edit (v5.5.0).
 		if ( get_post_type( $post_id ) === 'product' ) {
 			return $this->edit_product( $params );
 		}
@@ -466,7 +480,8 @@ class PressArk_Handler_Content extends PressArk_Handler_Base {
 			return $this->edit_variation( $params );
 		}
 
-		// Route Elementor pages through Elementor tools for correct rendering.
+		// Defense-in-depth: Elementor content guard.
+		// Primary guard is now PressArk_Preflight::rule_elementor_content_edit (v5.5.0).
 		$changes = $params['changes'] ?? $params;
 		if ( ! empty( get_post_meta( $post_id, '_elementor_data', true ) ) && isset( $changes['content'] ) ) {
 			return array(
@@ -624,7 +639,8 @@ class PressArk_Handler_Content extends PressArk_Handler_Base {
 			return array( 'success' => false, 'message' => __( 'Post not found.', 'pressark' ) );
 		}
 
-		// ── WC Product Guard ─────────────────────────────────────────────
+		// ── WC Product Guard (defense-in-depth) ─────────────────────────
+		// Primary guard is now PressArk_Preflight::rule_wc_guarded_meta (v5.5.0).
 		// Writing these keys via raw update_post_meta() on products bypasses
 		// WC's lookup table, transient busting, stock hooks, and price sync.
 		// Route through edit_product instead.

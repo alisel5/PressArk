@@ -58,22 +58,32 @@ class PressArk_History_Manager {
 	 * @param array                    $conversation Full conversation array from frontend.
 	 * @param bool                     $deep_mode    Whether deep mode is active.
 	 * @param PressArk_Checkpoint|null $checkpoint   Optional checkpoint from frontend round-trip.
+	 * @param array                    $options      Optional overrides: token_budget, max_messages.
 	 * @return array Compressed conversation suitable for the API.
 	 */
-	public static function prepare( array $conversation, bool $deep_mode = false, ?PressArk_Checkpoint $checkpoint = null ): array {
+	public static function prepare( array $conversation, bool $deep_mode = false, ?PressArk_Checkpoint $checkpoint = null, array $options = array() ): array {
 		if ( empty( $conversation ) ) {
 			return array();
 		}
 
+		$token_budget = max(
+			800,
+			(int) ( $options['token_budget'] ?? ( $deep_mode ? self::DEEP_TOKEN_BUDGET : self::NORMAL_TOKEN_BUDGET ) )
+		);
+		$max_messages = max(
+			4,
+			(int) ( $options['max_messages'] ?? ( $deep_mode ? self::DEEP_MAX_MESSAGES : self::NORMAL_MAX_MESSAGES ) )
+		);
+
 		// Strategy B: use provided checkpoint.
 		if ( $checkpoint && ! $checkpoint->is_empty() ) {
-			return self::prepare_with_checkpoint( $conversation, $checkpoint, $deep_mode );
+			return self::prepare_with_checkpoint( $conversation, $checkpoint, $deep_mode, array(
+				'token_budget' => $token_budget,
+				'max_messages' => $max_messages,
+			) );
 		}
 
 		// Strategy A: token-budgeted backward scan when no durable checkpoint exists.
-		$max_messages  = $deep_mode ? self::DEEP_MAX_MESSAGES : self::NORMAL_MAX_MESSAGES;
-		$token_budget  = $deep_mode ? self::DEEP_TOKEN_BUDGET : self::NORMAL_TOKEN_BUDGET;
-
 		// Take the most recent messages first.
 		$candidates = array_slice( $conversation, -$max_messages );
 
@@ -196,12 +206,21 @@ class PressArk_History_Manager {
 	 * @param array               $conversation Full conversation array.
 	 * @param PressArk_Checkpoint $checkpoint   Non-empty checkpoint.
 	 * @param bool                $deep_mode    Whether deep mode is active.
+	 * @param array               $options      Optional overrides: token_budget, max_messages.
 	 * @return array Compressed conversation.
 	 */
-	private static function prepare_with_checkpoint( array $conversation, PressArk_Checkpoint $checkpoint, bool $deep_mode ): array {
-		$keep_count = self::checkpoint_supports_tiny_tail( $checkpoint )
+	private static function prepare_with_checkpoint( array $conversation, PressArk_Checkpoint $checkpoint, bool $deep_mode, array $options = array() ): array {
+		$default_keep = self::checkpoint_supports_tiny_tail( $checkpoint )
 			? ( $deep_mode ? self::DEEP_TAIL : self::NORMAL_TAIL )
 			: ( $deep_mode ? self::SPARSE_DEEP_TAIL : self::SPARSE_NORMAL_TAIL );
+		$keep_count   = min(
+			$default_keep,
+			max( 2, (int) ( $options['max_messages'] ?? $default_keep ) )
+		);
+		$budget       = max(
+			800,
+			(int) ( $options['token_budget'] ?? ( $deep_mode ? self::DEEP_TOKEN_BUDGET : self::NORMAL_TOKEN_BUDGET ) )
+		);
 
 		// Filter to valid roles.
 		$valid = array();
@@ -224,7 +243,6 @@ class PressArk_History_Manager {
 		$header = $checkpoint->to_context_header();
 		if ( $header ) {
 			$header_tokens  = self::estimate_tokens( $header );
-			$budget         = $deep_mode ? self::DEEP_TOKEN_BUDGET : self::NORMAL_TOKEN_BUDGET;
 			$max_header     = (int) ( $budget * 0.25 );
 
 			if ( $header_tokens > $max_header ) {

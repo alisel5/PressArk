@@ -423,6 +423,7 @@ class PressArk_Task_Queue {
 			$async_post_id = (int) ( $resolved['post_id'] ?? 0 );
 			$async_chat_id = (int) ( $resolved['chat_id'] ?? 0 );
 			$async_user_id = (int) $task['user_id'];
+			$agent->set_run_context( $run_id, $async_chat_id );
 
 			// v3.3.0: Reload fresh conversation + checkpoint from server
 			// at execution time. The enqueued snapshot may be stale if the

@@ -663,12 +663,12 @@ class PressArk_Tools {
 	private static function read_content(): array {
 		return array(
 			'name'        => 'read_content',
-			'description' => 'Read post/page by ID, URL, or slug. Modes: light (default), structured, full. Use section param to read only the beginning or end of long content in full mode.',
+			'description' => 'Read post/page by ID, URL, or slug. Modes: summary/light (default), detail/structured, raw/full. Use section to trim raw reads.',
 			'params'      => array(
 				array( 'name' => 'post_id', 'required' => false ),
 				array( 'name' => 'url', 'required' => false ),
 				array( 'name' => 'slug', 'required' => false ),
-				array( 'name' => 'mode', 'required' => false, 'desc' => 'light|structured|full (default: light)' ),
+				array( 'name' => 'mode', 'required' => false, 'desc' => 'summary|detail|raw or light|structured|full (default: summary/light)' ),
 				array( 'name' => 'section', 'required' => false, 'desc' => 'head|tail|first_n_paragraphs — trim full-mode content to reduce size' ),
 				array( 'name' => 'paragraphs', 'required' => false, 'desc' => 'Number of paragraphs for first_n_paragraphs section (default: 5)' ),
 			),
@@ -1767,9 +1767,10 @@ class PressArk_Tools {
 	private static function elementor_get_widget_schema(): array {
 		return array(
 			'name'        => 'elementor_get_widget_schema',
-			'description' => 'Discover fields for any Elementor widget type including third-party. Omit type for summary.',
+			'description' => 'Discover fields for any Elementor widget type including third-party. Omit type for summary; use mode=detail for the full schema of one widget.',
 			'params'      => array(
 				array( 'name' => 'widget_type', 'required' => false, 'desc' => 'Omit for all widgets summary' ),
+				array( 'name' => 'mode', 'required' => false, 'desc' => 'summary|detail (default: summary without widget_type, detail with widget_type)' ),
 			),
 		);
 	}
@@ -1981,9 +1982,10 @@ class PressArk_Tools {
 	private static function read_resource(): array {
 		return array(
 			'name'        => 'read_resource',
-			'description' => 'Read a site resource by URI. Returns cached data (design system, templates, post type schema, REST routes, etc.). Use list_resources first to see available URIs.',
+			'description' => 'Read a site resource by URI. Default is summary mode; use detail for structured JSON or raw for the unformatted payload. Use list_resources first to see available URIs.',
 			'params'      => array(
 				array( 'name' => 'uri', 'required' => true, 'desc' => 'Resource URI from list_resources (e.g., pressark://design/theme-json, pressark://schema/post-types)' ),
+				array( 'name' => 'mode', 'required' => false, 'desc' => 'summary|detail|raw (default: summary)' ),
 			),
 		);
 	}
@@ -2449,9 +2451,10 @@ class PressArk_Tools {
 	private static function get_custom_fields(): array {
 		return array(
 			'name'        => 'get_custom_fields',
-			'description' => 'Hint: Call to discover field names/types before updating -- never guess ACF keys. Get custom fields for a post.',
+			'description' => 'Hint: Call to discover field names/types before updating -- never guess ACF keys. Summary mode is default; use detail to include current values.',
 			'params'      => array(
 				array( 'name' => 'post_id', 'required' => true ),
+				array( 'name' => 'mode', 'required' => false, 'desc' => 'summary|detail (default: summary)' ),
 			),
 		);
 	}
@@ -2483,10 +2486,11 @@ class PressArk_Tools {
 	private static function get_templates(): array {
 		return array(
 			'name'        => 'get_templates',
-			'description' => 'Read FSE block templates and parts. Block themes only.',
+			'description' => 'Read FSE block templates and parts. Lists summaries by default; use slug with mode=detail or mode=raw for one template.',
 			'params'      => array(
 				array( 'name' => 'type', 'required' => false, 'desc' => 'wp_template|wp_template_part (default: wp_template)' ),
 				array( 'name' => 'slug', 'required' => false, 'desc' => 'Omit to list all' ),
+				array( 'name' => 'mode', 'required' => false, 'desc' => 'summary|detail|raw (default: summary for lists, detail with slug)' ),
 			),
 		);
 	}

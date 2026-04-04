@@ -1007,6 +1007,10 @@ class PressArk_Handler_Media extends PressArk_Handler_Base {
 	public function get_custom_fields( array $args ): array {
 		$post_id = (int) ( $args['post_id'] ?? 0 );
 		$post    = get_post( $post_id );
+		$mode    = sanitize_key( (string) ( $args['mode'] ?? 'summary' ) );
+		if ( ! in_array( $mode, array( 'summary', 'detail' ), true ) ) {
+			$mode = 'summary';
+		}
 
 		if ( ! $post ) {
 			return array( 'error' => __( 'Post not found.', 'pressark' ) );
@@ -1063,13 +1067,13 @@ class PressArk_Handler_Media extends PressArk_Handler_Base {
 					);
 				}
 
-				return array(
+				return $this->format_custom_fields_payload( array(
 					'post_id'   => $post_id,
 					'source'    => 'acf',
 					'count'     => count( $fields ),
 					'fields'    => $fields,
 					'edit_hint' => __( 'Use update_custom_field with the key name to update any field.', 'pressark' ),
-				);
+				), $mode );
 			}
 		}
 
@@ -1133,13 +1137,55 @@ class PressArk_Handler_Media extends PressArk_Handler_Base {
 			);
 		}
 
-		return array(
+		return $this->format_custom_fields_payload( array(
 			'post_id'   => $post_id,
 			'source'    => 'raw_postmeta',
 			'count'     => count( $public_meta ),
 			'fields'    => $public_meta,
 			'edit_hint' => __( 'Use update_custom_field with the key name to update any field.', 'pressark' ),
 			'note'      => __( 'ACF not detected. Showing public post meta and registered meta fields.', 'pressark' ),
+		), $mode );
+	}
+
+	/**
+	 * Convert the full custom-field payload into summary/detail output modes.
+	 *
+	 * @param array  $payload Full payload.
+	 * @param string $mode    summary|detail
+	 * @return array
+	 */
+	private function format_custom_fields_payload( array $payload, string $mode ): array {
+		if ( 'detail' === $mode ) {
+			$payload['mode'] = 'detail';
+			return $payload;
+		}
+
+		$fields = array_map(
+			static function ( array $field ): array {
+				return array_filter( array(
+					'key'        => $field['key'] ?? '',
+					'label'      => $field['label'] ?? '',
+					'type'       => $field['type'] ?? '',
+					'source'     => $field['source'] ?? '',
+					'required'   => $field['required'] ?? null,
+					'registered' => $field['registered'] ?? null,
+					'empty'      => $field['empty'] ?? null,
+				), static function ( $value ) {
+					return null !== $value && '' !== $value;
+				} );
+			},
+			(array) ( $payload['fields'] ?? array() )
+		);
+
+		return array(
+			'post_id'      => $payload['post_id'] ?? 0,
+			'source'       => $payload['source'] ?? '',
+			'count'        => $payload['count'] ?? count( $fields ),
+			'fields'       => $fields,
+			'edit_hint'    => $payload['edit_hint'] ?? '',
+			'note'         => $payload['note'] ?? '',
+			'detail_hint'  => __( 'Use mode=detail to include current values and field instructions.', 'pressark' ),
+			'mode'         => 'summary',
 		);
 	}
 

@@ -1018,6 +1018,70 @@ class PressArk_Operation_Registry {
 				'interrupt'     => 'block',
 				'tags'          => array( 'destructive', 'security', 'system' ),
 				'idempotent'    => false,
+				'verification'  => array(
+					'strategy'     => 'read_back',
+					'read_tool'    => 'scan_security',
+					'read_args'    => array(),
+					'check_fields' => array(),
+					'intensity'    => 'thorough',
+					'nudge'        => true,
+				),
+			),
+
+			'fix_seo' => array(
+				'search_hint'   => 'fix seo meta title description schema',
+				'interrupt'     => 'block',
+				'tags'          => array( 'seo', 'write' ),
+				'verification'  => array(
+					'strategy'     => 'field_check',
+					'read_tool'    => 'read_content',
+					'read_args'    => array( 'mode' => 'structured' ),
+					'check_fields' => array( 'seo_title', 'seo_description' ),
+					'intensity'    => 'standard',
+					'nudge'        => false,
+				),
+			),
+
+			'update_meta' => array(
+				'search_hint'   => 'update post meta seo fields custom',
+				'interrupt'     => 'block',
+				'tags'          => array( 'content', 'meta', 'write' ),
+				'verification'  => array(
+					'strategy'     => 'field_check',
+					'read_tool'    => 'read_content',
+					'read_args'    => array( 'mode' => 'structured' ),
+					'check_fields' => array(),
+					'intensity'    => 'standard',
+					'nudge'        => false,
+				),
+			),
+
+			'edit_template' => array(
+				'search_hint'   => 'edit FSE block template part',
+				'interrupt'     => 'block',
+				'tags'          => array( 'templates', 'design', 'write' ),
+				'verification'  => array(
+					'strategy'     => 'read_back',
+					'read_tool'    => 'get_templates',
+					'read_args'    => array(),
+					'check_fields' => array(),
+					'intensity'    => 'thorough',
+					'nudge'        => true,
+				),
+			),
+
+			'update_theme_setting' => array(
+				'search_hint'   => 'update theme customizer setting',
+				'interrupt'     => 'block',
+				'tags'          => array( 'themes', 'design', 'system' ),
+				'verification'  => array(
+					'strategy'     => 'field_check',
+					'read_tool'    => 'get_theme_settings',
+					'read_args'    => array(),
+					'check_fields' => array(),
+					'intensity'    => 'thorough',
+					'nudge'        => true,
+				),
 			),
 
 			'cleanup_database' => array(
@@ -1045,6 +1109,14 @@ class PressArk_Operation_Registry {
 				'policy_hooks'  => array(
 					'pre_approve' => 'pressark_confirm_refund',
 				),
+				'verification'  => array(
+					'strategy'     => 'read_back',
+					'read_tool'    => 'get_order',
+					'read_args'    => array(),
+					'check_fields' => array( 'status', 'total', 'refunds' ),
+					'intensity'    => 'thorough',
+					'nudge'        => true,
+				),
 			),
 
 			'email_customer' => array(
@@ -1052,6 +1124,14 @@ class PressArk_Operation_Registry {
 				'interrupt'     => 'cancel',
 				'tags'          => array( 'woocommerce', 'communication', 'irreversible' ),
 				'idempotent'    => false,
+				'verification'  => array(
+					'strategy'     => 'none',
+					'read_tool'    => '',
+					'read_args'    => array(),
+					'check_fields' => array(),
+					'intensity'    => 'light',
+					'nudge'        => true,
+				),
 			),
 
 			'trigger_wc_email' => array(
@@ -1059,6 +1139,14 @@ class PressArk_Operation_Registry {
 				'interrupt'     => 'cancel',
 				'tags'          => array( 'woocommerce', 'communication' ),
 				'idempotent'    => false,
+				'verification'  => array(
+					'strategy'     => 'none',
+					'read_tool'    => '',
+					'read_args'    => array(),
+					'check_fields' => array(),
+					'intensity'    => 'light',
+					'nudge'        => true,
+				),
 			),
 
 			'bulk_edit_products' => array(
@@ -1068,6 +1156,58 @@ class PressArk_Operation_Registry {
 				'output_policy' => 'compact',
 				'tags'          => array( 'woocommerce', 'bulk', 'products' ),
 				'idempotent'    => false,
+				'verification'  => array(
+					'strategy'     => 'read_back',
+					'read_tool'    => 'get_product',
+					'read_args'    => array(),
+					'check_fields' => array(),
+					'intensity'    => 'thorough',
+					'nudge'        => true,
+				),
+			),
+
+			'edit_product' => array(
+				'search_hint'   => 'edit update product price stock description',
+				'interrupt'     => 'block',
+				'tags'          => array( 'woocommerce', 'products', 'write' ),
+				'verification'  => array(
+					'strategy'     => 'read_back',
+					'read_tool'    => 'get_product',
+					'read_args'    => array(),
+					'check_fields' => array( 'name', 'regular_price', 'stock_quantity', 'status' ),
+					'intensity'    => 'thorough',
+					'nudge'        => true,
+				),
+			),
+
+			'create_product' => array(
+				'search_hint'   => 'create new product simple variable',
+				'interrupt'     => 'block',
+				'tags'          => array( 'woocommerce', 'products', 'write' ),
+				'idempotent'    => false,
+				'verification'  => array(
+					'strategy'     => 'existence_check',
+					'read_tool'    => 'get_product',
+					'read_args'    => array(),
+					'check_fields' => array( 'name', 'status', 'type' ),
+					'intensity'    => 'thorough',
+					'nudge'        => true,
+				),
+			),
+
+			'create_order' => array(
+				'search_hint'   => 'create manual order billing shipping',
+				'interrupt'     => 'cancel',
+				'tags'          => array( 'woocommerce', 'orders', 'financial' ),
+				'idempotent'    => false,
+				'verification'  => array(
+					'strategy'     => 'existence_check',
+					'read_tool'    => 'get_order',
+					'read_args'    => array(),
+					'check_fields' => array( 'status', 'total' ),
+					'intensity'    => 'thorough',
+					'nudge'        => true,
+				),
 			),
 
 			// ── Content writes (preview flow) ───────────────────────
@@ -1076,6 +1216,14 @@ class PressArk_Operation_Registry {
 				'search_hint'   => 'edit update post page title content excerpt',
 				'interrupt'     => 'block',
 				'tags'          => array( 'content', 'write' ),
+				'verification'  => array(
+					'strategy'     => 'read_back',
+					'read_tool'    => 'read_content',
+					'read_args'    => array( 'mode' => 'structured' ),
+					'check_fields' => array( 'title', 'status' ),
+					'intensity'    => 'standard',
+					'nudge'        => false,
+				),
 			),
 
 			'create_post' => array(
@@ -1083,6 +1231,14 @@ class PressArk_Operation_Registry {
 				'interrupt'     => 'block',
 				'tags'          => array( 'content', 'write' ),
 				'idempotent'    => false,
+				'verification'  => array(
+					'strategy'     => 'existence_check',
+					'read_tool'    => 'read_content',
+					'read_args'    => array( 'mode' => 'structured' ),
+					'check_fields' => array( 'title', 'status' ),
+					'intensity'    => 'standard',
+					'nudge'        => false,
+				),
 			),
 
 			'bulk_edit' => array(
@@ -1099,6 +1255,14 @@ class PressArk_Operation_Registry {
 				'search_hint'   => 'update site settings name url timezone',
 				'interrupt'     => 'block',
 				'tags'          => array( 'settings', 'system' ),
+				'verification'  => array(
+					'strategy'     => 'field_check',
+					'read_tool'    => 'get_site_settings',
+					'read_args'    => array(),
+					'check_fields' => array(),
+					'intensity'    => 'thorough',
+					'nudge'        => true,
+				),
 			),
 
 			'switch_theme' => array(
@@ -1106,6 +1270,14 @@ class PressArk_Operation_Registry {
 				'interrupt'     => 'cancel',
 				'tags'          => array( 'themes', 'system', 'dangerous' ),
 				'idempotent'    => true,
+				'verification'  => array(
+					'strategy'     => 'field_check',
+					'read_tool'    => 'list_themes',
+					'read_args'    => array(),
+					'check_fields' => array( 'active' ),
+					'intensity'    => 'thorough',
+					'nudge'        => true,
+				),
 			),
 
 			'toggle_plugin' => array(
@@ -1113,6 +1285,14 @@ class PressArk_Operation_Registry {
 				'interrupt'     => 'cancel',
 				'tags'          => array( 'plugins', 'system' ),
 				'idempotent'    => true,
+				'verification'  => array(
+					'strategy'     => 'field_check',
+					'read_tool'    => 'list_plugins',
+					'read_args'    => array(),
+					'check_fields' => array( 'status' ),
+					'intensity'    => 'standard',
+					'nudge'        => true,
+				),
 			),
 
 			'manage_scheduled_task' => array(
@@ -1265,6 +1445,42 @@ class PressArk_Operation_Registry {
 				'search_hint'   => 'elementor edit widget text heading image button',
 				'interrupt'     => 'block',
 				'tags'          => array( 'elementor', 'write' ),
+				'verification'  => array(
+					'strategy'     => 'read_back',
+					'read_tool'    => 'elementor_read_page',
+					'read_args'    => array(),
+					'check_fields' => array(),
+					'intensity'    => 'thorough',
+					'nudge'        => true,
+				),
+			),
+
+			'elementor_add_widget' => array(
+				'search_hint'   => 'elementor add new widget section',
+				'interrupt'     => 'block',
+				'tags'          => array( 'elementor', 'write' ),
+				'verification'  => array(
+					'strategy'     => 'read_back',
+					'read_tool'    => 'elementor_read_page',
+					'read_args'    => array(),
+					'check_fields' => array(),
+					'intensity'    => 'standard',
+					'nudge'        => true,
+				),
+			),
+
+			'elementor_add_container' => array(
+				'search_hint'   => 'elementor add container section',
+				'interrupt'     => 'block',
+				'tags'          => array( 'elementor', 'write' ),
+				'verification'  => array(
+					'strategy'     => 'read_back',
+					'read_tool'    => 'elementor_read_page',
+					'read_args'    => array(),
+					'check_fields' => array(),
+					'intensity'    => 'standard',
+					'nudge'        => true,
+				),
 			),
 
 			'elementor_create_page' => array(
@@ -1272,6 +1488,14 @@ class PressArk_Operation_Registry {
 				'interrupt'     => 'block',
 				'tags'          => array( 'elementor', 'write' ),
 				'idempotent'    => false,
+				'verification'  => array(
+					'strategy'     => 'existence_check',
+					'read_tool'    => 'read_content',
+					'read_args'    => array( 'mode' => 'structured' ),
+					'check_fields' => array( 'title', 'status' ),
+					'intensity'    => 'thorough',
+					'nudge'        => true,
+				),
 			),
 
 			'elementor_find_replace' => array(
@@ -1280,6 +1504,28 @@ class PressArk_Operation_Registry {
 				'resumable'     => true,
 				'tags'          => array( 'elementor', 'bulk', 'dangerous' ),
 				'idempotent'    => false,
+				'verification'  => array(
+					'strategy'     => 'read_back',
+					'read_tool'    => 'elementor_read_page',
+					'read_args'    => array(),
+					'check_fields' => array(),
+					'intensity'    => 'thorough',
+					'nudge'        => true,
+				),
+			),
+
+			'elementor_global_styles' => array(
+				'search_hint'   => 'elementor global design system colors typography',
+				'interrupt'     => 'block',
+				'tags'          => array( 'elementor', 'design', 'system' ),
+				'verification'  => array(
+					'strategy'     => 'read_back',
+					'read_tool'    => 'elementor_get_styles',
+					'read_args'    => array(),
+					'check_fields' => array(),
+					'intensity'    => 'thorough',
+					'nudge'        => true,
+				),
 			),
 		);
 

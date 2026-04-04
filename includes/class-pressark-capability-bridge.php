@@ -52,9 +52,10 @@ class PressArk_Capability_Bridge {
 	 * available for reading via list_resources / read_resource.
 	 *
 	 * @param string[] $loaded_groups Currently loaded tool groups (for context).
+	 * @param string   $detail        full|compact|minimal
 	 * @return string Formatted text block, or empty string if bridge not ready.
 	 */
-	public static function get_context_resources( array $loaded_groups = array() ): string {
+	public static function get_context_resources( array $loaded_groups = array(), string $detail = 'full' ): string {
 		if ( ! self::is_bridge_ready() ) {
 			return '';
 		}
@@ -70,14 +71,30 @@ class PressArk_Capability_Bridge {
 			$by_group[ $res['group'] ][] = $res;
 		}
 
-		$lines = array();
+		$detail = sanitize_key( $detail );
+		$lines  = array();
 		foreach ( $by_group as $group => $items ) {
-			$names = array_map( fn( $r ) => $r['name'], $items );
+			if ( 'minimal' === $detail ) {
+				$lines[] = '- ' . $group;
+				continue;
+			}
+
+			if ( 'compact' === $detail ) {
+				$lines[] = sprintf( '- %s: %d resource%s', $group, count( $items ), 1 === count( $items ) ? '' : 's' );
+				continue;
+			}
+
+			$names   = array_map( fn( $r ) => $r['name'], $items );
 			$lines[] = sprintf( '- %s: %s', $group, implode( ', ', $names ) );
 		}
 
 		if ( empty( $lines ) ) {
 			return '';
+		}
+
+		if ( 'minimal' === $detail ) {
+			return "RESOURCES (browse with list_resources, fetch with read_resource):\n"
+				. implode( "\n", array_slice( $lines, 0, 8 ) );
 		}
 
 		return "RESOURCES (use list_resources to browse, read_resource to fetch):\n"

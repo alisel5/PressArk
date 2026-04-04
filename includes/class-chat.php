@@ -1183,6 +1183,7 @@ class PressArk_Chat {
 				// Agent path — full streaming support.
 				$stream_connector = new PressArk_Stream_Connector( $ctx['connector'], $emitter, $run_cancel_check );
 				$agent = new PressArk_Agent( $ctx['connector'], $ctx['engine'], $ctx['tier'] );
+				$agent->set_run_context( $ctx['run_id'], (int) $ctx['chat_id'] );
 
 				$result = $agent->run_streaming(
 					$ctx['message'],
@@ -1322,9 +1323,12 @@ class PressArk_Chat {
 		$run_cancel_check = $this->build_run_cancel_check( $run_store, $run_id );
 
 		try {
+			$agent = new PressArk_Agent( $ctx['connector'], $ctx['engine'], $ctx['tier'] );
+			$agent->set_run_context( $run_id, (int) $chat_id );
+
 			$result = match ( $routing['route'] ) {
 				PressArk_Router::ROUTE_WORKFLOW => $routing['handler']->run( $ctx['message'], $ctx['conversation'], $ctx['screen'], $ctx['post_id'] ),
-				PressArk_Router::ROUTE_AGENT   => ( new PressArk_Agent( $ctx['connector'], $ctx['engine'], $ctx['tier'] ) )->run(
+				PressArk_Router::ROUTE_AGENT   => $agent->run(
 					$ctx['message'], $ctx['conversation'], $ctx['deep_mode'], $ctx['screen'], $ctx['post_id'], $ctx['loaded_groups'], $ctx['checkpoint_data'], $run_cancel_check ),
 				PressArk_Router::ROUTE_LEGACY  => $this->run_legacy_raw(
 					$ctx['message'], $ctx['conversation'], $ctx['deep_mode'], $ctx['post_id'], $ctx['screen'], $ctx['connector'] ),
@@ -1827,6 +1831,34 @@ class PressArk_Chat {
 				if ( $all_resolved ) {
 					$checkpoint->set_workflow_stage( 'settled' );
 				}
+
+				// v5.4.0: Evidence-based verification for confirmed actions.
+				if ( class_exists( 'PressArk_Verification' ) ) {
+					$tool_name = (string) ( $action['type'] ?? '' );
+					$policy    = PressArk_Verification::get_policy( $tool_name, $result );
+					if ( $policy && 'none' !== ( $policy['strategy'] ?? 'none' ) ) {
+						$readback_call = PressArk_Verification::build_readback( $policy, $result, $action_args );
+						if ( $readback_call ) {
+							try {
+								$readback_result = $engine->execute_read( $readback_call['name'], $readback_call['arguments'] );
+								$eval = PressArk_Verification::evaluate( $policy, $action_args, $readback_result );
+								$checkpoint->record_verification( $tool_name, $readback_result, $eval['passed'], $eval['evidence'] );
+								$result['verification'] = array(
+									'passed'   => $eval['passed'],
+									'evidence' => $eval['evidence'],
+									'status'   => $eval['passed'] ? 'verified' : 'uncertain',
+								);
+							} catch ( \Throwable $ve ) {
+								// Read-back failed — degrade gracefully; do not block the confirm.
+							}
+						}
+					}
+					// Nudge for model continuation (even if no read-back).
+					$nudge = PressArk_Verification::build_nudge( $tool_name, $result, $result['verification'] ?? null );
+					if ( $nudge ) {
+						$result['verification_nudge'] = $nudge;
+					}
+				}
 			} else {
 				$checkpoint->add_blocker( (string) ( $result['message'] ?? 'Confirmed action failed.' ) );
 			}
@@ -1897,6 +1929,39 @@ class PressArk_Chat {
 				if ( ! empty( $result['success'] ) ) {
 					$checkpoint->clear_blockers();
 					$checkpoint->set_workflow_stage( 'settled' );
+
+					// v5.4.0: Evidence-based verification for preview-applied writes.
+					if ( class_exists( 'PressArk_Verification' ) && ! empty( $session_calls ) ) {
+						$logger_v = new PressArk_Action_Logger();
+						$engine_v = new PressArk_Action_Engine( $logger_v );
+						foreach ( $session_calls as $call ) {
+							$tool_name_v = (string) ( $call['name'] ?? $call['type'] ?? '' );
+							$args_v      = is_array( $call['arguments'] ?? null ) ? $call['arguments'] : ( $call['params'] ?? array() );
+							$policy_v    = PressArk_Verification::get_policy( $tool_name_v, $result );
+							if ( ! $policy_v || 'none' === ( $policy_v['strategy'] ?? 'none' ) ) {
+								continue;
+							}
+							$readback_call_v = PressArk_Verification::build_readback( $policy_v, $result, $args_v );
+							if ( ! $readback_call_v ) {
+								continue;
+							}
+							try {
+								$readback_result_v = $engine_v->execute_read( $readback_call_v['name'], $readback_call_v['arguments'] );
+								$eval_v = PressArk_Verification::evaluate( $policy_v, $args_v, $readback_result_v );
+								$checkpoint->record_verification( $tool_name_v, $readback_result_v, $eval_v['passed'], $eval_v['evidence'] );
+								if ( ! isset( $result['verification'] ) ) {
+									$result['verification'] = array();
+								}
+								$result['verification'][ $tool_name_v ] = array(
+									'passed'   => $eval_v['passed'],
+									'evidence' => $eval_v['evidence'],
+									'status'   => $eval_v['passed'] ? 'verified' : 'uncertain',
+								);
+							} catch ( \Throwable $ve ) {
+								// Read-back failed — degrade gracefully.
+							}
+						}
+					}
 				} else {
 					$checkpoint->add_blocker( (string) ( $result['message'] ?? 'Preview apply failed.' ) );
 				}
@@ -2050,11 +2115,16 @@ class PressArk_Chat {
 			$execution = $checkpoint->get_execution();
 			$progress  = PressArk_Execution_Ledger::progress_snapshot( $execution );
 			$blockers  = $checkpoint->get_blockers();
+			$replay    = $checkpoint->get_replay_sidecar();
 
 			$result['continuation']['execution']          = $execution;
 			$result['continuation']['progress']           = $progress;
 			$result['continuation']['blockers']           = $blockers;
 			$result['continuation']['should_auto_resume'] = ! empty( $progress['should_auto_resume'] ) && empty( $blockers );
+			if ( ! empty( $replay ) ) {
+				$result['continuation']['replay'] = $replay;
+				$result['replay']                 = $replay;
+			}
 
 			if ( ! empty( $progress['is_complete'] ) ) {
 				$result['continuation']['completion_message'] = 'All requested steps are complete. Do not continue automatically.';

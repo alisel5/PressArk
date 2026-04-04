@@ -116,6 +116,7 @@ spl_autoload_register( static function ( string $class ): void {
 		'PressArk_AI_Connector'          => 'includes/class-ai-connector.php',
 		'PressArk_Automation_Dispatcher' => 'includes/class-pressark-automation-dispatcher.php',
 		'PressArk_Automation_Policy'     => 'includes/class-pressark-automation-policy.php',
+		'PressArk_Policy_Engine'         => 'includes/class-pressark-policy-engine.php',
 		'PressArk_Automation_Recurrence' => 'includes/class-pressark-automation-recurrence.php',
 		'PressArk_Automation_Service'    => 'includes/class-pressark-automation-service.php',
 		'PressArk_Automation_Store'      => 'includes/class-pressark-automation-store.php',
@@ -135,6 +136,7 @@ spl_autoload_register( static function ( string $class ): void {
 		'PressArk_Entitlements'          => 'includes/class-pressark-entitlements.php',
 		'PressArk_Error_Tracker'         => 'includes/class-pressark-error-tracker.php',
 		'PressArk_Execution_Ledger'      => 'includes/class-pressark-execution-ledger.php',
+		'PressArk_Verification'          => 'includes/class-pressark-verification.php',
 		'PressArk_Frontend_SEO'          => 'includes/class-pressark-frontend-seo.php',
 		'PressArk_Handler_Automation'    => 'includes/handlers/class-handler-automation.php',
 		'PressArk_Handler_Base'          => 'includes/handlers/class-handler-base.php',
@@ -165,6 +167,7 @@ spl_autoload_register( static function ( string $class ): void {
 		'PressArk_PAL_Parser'            => 'includes/class-pressark-pal-parser.php',
 		'PressArk_Pipeline'              => 'includes/class-pressark-pipeline.php',
 		'PressArk_Plugins'               => 'includes/class-pressark-plugins.php',
+		'PressArk_Preflight'             => 'includes/class-pressark-preflight.php',
 		'PressArk_Preview'               => 'includes/class-pressark-preview.php',
 		'PressArk_Preview_Builder'       => 'includes/class-pressark-preview-builder.php',
 		'PressArk_Privacy'               => 'includes/class-pressark-privacy.php',
@@ -172,6 +175,7 @@ spl_autoload_register( static function ( string $class ): void {
 		'PressArk_Queue_Backend'         => 'includes/class-pressark-queue-backend.php',
 		'PressArk_Queue_Cron'            => 'includes/class-pressark-queue-cron.php',
 		'PressArk_Reservation'           => 'includes/class-pressark-reservation.php',
+		'PressArk_Replay_Integrity'      => 'includes/class-pressark-replay-integrity.php',
 		'PressArk_Retention'             => 'includes/class-pressark-retention.php',
 		'PressArk_Router'                => 'includes/class-pressark-router.php',
 		'PressArk_Run_Approval_Service'  => 'includes/class-pressark-run-approval-service.php',
@@ -189,8 +193,10 @@ spl_autoload_register( static function ( string $class ): void {
 		'PressArk_Themes'                => 'includes/class-pressark-themes.php',
 		'PressArk_Throttle'              => 'includes/class-pressark-throttle.php',
 		'PressArk_Token_Bank'            => 'includes/class-pressark-token-bank.php',
+		'PressArk_Token_Budget_Manager'  => 'includes/class-pressark-token-budget-manager.php',
 		'PressArk_Tool_Catalog'          => 'includes/class-pressark-tool-catalog.php',
 		'PressArk_Tool_Loader'           => 'includes/class-pressark-tool-loader.php',
+		'PressArk_Tool_Result_Artifacts' => 'includes/class-pressark-tool-result-artifacts.php',
 		'PressArk_Tools'                 => 'includes/class-pressark-tools.php',
 		'PressArk_Usage_Tracker'         => 'includes/class-usage-tracker.php',
 		'PressArk_Watchdog_Alerter'      => 'includes/class-pressark-watchdog-alerter.php',
@@ -305,7 +311,8 @@ function pressark_credit_pack_checkout_url( string $pack_type ): string {
  * Infer the purchased credit pack from a Freemius payment object.
  */
 function pressark_resolve_pack_type( $payment ): string {
-	$pack_types = array_keys( PressArk_Entitlements::CREDIT_PACKS );
+	$pack_catalog = PressArk_Entitlements::get_credit_pack_catalog();
+	$pack_types   = array_keys( $pack_catalog );
 
 	// 1. Match by Freemius pricing_id (most reliable).
 	$pricing_id = 0;
@@ -313,8 +320,8 @@ function pressark_resolve_pack_type( $payment ): string {
 		$pricing_id = (int) $payment->pricing_id;
 	}
 	if ( $pricing_id > 0 ) {
-		foreach ( PressArk_Entitlements::CREDIT_PACKS as $pack_type => $pack ) {
-			if ( (int) ( $pack['freemius_pricing_id'] ?? 0 ) === $pricing_id ) {
+		foreach ( $pack_catalog as $pack_type => $pack ) {
+			if ( (int) ( $pack['pricing_id'] ?? $pack['freemius_pricing_id'] ?? 0 ) === $pricing_id ) {
 				return $pack_type;
 			}
 		}
@@ -328,7 +335,7 @@ function pressark_resolve_pack_type( $payment ): string {
 
 		$value = strtolower( (string) $payment->$field );
 		foreach ( $pack_types as $pack_type ) {
-			$label = strtolower( (string) PressArk_Entitlements::CREDIT_PACKS[ $pack_type ]['label'] );
+			$label = strtolower( (string) ( $pack_catalog[ $pack_type ]['label'] ?? '' ) );
 			if ( str_contains( $value, strtolower( $pack_type ) ) || str_contains( $value, $label ) ) {
 				return $pack_type;
 			}
@@ -345,8 +352,8 @@ function pressark_resolve_pack_type( $payment ): string {
 		$gross = (int) round( (float) $payment->total * 100 );
 	}
 
-	foreach ( PressArk_Entitlements::CREDIT_PACKS as $pack_type => $pack ) {
-		if ( (int) $pack['price_cents'] === $gross ) {
+	foreach ( $pack_catalog as $pack_type => $pack ) {
+		if ( (int) ( $pack['price_cents'] ?? 0 ) === $gross ) {
 			return $pack_type;
 		}
 	}
@@ -365,6 +372,88 @@ function pressark_resolve_pack_type( $payment ): string {
 	}
 
 	return '';
+}
+
+/**
+ * Local helper for plugin-side purchase dedup after bank confirmation.
+ */
+function pressark_credit_payment_dedup_key( string $payment_id ): string {
+	return 'pressark_credit_payment_' . sanitize_key( $payment_id );
+}
+
+/**
+ * Apply a credit purchase through the bank without trusting local tier claims.
+ *
+ * The bank remains authoritative for subscription eligibility, payment
+ * verification, pricing, and idempotency. The local dedup option is only
+ * written after the bank returns success or idempotent success.
+ *
+ * @param int    $user_id User receiving credits.
+ * @param string $pack_type Resolved pack type.
+ * @param string $payment_id Freemius payment ID.
+ * @return array
+ */
+function pressark_apply_credit_purchase( int $user_id, string $pack_type, string $payment_id ): array {
+	$payment_id = sanitize_text_field( $payment_id );
+	$pack_type  = sanitize_key( $pack_type );
+
+	if ( $user_id <= 0 || '' === $pack_type || '' === $payment_id ) {
+		return array(
+			'success' => false,
+			'error'   => 'missing_purchase_context',
+		);
+	}
+
+	$dedup_key = pressark_credit_payment_dedup_key( $payment_id );
+	if ( get_option( $dedup_key ) ) {
+		return array(
+			'success'       => true,
+			'idempotent'    => true,
+			'already_applied' => true,
+			'local_dedup'   => true,
+		);
+	}
+
+	$bank   = new PressArk_Token_Bank();
+	$result = $bank->purchase_credits( $user_id, $pack_type, $payment_id );
+	$success = ! empty( $result['success'] );
+	$idempotent = ! empty( $result['idempotent'] );
+
+	if ( ! $success && ! $idempotent ) {
+		$error_message = '';
+		if ( is_string( $result['error'] ?? null ) ) {
+			$error_message = $result['error'];
+		} elseif ( is_array( $result['error'] ?? null ) ) {
+			$error_message = (string) ( $result['error']['message'] ?? $result['error']['code'] ?? '' );
+		}
+
+		return array_merge(
+			array(
+				'success' => false,
+				'error'   => $error_message ?: 'credit_purchase_failed',
+			),
+			is_array( $result ) ? $result : array()
+		);
+	}
+
+	update_option(
+		$dedup_key,
+		array(
+			'applied_at' => time(),
+			'pack_type'  => $pack_type,
+		),
+		false
+	);
+	delete_transient( 'pressark_token_status_' . $user_id );
+
+	return array_merge(
+		is_array( $result ) ? $result : array(),
+		array(
+			'success'         => true,
+			'idempotent'      => $idempotent,
+			'already_applied' => $idempotent || ! empty( $result['already_applied'] ),
+		)
+	);
 }
 
 /**
@@ -504,28 +593,23 @@ function pressark_on_credit_purchase( $payment ): void {
 		return;
 	}
 
-	$tier = ( new PressArk_License() )->get_tier();
-	if ( ! PressArk_Entitlements::is_paid_tier( $tier ) ) {
-		return;
-	}
-
 	$payment_id = isset( $payment->id ) ? (string) $payment->id : '';
 	if ( '' === $payment_id ) {
 		return;
 	}
 
-	// v5.0.1: Idempotency guard — Freemius webhooks can retry on network failure.
-	// Prevent double-crediting the same payment by checking a dedup option first.
-	$dedup_key = 'pressark_credit_payment_' . $payment_id;
-	if ( get_option( $dedup_key ) ) {
-		return; // Already processed.
+	$result = pressark_apply_credit_purchase( $user_id, $pack_type, $payment_id );
+	if ( empty( $result['success'] ) ) {
+		PressArk_Error_Tracker::warning(
+			'Billing',
+			'Credit purchase confirmation was rejected by the token bank.',
+			array(
+				'payment_id' => $payment_id,
+				'pack_type'  => $pack_type,
+				'error'      => (string) ( $result['error'] ?? 'unknown' ),
+			)
+		);
 	}
-	// Mark as processed BEFORE calling the bank to prevent race conditions.
-	update_option( $dedup_key, time(), false );
-
-	$bank = new PressArk_Token_Bank();
-	$bank->purchase_credits( $user_id, $pack_type, $payment_id, $tier );
-	delete_transient( 'pressark_token_status_' . $user_id );
 }
 
 /**
@@ -629,23 +713,22 @@ function pressark_ajax_confirm_credit_purchase(): void {
 		wp_send_json_success( array( 'skipped' => true ) );
 	}
 
-	$tier = ( new PressArk_License() )->get_tier();
-	if ( ! PressArk_Entitlements::is_paid_tier( $tier ) ) {
-		wp_send_json_error( 'Credit packs require a paid plan' );
+	$result = pressark_apply_credit_purchase( $user_id, $pack_type, $payment_id );
+	if ( empty( $result['success'] ) ) {
+		wp_send_json_error(
+			array(
+				'pack_type' => $pack_type,
+				'message'   => (string) ( $result['error'] ?? 'Credit purchase could not be confirmed.' ),
+			),
+			400
+		);
 	}
 
-	// v5.0.1: Idempotency guard — prevent double-crediting on JS retry.
-	$dedup_key = 'pressark_credit_payment_' . $payment_id;
-	if ( get_option( $dedup_key ) ) {
-		wp_send_json_success( array( 'pack_type' => $pack_type, 'already_applied' => true ) );
-	}
-	update_option( $dedup_key, time(), false );
-
-	$bank = new PressArk_Token_Bank();
-	$bank->purchase_credits( $user_id, $pack_type, $payment_id, $tier );
-	delete_transient( 'pressark_token_status_' . $user_id );
-
-	wp_send_json_success( array( 'pack_type' => $pack_type ) );
+	wp_send_json_success( array(
+		'pack_type'       => $pack_type,
+		'already_applied' => ! empty( $result['already_applied'] ),
+		'idempotent'      => ! empty( $result['idempotent'] ),
+	) );
 }
 
 // Register WP-CLI commands when running in CLI context.

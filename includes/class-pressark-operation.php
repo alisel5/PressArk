@@ -168,6 +168,24 @@ class PressArk_Operation {
 	 */
 	public array $tags = array();
 
+	/**
+	 * Verification contract — declares how to prove a write succeeded.
+	 *
+	 * Keys:
+	 *   'strategy'     => 'none'|'read_back'|'field_check'|'existence_check'
+	 *   'read_tool'    => Tool name to call for read-back (e.g. 'read_content').
+	 *   'read_args'    => Default args merged into the read-back call.
+	 *   'check_fields' => Fields to verify match between write intent and read-back.
+	 *   'intensity'    => 'light'|'standard'|'thorough'
+	 *   'nudge'        => bool — append evidence nudge to tool result for the AI model.
+	 *
+	 * Empty array = no verification (default for reads and low-risk writes).
+	 *
+	 * @since 5.4.0
+	 * @var array
+	 */
+	public array $verification = array();
+
 	// ── Contract application ───────────────────────────────────────
 
 	/**
@@ -185,7 +203,7 @@ class PressArk_Operation {
 		$allowed = array(
 			'search_hint', 'interrupt', 'cache_ttl', 'output_policy',
 			'resumable', 'defer', 'idempotent', 'validate',
-			'policy_hooks', 'tags',
+			'policy_hooks', 'tags', 'verification',
 		);
 
 		foreach ( $allowed as $field ) {
@@ -297,6 +315,27 @@ class PressArk_Operation {
 	}
 
 	/**
+	 * Whether this operation has a verification contract.
+	 *
+	 * @since 5.4.0
+	 */
+	public function has_verification(): bool {
+		return ! empty( $this->verification )
+			&& isset( $this->verification['strategy'] )
+			&& 'none' !== $this->verification['strategy'];
+	}
+
+	/**
+	 * Get the verification contract, or null if none.
+	 *
+	 * @since 5.4.0
+	 * @return array|null
+	 */
+	public function get_verification(): ?array {
+		return $this->has_verification() ? $this->verification : null;
+	}
+
+	/**
 	 * Run pre-permission validation if a validator is set.
 	 *
 	 * @since 5.3.0
@@ -364,6 +403,9 @@ class PressArk_Operation {
 
 			// ── Policy Hooks ──
 			'policy_hooks'     => $this->policy_hooks,
+
+			// ── Verification ──
+			'verification'     => $this->verification,
 		);
 	}
 }

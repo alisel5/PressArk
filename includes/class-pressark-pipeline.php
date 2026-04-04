@@ -227,6 +227,7 @@ class PressArk_Pipeline {
 			'pending_actions'   => $result['pending_actions'] ?? array(),
 			'usage'             => $this->tracker->get_usage_data(),
 			'token_status'      => $token_status,
+			'billing_status'    => $token_status,
 			'plan_info'         => $this->plan_info,
 		);
 
@@ -260,6 +261,10 @@ class PressArk_Pipeline {
 			}
 		}
 
+		if ( array_key_exists( 'budget', $result ) ) {
+			$data['budget'] = $this->build_budget_response( (array) $result['budget'], $result, $token_status );
+		}
+
 		// Steps (agent + workflow paths).
 		if ( in_array( $route, array( 'agent', 'workflow' ), true ) ) {
 			$data['steps'] = $result['steps'] ?? array();
@@ -286,6 +291,50 @@ class PressArk_Pipeline {
 		}
 
 		return new WP_REST_Response( $data, 200 );
+	}
+
+	/**
+	 * Merge planning ledger data with settled usage and billing status.
+	 *
+	 * @param array $budget       Pre-request planning ledger.
+	 * @param array $result       Execution result.
+	 * @param array $token_status Settled billing status.
+	 * @return array
+	 */
+	private function build_budget_response( array $budget, array $result, array $token_status ): array {
+		$raw_actual_tokens = (int) ( $token_status['raw_actual_tokens'] ?? $result['tokens_used'] ?? 0 );
+		$actual_icus       = (int) ( $token_status['actual_icus'] ?? $result['icu_spent'] ?? 0 );
+
+		$budget['raw_actual_tokens'] = $raw_actual_tokens;
+		$budget['actual_icus']       = $actual_icus;
+
+		foreach ( array(
+			'billing_authority',
+			'billing_tier',
+			'budget_pressure_state',
+			'monthly_icu_budget',
+			'monthly_included_icu_budget',
+			'monthly_remaining',
+			'monthly_included_remaining',
+			'credits_remaining',
+			'purchased_credits_remaining',
+			'legacy_bonus_remaining',
+			'total_available',
+			'total_remaining',
+			'spendable_credits_remaining',
+			'spendable_icus_remaining',
+			'using_purchased_credits',
+			'using_legacy_bonus',
+		) as $field ) {
+			if ( array_key_exists( $field, $token_status ) ) {
+				$budget[ $field ] = $token_status[ $field ];
+			}
+		}
+
+		$budget['fits_credit_budget'] = ! empty( $budget['is_byok'] )
+			|| (int) ( $budget['estimated_request_icus'] ?? 0 ) <= max( 0, (int) ( $budget['total_remaining'] ?? 0 ) );
+
+		return $budget;
 	}
 
 	// ── Run Lifecycle (v3.1.0) ────────────────────────────────────

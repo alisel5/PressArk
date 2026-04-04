@@ -938,11 +938,14 @@ class PressArk_Admin {
 
 	public function render_credit_store_field(): void {
 		$tier      = ( new PressArk_License() )->get_tier();
-		$is_byok   = PressArk_Entitlements::is_byok();
-		$is_paid   = PressArk_Entitlements::is_paid_tier( $tier );
+		$plan_info = PressArk_Entitlements::get_plan_info( $tier );
+		$is_byok   = ! empty( $plan_info['is_byok'] );
+		$is_paid   = ! empty( $plan_info['can_buy_credits'] );
 		$bank      = new PressArk_Token_Bank();
 		$credits   = $bank->get_credits();
 		$active    = (array) ( $credits['credits'] ?? array() );
+		$pack_catalog = PressArk_Entitlements::get_credit_pack_catalog();
+		$checkout_config = PressArk_Entitlements::get_credit_checkout_config();
 
 		echo '<div id="pressark-credit-store">';
 
@@ -963,13 +966,16 @@ class PressArk_Admin {
 			return;
 		}
 
-		echo '<p>' . esc_html__( 'Purchased credits are used after your monthly plan credits are exhausted. Credit packs expire 12 months after purchase.', 'pressark' ) . '</p>';
+		echo '<p>' . esc_html__( 'Purchased credits are used after your monthly included allowance is exhausted. Credit packs expire 12 months after purchase.', 'pressark' ) . '</p>';
+		if ( ! empty( $plan_info['billing_contract_mismatch'] ) ) {
+			echo '<p class="description" style="color:#92400e;">' . esc_html__( 'The bank is using a newer billing catalog than this plugin build. Checkout uses the bank catalog automatically.', 'pressark' ) . '</p>';
+		}
 		echo '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin:16px 0 20px;">';
-		foreach ( PressArk_Entitlements::CREDIT_PACKS as $pack_type => $pack ) {
-			$pricing_id = (int) ( $pack['freemius_pricing_id'] ?? 0 );
+		foreach ( $pack_catalog as $pack_type => $pack ) {
+			$pricing_id = (int) ( $pack['pricing_id'] ?? $pack['freemius_pricing_id'] ?? 0 );
 			echo '<div style="background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:16px;">';
-			echo '<strong style="display:block;color:#0f172a;margin-bottom:6px;">' . esc_html( $pack['label'] ) . '</strong>';
-			echo '<p style="margin:0 0 12px;color:#64748b;">$' . esc_html( number_format( $pack['price_cents'] / 100, 0 ) ) . '</p>';
+			echo '<strong style="display:block;color:#0f172a;margin-bottom:6px;">' . esc_html( (string) ( $pack['label'] ?? '' ) ) . '</strong>';
+			echo '<p style="margin:0 0 12px;color:#64748b;">$' . esc_html( number_format( (int) ( $pack['price_cents'] ?? 0 ) / 100, 0 ) ) . '</p>';
 			printf(
 				'<button type="button" class="button button-secondary pressark-buy-credits" data-pricing-id="%s" data-pack="%s">%s</button>',
 				esc_attr( (string) $pricing_id ),
@@ -1000,8 +1006,8 @@ class PressArk_Admin {
 			: ( defined( 'WP_FS__pressark_SECRET_KEY' ) ? WP_FS__pressark_SECRET_KEY : '' );
 			if ( $secret_key ) {
 				$ctx           = (string) time();
-				$product_id    = (string) PressArk_Entitlements::CREDITS_PRODUCT_ID;
-				$public_key    = PressArk_Entitlements::CREDITS_PUBLIC_KEY;
+				$product_id    = (string) $checkout_config['product_id'];
+				$public_key    = (string) $checkout_config['public_key'];
 				$sandbox_token = md5( $ctx . $product_id . $secret_key . $public_key . 'checkout' );
 				$sandbox_json  = wp_json_encode( array(
 					'token' => $sandbox_token,
@@ -1023,9 +1029,9 @@ class PressArk_Admin {
 					if (!pricingId) return;
 
 					var checkoutConfig = {
-						product_id:  '<?php echo (int) PressArk_Entitlements::CREDITS_PRODUCT_ID; ?>',
-						plan_id:     '<?php echo (int) PressArk_Entitlements::CREDITS_PLAN_ID; ?>',
-						public_key:  <?php echo wp_json_encode( PressArk_Entitlements::CREDITS_PUBLIC_KEY ); ?>,
+						product_id:  '<?php echo (int) $checkout_config['product_id']; ?>',
+						plan_id:     '<?php echo (int) $checkout_config['plan_id']; ?>',
+						public_key:  <?php echo wp_json_encode( $checkout_config['public_key'] ); ?>,
 						image:       <?php echo wp_json_encode( PRESSARK_URL . 'assets/imgs/PNG-LOGO.png' ); ?>
 					};
 
@@ -1306,26 +1312,28 @@ class PressArk_Admin {
 	 * Render bundled credit usage (read-only) in the billing section.
 	 */
 	private function render_token_budget_display(): void {
-		$token_bank   = new PressArk_Token_Bank();
-		$status       = $token_bank->get_status();
-		$is_byok      = (bool) get_option( 'pressark_byok_enabled', false );
-		$used         = (int) ( $status['icus_used'] ?? 0 );
-		$monthly      = (int) ( $status['icu_budget'] ?? 100000 );
-		$total        = (int) ( $status['total_remaining'] ?? $status['icus_remaining'] ?? $monthly );
-		$pct          = (int) ( $status['percent_used'] ?? 0 );
-		$at_limit     = ! empty( $status['at_limit'] );
-		$warn         = ! empty( $status['warn'] );
-		$credits_left = (int) ( $status['credits_remaining'] ?? 0 );
-		$monthly_left = (int) ( $status['monthly_remaining'] ?? max( 0, $monthly - $used ) );
-		$next_reset_at = (string) ( $status['next_reset_at'] ?? '' );
+		$tier         = ( new PressArk_License() )->get_tier();
+		$plan_info    = PressArk_Entitlements::get_plan_info( $tier );
+		$is_byok      = ! empty( $plan_info['is_byok'] );
+		$used         = (int) ( $plan_info['icus_used'] ?? 0 );
+		$monthly      = (int) ( $plan_info['monthly_included_icu_budget'] ?? $plan_info['monthly_icu_budget'] ?? 100000 );
+		$total        = (int) ( $plan_info['total_remaining'] ?? $plan_info['icus_remaining'] ?? $monthly );
+		$monthly_left = (int) ( $plan_info['monthly_included_remaining'] ?? $plan_info['monthly_remaining'] ?? max( 0, $monthly - $used ) );
+		$credits_left = (int) ( $plan_info['purchased_credits_remaining'] ?? $plan_info['credits_remaining'] ?? 0 );
+		$legacy_left  = (int) ( $plan_info['legacy_bonus_remaining'] ?? 0 );
+		$at_limit     = $total <= 0;
+		$pct          = $monthly > 0 ? (int) min( 100, round( ( $used / $monthly ) * 100 ) ) : 0;
+		$warn         = 'normal' !== (string) ( $plan_info['budget_pressure_state'] ?? 'normal' );
+		$next_reset_at = (string) ( $plan_info['next_reset_at'] ?? '' );
 		$reset_label   = $next_reset_at ? wp_date( 'M j', strtotime( $next_reset_at ) ) : '';
 		$upgrade_url  = pressark_get_upgrade_url();
 		$store_anchor = admin_url( 'admin.php?page=pressark#pressark-credit-store' );
+		$pressure_label = ucfirst( (string) ( $plan_info['budget_pressure_state'] ?? 'normal' ) );
 
 		if ( $is_byok ) {
 			echo '<div style="background:#f0fdf4;border:1px solid #86efac;border-radius:6px;padding:12px;margin-top:12px;">';
 			echo '<strong>' . esc_html__( 'BYOK Mode Active', 'pressark' ) . '</strong>';
-			echo '<p style="margin:4px 0 0;">' . esc_html__( 'Using your own API key. No bundled credit limits apply.', 'pressark' ) . '</p>';
+			echo '<p style="margin:4px 0 0;">' . esc_html__( 'Using your own API key. Bundled credits are bypassed, but plan entitlements still apply.', 'pressark' ) . '</p>';
 			echo '</div>';
 			return;
 		}
@@ -1339,36 +1347,53 @@ class PressArk_Admin {
 			<p style="margin:0;font-size:14px;font-weight:500;color:<?php echo esc_attr( $at_limit ? '#ef4444' : ( $warn ? '#f59e0b' : '#475569' ) ); ?>;">
 				<?php
 				printf(
-					/* translators: 1: credits used 2: billing-cycle credit budget 3: percentage */
-					esc_html__( '%1$s / %2$s credits used this billing cycle (%3$s%%)', 'pressark' ),
+					/* translators: 1: included credits used 2: billing-cycle included credit budget 3: percentage */
+					esc_html__( '%1$s / %2$s included credits used this billing cycle (%3$s%%)', 'pressark' ),
 					esc_html( number_format_i18n( $used ) ),
 					esc_html( number_format_i18n( $monthly ) ),
 					esc_html( number_format_i18n( $pct ) )
 				);
 				?>
 			</p>
-			<p style="display:none;margin:10px 0 0;color:#64748b;" aria-hidden="true">
+			<p style="margin:10px 0 0;color:#64748b;">
 				<?php
-				printf(
-					/* translators: 1: monthly credits remaining 2: purchased credits remaining 3: total credits available */
-					esc_html__( 'Monthly remaining: %1$s · Purchased credits: %2$s · Total available: %3$s', 'pressark' ),
+				$summary = sprintf(
+					/* translators: 1: included credits remaining 2: purchased credits remaining 3: total credits remaining */
+					esc_html__( 'Included remaining: %1$s · Purchased credits: %2$s · Total spendable: %3$s', 'pressark' ),
 					number_format( $monthly_left ),
 					number_format( $credits_left ),
 					number_format( $total )
 				);
+				if ( $legacy_left > 0 ) {
+					$summary .= ' · ' . sprintf(
+						/* translators: %s: legacy bonus credits remaining */
+						esc_html__( 'Legacy bonus: %s', 'pressark' ),
+						number_format( $legacy_left )
+					);
+				}
+				echo esc_html( $summary );
 				?>
 			</p>
 			<p style="margin:10px 0 0;color:#64748b;">
 				<?php
-				printf(
-					/* translators: 1: billing-cycle credits remaining 2: purchased credits remaining 3: total credits remaining */
-					esc_html__( 'Allowance remaining: %1$s · Purchased credits: %2$s · Total remaining: %3$s', 'pressark' ),
-					number_format( $monthly_left ),
-					number_format( $credits_left ),
-					number_format( $total )
+				echo esc_html(
+					sprintf(
+						/* translators: 1: pressure label 2: billing authority */
+						__( 'Budget pressure: %1$s · Billing source: %2$s', 'pressark' ),
+						$pressure_label,
+						(string) ( $plan_info['billing_authority'] ?? 'token_bank' )
+					)
 				);
 				?>
 			</p>
+			<?php if ( ! empty( $plan_info['using_purchased_credits'] ) ) : ?>
+				<p style="margin:10px 0 0;color:#92400e;"><?php esc_html_e( 'Purchased credits are currently being used because the monthly included allowance is exhausted.', 'pressark' ); ?></p>
+			<?php elseif ( ! empty( $plan_info['using_legacy_bonus'] ) ) : ?>
+				<p style="margin:10px 0 0;color:#92400e;"><?php esc_html_e( 'Legacy bonus credits are currently covering usage after the monthly included allowance.', 'pressark' ); ?></p>
+			<?php endif; ?>
+			<?php if ( ! empty( $plan_info['billing_contract_mismatch'] ) ) : ?>
+				<p style="margin:10px 0 0;color:#92400e;"><?php esc_html_e( 'The bank is using a newer billing catalog than this plugin build. Bank values remain authoritative for pricing and balance semantics.', 'pressark' ); ?></p>
+			<?php endif; ?>
 			<?php if ( $reset_label ) : ?>
 				<p style="margin:10px 0 0;color:#64748b;">
 					<?php

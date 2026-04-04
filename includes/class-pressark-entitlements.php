@@ -46,6 +46,8 @@ class PressArk_Entitlements {
 		'enterprise' => 43685,
 	);
 
+	public const MAIN_PLUGIN_ID = 26376;
+
 	/** Freemius "PressArk Credits" SaaS product for one-off credit purchases. */
 	public const CREDITS_PRODUCT_ID = 26385;
 	public const CREDITS_PUBLIC_KEY = 'pk_0ea7686cd81ea4e278f5c183b22cf';
@@ -271,6 +273,82 @@ class PressArk_Entitlements {
 		return self::icu_budget( $tier );
 	}
 
+	public static function get_local_credit_pack_catalog(): array {
+		$catalog = array();
+
+		foreach ( self::CREDIT_PACKS as $pack_type => $pack ) {
+			$catalog[ $pack_type ] = array(
+				'pack_type'   => $pack_type,
+				'pricing_id'  => (int) ( $pack['freemius_pricing_id'] ?? 0 ),
+				'icus'        => (int) ( $pack['icus'] ?? 0 ),
+				'price_cents' => (int) ( $pack['price_cents'] ?? 0 ),
+				'label'       => (string) ( $pack['label'] ?? '' ),
+			);
+		}
+
+		return $catalog;
+	}
+
+	public static function get_credit_pack_catalog( bool $prefer_bank = true ): array {
+		$catalog = self::get_billing_catalog( $prefer_bank );
+		if ( ! empty( $catalog['credit_packs'] ) && is_array( $catalog['credit_packs'] ) ) {
+			return $catalog['credit_packs'];
+		}
+
+		return self::get_local_credit_pack_catalog();
+	}
+
+	public static function get_billing_catalog( bool $prefer_bank = true ): array {
+		if ( $prefer_bank && ! self::is_byok() ) {
+			$catalog = ( new PressArk_Token_Bank() )->get_billing_catalog();
+			if ( ! empty( $catalog ) ) {
+				return $catalog;
+			}
+		}
+
+		$local = self::get_local_billing_contract();
+		$local['contract_hash'] = self::get_local_billing_contract_hash();
+
+		return $local;
+	}
+
+	public static function get_credit_checkout_config( bool $prefer_bank = true ): array {
+		$catalog  = self::get_billing_catalog( $prefer_bank );
+		$freemius = (array) ( $catalog['freemius'] ?? array() );
+
+		return array(
+			'main_plugin_id'     => (int) ( $freemius['main_plugin_id'] ?? self::MAIN_PLUGIN_ID ),
+			'product_id'         => (int) ( $freemius['credits_product_id'] ?? self::CREDITS_PRODUCT_ID ),
+			'plan_id'            => (int) ( $freemius['credits_plan_id'] ?? self::CREDITS_PLAN_ID ),
+			'public_key'         => self::CREDITS_PUBLIC_KEY,
+			'contract_hash'      => (string) ( $catalog['contract_hash'] ?? self::get_local_billing_contract_hash() ),
+		);
+	}
+
+	public static function get_local_billing_contract(): array {
+		$plan_to_tier = array();
+		foreach ( self::FREEMIUS_PLAN_IDS as $tier => $plan_id ) {
+			$plan_to_tier[ (string) $plan_id ] = self::normalize_tier( $tier );
+		}
+
+		return array(
+			'version'      => 1,
+			'plan_to_tier' => $plan_to_tier,
+			'credit_packs' => self::get_local_credit_pack_catalog(),
+			'freemius'     => array(
+				'main_plugin_id'     => (string) self::MAIN_PLUGIN_ID,
+				'credits_product_id' => (string) self::CREDITS_PRODUCT_ID,
+				'credits_plan_id'    => (string) self::CREDITS_PLAN_ID,
+			),
+		);
+	}
+
+	public static function get_local_billing_contract_hash(): string {
+		$sorted = self::sort_contract_value( self::get_local_billing_contract() );
+		$json   = wp_json_encode( $sorted );
+		return is_string( $json ) ? hash( 'sha256', $json ) : '';
+	}
+
 	/**
 	 * Get output buffer size for reservation estimates.
 	 */
@@ -283,6 +361,24 @@ class PressArk_Entitlements {
 	 */
 	public static function default_model( string $tier ): string {
 		return (string) self::tier_value( $tier, 'default_model' );
+	}
+
+	private static function sort_contract_value( $value ) {
+		if ( ! is_array( $value ) ) {
+			return $value;
+		}
+
+		$is_list = array_keys( $value ) === range( 0, count( $value ) - 1 );
+		if ( $is_list ) {
+			return array_map( array( self::class, 'sort_contract_value' ), $value );
+		}
+
+		ksort( $value );
+		foreach ( $value as $key => $item ) {
+			$value[ $key ] = self::sort_contract_value( $item );
+		}
+
+		return $value;
 	}
 
 	/**
@@ -520,43 +616,77 @@ class PressArk_Entitlements {
 		$config = self::tier_config( $tier );
 
 		$info = array(
-			'tier'              => $tier,
-			'tier_label'        => $config['label'],
-			'icu_budget'        => (int) $config['icu_budget'],
-			'token_budget'      => (int) $config['token_budget'],
-			'is_byok'           => self::is_byok(),
-			'upgrade_url'       => pressark_get_upgrade_url(),
-			'can_buy_credits'   => ! self::is_byok() && self::is_paid_tier( $tier ),
-			'credits_remaining' => 0,
-			'credits_packs'     => array(),
+			'tier'                       => $tier,
+			'tier_label'                 => $config['label'],
+			'entitlement_tier'           => $tier,
+			'entitlement_tier_label'     => $config['label'],
+			'billing_tier'               => $tier,
+			'billing_tier_label'         => $config['label'],
+			'icu_budget'                 => (int) $config['icu_budget'],
+			'monthly_icu_budget'         => (int) $config['icu_budget'],
+			'monthly_included_icu_budget' => (int) $config['icu_budget'],
+			'token_budget'               => (int) $config['token_budget'],
+			'is_byok'                    => self::is_byok(),
+			'upgrade_url'                => pressark_get_upgrade_url(),
+			'can_buy_credits'            => ! self::is_byok() && self::is_paid_tier( $tier ),
+			'credits_remaining'          => 0,
+			'purchased_credits_remaining' => 0,
+			'legacy_bonus_remaining'     => 0,
+			'credit_packs'               => array(),
+			'credits_packs'              => array(),
+			'budget_pressure_state'      => 'normal',
+			'billing_authority'          => self::is_byok() ? 'byok' : 'token_bank_provisional',
+			'local_billing_contract_hash' => self::get_local_billing_contract_hash(),
+			'billing_contract_hash'      => self::get_local_billing_contract_hash(),
+			'billing_contract_mismatch'  => false,
+			'verified_handshake'         => false,
+			'provisional_handshake'      => ! self::is_byok(),
 		);
 
 		if ( ! self::is_byok() ) {
 			$bank   = new PressArk_Token_Bank();
 			$status = $bank->get_status();
+			$catalog = self::get_billing_catalog( true );
 			$credits = $bank->get_credits();
+			$billing_tier = self::normalize_tier( (string) ( $status['tier'] ?? $tier ) );
+			$info['billing_tier']       = $billing_tier;
+			$info['billing_tier_label'] = self::tier_label( $billing_tier );
 			$info['icus_used']         = (int) ( $status['icus_used'] ?? 0 );
 			$info['icus_remaining']    = (int) ( $status['icus_remaining'] ?? $config['icu_budget'] );
 			$info['monthly_remaining'] = (int) ( $status['monthly_remaining'] ?? max( 0, $config['icu_budget'] - $info['icus_used'] ) );
+			$info['monthly_included_remaining'] = (int) ( $status['monthly_included_remaining'] ?? $info['monthly_remaining'] );
 			$info['monthly_exhausted'] = ! empty( $status['monthly_exhausted'] );
 			$info['using_purchased_credits'] = ! empty( $status['using_purchased_credits'] );
+			$info['using_legacy_bonus'] = ! empty( $status['using_legacy_bonus'] );
 			$info['credits_remaining'] = (int) ( $status['credits_remaining'] ?? 0 );
-			$info['credits_packs']     = (array) ( $credits['credits'] ?? array() );
-			$info['total_available']   = (int) ( $status['total_available'] ?? ( $config['icu_budget'] + $info['credits_remaining'] ) );
+			$info['purchased_credits_remaining'] = (int) ( $status['purchased_credits_remaining'] ?? $info['credits_remaining'] );
+			$info['legacy_bonus_remaining'] = (int) ( $status['legacy_bonus_remaining'] ?? 0 );
+			$info['credit_packs']      = (array) ( $credits['credits'] ?? array() );
+			$info['credits_packs']     = $info['credit_packs'];
+			$info['total_available']   = (int) ( $status['total_available'] ?? ( $config['icu_budget'] + $info['credits_remaining'] + $info['legacy_bonus_remaining'] ) );
 			$info['total_remaining']   = (int) ( $status['total_remaining'] ?? $info['icus_remaining'] );
 			$info['next_reset_at']     = (string) ( $status['next_reset_at'] ?? '' );
 			$info['billing_period_start'] = (string) ( $status['billing_period_start'] ?? '' );
 			$info['billing_period_end']   = (string) ( $status['billing_period_end'] ?? '' );
 			$info['uses_anniversary_reset'] = ! empty( $status['uses_anniversary_reset'] );
 			$info['raw_tokens_used']   = (int) ( $status['raw_tokens_used'] ?? 0 );
+			$info['budget_pressure_state'] = (string) ( $status['budget_pressure_state'] ?? 'normal' );
+			$info['billing_authority'] = (string) ( $status['billing_authority'] ?? 'token_bank_provisional' );
+			$info['billing_contract_hash'] = (string) ( $catalog['contract_hash'] ?? '' );
+			$info['billing_contract_mismatch'] = ! empty( $info['billing_contract_hash'] ) && $info['billing_contract_hash'] !== $info['local_billing_contract_hash'];
+			$info['verified_handshake']  = (bool) get_option( 'pressark_handshake_verified', false );
+			$info['provisional_handshake'] = ! $info['verified_handshake'];
+			$info['can_buy_credits']    = self::is_paid_tier( $billing_tier );
 			$info['tokens_used']       = $info['icus_used'];
 			$info['tokens_remaining']  = $info['icus_remaining'];
 		} else {
 			$info['icus_used']        = 0;
 			$info['icus_remaining']   = 0;
 			$info['monthly_remaining'] = 0;
+			$info['monthly_included_remaining'] = 0;
 			$info['monthly_exhausted'] = false;
 			$info['using_purchased_credits'] = false;
+			$info['using_legacy_bonus'] = false;
 			$info['total_available']  = 0;
 			$info['total_remaining']  = 0;
 			$info['next_reset_at']    = '';
@@ -566,6 +696,8 @@ class PressArk_Entitlements {
 			$info['raw_tokens_used']  = 0;
 			$info['tokens_used']      = 0;
 			$info['tokens_remaining'] = 0;
+			$info['billing_contract_hash'] = self::get_local_billing_contract_hash();
+			$info['billing_contract_mismatch'] = false;
 		}
 
 		if ( 'free' === $tier ) {

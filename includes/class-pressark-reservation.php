@@ -23,14 +23,15 @@ class PressArk_Reservation {
 	}
 
 	public function estimate_icus( string $message, array $conversation, string $tier = 'free', string $model = '' ): int {
-		$estimate   = $this->estimate_usage( $message, $conversation, $tier );
-		$model      = $model ?: PressArk_Model_Policy::resolve( $tier );
-		$multiplier = PressArk_Model_Policy::get_model_multiplier( $model );
+		$estimate = $this->estimate_usage( $message, $conversation, $tier );
+		$model    = $model ?: PressArk_Model_Policy::resolve( $tier );
+		$resolved = $this->token_bank->resolve_icus( array(
+			'model'         => $model,
+			'input_tokens'  => (int) ( $estimate['input_tokens'] ?? 0 ),
+			'output_tokens' => (int) ( $estimate['output_tokens'] ?? 0 ),
+		) );
 
-		return (int) ceil(
-			( $estimate['input_tokens'] * (int) ( $multiplier['input'] ?? 10 ) )
-			+ ( $estimate['output_tokens'] * (int) ( $multiplier['output'] ?? 30 ) )
-		);
+		return max( 0, (int) ( $resolved['icu_total'] ?? 0 ) );
 	}
 
 	public function reserve(
@@ -127,7 +128,14 @@ class PressArk_Reservation {
 
 		$this->ledger->settle( $reservation_id, $settle_payload );
 
-		return $bank_status;
+		return array_merge(
+			is_array( $bank_status ) ? $bank_status : array(),
+			array(
+				'actual_icus'      => (int) ( $bank_status['actual_icus'] ?? $settle_payload['actual_icus'] ?? 0 ),
+				'raw_actual_tokens' => (int) ( $bank_status['raw_actual_tokens'] ?? $settle_payload['actual_tokens'] ?? 0 ),
+				'actual_tokens'    => (int) ( $bank_status['actual_tokens'] ?? $settle_payload['actual_tokens'] ?? 0 ),
+			)
+		);
 	}
 
 	public function fail( string $reservation_id, string $reason = '' ): void {

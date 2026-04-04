@@ -22,6 +22,16 @@ class PressArk_Execution_Ledger {
 	private const MAX_RECEIPTS = 12;
 
 	/**
+	 * Valid task statuses.
+	 *
+	 * `done` is accepted on read for backward compatibility and normalized to
+	 * `completed` so callers only see the canonical set.
+	 *
+	 * @since 5.3.0
+	 */
+	private const VALID_STATUSES = array( 'pending', 'in_progress', 'completed', 'blocked', 'verified', 'uncertain' );
+
+	/**
 	 * Normalize and sanitize ledger data from storage.
 	 */
 	public static function sanitize( array $raw ): array {
@@ -32,15 +42,43 @@ class PressArk_Execution_Ledger {
 			}
 
 			$status = sanitize_key( $task['status'] ?? 'pending' );
-			if ( ! in_array( $status, array( 'pending', 'done' ), true ) ) {
+
+			// v5.3.0: Backward compat — normalize legacy `done` to `completed`.
+			if ( 'done' === $status ) {
+				$status = 'completed';
+			}
+			if ( ! in_array( $status, self::VALID_STATUSES, true ) ) {
 				$status = 'pending';
 			}
 
+			// v5.3.0: Sanitize depends_on edges.
+			$depends_on = array();
+			foreach ( (array) ( $task['depends_on'] ?? array() ) as $dep ) {
+				$dep = sanitize_key( (string) $dep );
+				if ( '' !== $dep ) {
+					$depends_on[] = $dep;
+				}
+			}
+
+			// v5.3.0: Sanitize metadata bag.
+			$metadata = array();
+			if ( is_array( $task['metadata'] ?? null ) ) {
+				foreach ( $task['metadata'] as $mk => $mv ) {
+					$mk = sanitize_key( (string) $mk );
+					if ( '' === $mk ) {
+						continue;
+					}
+					$metadata[ $mk ] = is_scalar( $mv ) ? $mv : wp_json_encode( $mv );
+				}
+			}
+
 			$tasks[] = array(
-				'key'      => sanitize_key( $task['key'] ?? '' ),
-				'label'    => sanitize_text_field( $task['label'] ?? '' ),
-				'status'   => $status,
-				'evidence' => sanitize_text_field( $task['evidence'] ?? '' ),
+				'key'        => sanitize_key( $task['key'] ?? '' ),
+				'label'      => sanitize_text_field( $task['label'] ?? '' ),
+				'status'     => $status,
+				'evidence'   => sanitize_text_field( $task['evidence'] ?? '' ),
+				'depends_on' => array_unique( array_slice( $depends_on, 0, self::MAX_TASKS ) ),
+				'metadata'   => $metadata,
 			);
 		}
 
@@ -50,13 +88,25 @@ class PressArk_Execution_Ledger {
 				continue;
 			}
 
-			$receipts[] = array(
+			$entry = array(
 				'tool'      => sanitize_key( $receipt['tool'] ?? '' ),
 				'summary'   => sanitize_text_field( $receipt['summary'] ?? '' ),
 				'post_id'   => absint( $receipt['post_id'] ?? 0 ),
 				'post_title'=> sanitize_text_field( $receipt['post_title'] ?? '' ),
 				'url'       => esc_url_raw( $receipt['url'] ?? '' ),
 			);
+
+			// v5.4.0: Preserve verification evidence attached by record_verification().
+			if ( is_array( $receipt['verification'] ?? null ) ) {
+				$v = $receipt['verification'];
+				$entry['verification'] = array(
+					'status'     => sanitize_key( $v['status'] ?? '' ),
+					'evidence'   => sanitize_text_field( $v['evidence'] ?? '' ),
+					'checked_at' => sanitize_text_field( $v['checked_at'] ?? '' ),
+				);
+			}
+
+			$receipts[] = $entry;
 		}
 
 		$request_counts = array();
@@ -135,11 +185,24 @@ class PressArk_Execution_Ledger {
 				continue;
 			}
 
-			if ( 'done' === $task['status'] ) {
-				$task_map[ $task['key'] ]['status'] = 'done';
+			// v5.3.0: Status priority — completed wins over any other state.
+			if ( 'completed' === $task['status'] ) {
+				$task_map[ $task['key'] ]['status'] = 'completed';
 				if ( ! empty( $task['evidence'] ) ) {
 					$task_map[ $task['key'] ]['evidence'] = $task['evidence'];
 				}
+			}
+
+			// Merge depends_on (union) and metadata (client wins per key).
+			if ( ! empty( $task['depends_on'] ) ) {
+				$existing_deps = $task_map[ $task['key'] ]['depends_on'] ?? array();
+				$task_map[ $task['key'] ]['depends_on'] = array_values( array_unique( array_merge( $existing_deps, $task['depends_on'] ) ) );
+			}
+			if ( ! empty( $task['metadata'] ) ) {
+				$task_map[ $task['key'] ]['metadata'] = array_merge(
+					$task_map[ $task['key'] ]['metadata'] ?? array(),
+					$task['metadata']
+				);
 			}
 		}
 		$merged['tasks'] = array_values( $task_map );
@@ -369,14 +432,32 @@ class PressArk_Execution_Ledger {
 			$lines[] = 'CURRENT TARGET: ' . $label;
 		}
 
-		$done    = self::task_labels( $ledger, 'done' );
-		$pending = self::task_labels( $ledger, 'pending' );
+		// v5.3.0: Resolve blocked states before building context.
+		$ledger  = self::resolve_blocked( $ledger );
+		$done      = self::task_labels( $ledger, 'completed' );
+		$active    = self::task_labels_by_status( $ledger, 'in_progress' );
+		$pending   = self::task_labels_by_status( $ledger, 'pending' );
+		$blocked   = self::task_labels_by_status( $ledger, 'blocked' );
+		$verified  = self::task_labels_by_status( $ledger, 'verified' );
+		$uncertain = self::task_labels_by_status( $ledger, 'uncertain' );
 
+		if ( ! empty( $verified ) ) {
+			$lines[] = 'VERIFIED TASKS: ' . implode( '; ', $verified );
+		}
 		if ( ! empty( $done ) ) {
 			$lines[] = 'COMPLETED TASKS: ' . implode( '; ', $done );
 		}
+		if ( ! empty( $active ) ) {
+			$lines[] = 'ACTIVE TASK: ' . implode( '; ', $active );
+		}
 		if ( ! empty( $pending ) ) {
 			$lines[] = 'REMAINING TASKS: ' . implode( '; ', $pending );
+		}
+		if ( ! empty( $blocked ) ) {
+			$lines[] = 'BLOCKED TASKS: ' . implode( '; ', $blocked );
+		}
+		if ( ! empty( $uncertain ) ) {
+			$lines[] = 'UNCERTAIN TASKS: ' . implode( '; ', $uncertain ) . ' — verify with a read tool before reporting completion.';
 		}
 		if ( self::should_scope_seo_to_current_target( $ledger ) ) {
 			$lines[] = 'SEO SCOPE: Optimize only the current target unless the user explicitly requested site-wide SEO.';
@@ -408,7 +489,8 @@ class PressArk_Execution_Ledger {
 			return '';
 		}
 
-		$done    = self::task_labels( $ledger, 'done' );
+		$ledger  = self::resolve_blocked( $ledger );
+		$done    = self::task_labels( $ledger, 'completed' );
 		$pending = self::task_labels( $ledger, 'pending' );
 		$target  = $ledger['current_target'];
 
@@ -451,20 +533,40 @@ class PressArk_Execution_Ledger {
 	 * Return a compact progress snapshot for continuation control.
 	 */
 	public static function progress_snapshot( array $ledger ): array {
-		$ledger           = self::sanitize( $ledger );
+		$ledger           = self::resolve_blocked( $ledger );
 		$completed_tasks  = array();
 		$remaining_tasks  = array();
+		$blocked_tasks    = array();
+		$in_progress      = array();
 		$next_task        = null;
 
+		$uncertain_tasks = array();
+
 		foreach ( $ledger['tasks'] as $task ) {
-			if ( 'done' === ( $task['status'] ?? '' ) ) {
+			$status = $task['status'] ?? '';
+
+			// v5.4.0: `verified` counts as completed; `uncertain` counts as remaining.
+			if ( in_array( $status, array( 'completed', 'verified' ), true ) ) {
 				$completed_tasks[] = $task;
 				continue;
 			}
 
 			$remaining_tasks[] = $task;
-			if ( null === $next_task ) {
-				$next_task = $task;
+
+			if ( 'blocked' === $status ) {
+				$blocked_tasks[] = $task;
+			} elseif ( 'uncertain' === $status ) {
+				$uncertain_tasks[] = $task;
+			} elseif ( 'in_progress' === $status ) {
+				$in_progress[] = $task;
+				if ( null === $next_task ) {
+					$next_task = $task;
+				}
+			} else {
+				// pending — candidate for next.
+				if ( null === $next_task ) {
+					$next_task = $task;
+				}
 			}
 		}
 
@@ -474,6 +576,9 @@ class PressArk_Execution_Ledger {
 			'total_tasks'        => count( $ledger['tasks'] ),
 			'completed_count'    => count( $completed_tasks ),
 			'remaining_count'    => count( $remaining_tasks ),
+			'blocked_count'      => count( $blocked_tasks ),
+			'uncertain_count'    => count( $uncertain_tasks ),
+			'in_progress_count'  => count( $in_progress ),
 			'completed_labels'   => array_values( array_filter( array_map(
 				fn( $task ) => sanitize_text_field( $task['label'] ?? '' ),
 				$completed_tasks
@@ -482,16 +587,167 @@ class PressArk_Execution_Ledger {
 				fn( $task ) => sanitize_text_field( $task['label'] ?? '' ),
 				$remaining_tasks
 			) ) ),
+			'blocked_labels'     => array_values( array_filter( array_map(
+				fn( $task ) => sanitize_text_field( $task['label'] ?? '' ),
+				$blocked_tasks
+			) ) ),
 			'next_task_key'      => sanitize_key( $next_task['key'] ?? '' ),
 			'next_task_label'    => sanitize_text_field( $next_task['label'] ?? '' ),
 			'is_complete'        => $is_complete,
-			'should_auto_resume' => ! $is_complete && ! empty( $remaining_tasks ),
+			'should_auto_resume' => ! $is_complete && ! empty( $remaining_tasks ) && count( $blocked_tasks ) < count( $remaining_tasks ),
 		);
 	}
 
 	public static function has_remaining_tasks( array $ledger ): bool {
 		$progress = self::progress_snapshot( $ledger );
 		return (int) ( $progress['remaining_count'] ?? 0 ) > 0;
+	}
+
+	// ── Task Graph: Dependency Resolution (v5.3.0) ──────────────────
+
+	/**
+	 * Resolve blocked status from dependency edges.
+	 *
+	 * A task is `blocked` when any key in its `depends_on` array references a
+	 * task that is not yet `completed`. Blocked tasks that become unblocked are
+	 * returned to `pending`. This is a pure function — it returns a new ledger.
+	 *
+	 * @since 5.3.0
+	 */
+	public static function resolve_blocked( array $ledger ): array {
+		$ledger = self::sanitize( $ledger );
+		if ( empty( $ledger['tasks'] ) ) {
+			return $ledger;
+		}
+
+		// Build a set of completed task keys (verified counts as completed).
+		$completed_keys = array();
+		foreach ( $ledger['tasks'] as $task ) {
+			if ( in_array( $task['status'], array( 'completed', 'verified' ), true ) ) {
+				$completed_keys[ $task['key'] ] = true;
+			}
+		}
+
+		foreach ( $ledger['tasks'] as &$task ) {
+			// Don't touch completed, verified, uncertain, or in_progress tasks.
+			if ( in_array( $task['status'], array( 'completed', 'verified', 'uncertain', 'in_progress' ), true ) ) {
+				continue;
+			}
+
+			$deps = $task['depends_on'] ?? array();
+			if ( empty( $deps ) ) {
+				// No deps — should be pending, not blocked.
+				if ( 'blocked' === $task['status'] ) {
+					$task['status'] = 'pending';
+				}
+				continue;
+			}
+
+			$all_met = true;
+			foreach ( $deps as $dep_key ) {
+				if ( empty( $completed_keys[ $dep_key ] ) ) {
+					$all_met = false;
+					break;
+				}
+			}
+
+			$task['status'] = $all_met ? 'pending' : 'blocked';
+		}
+		unset( $task );
+
+		return $ledger;
+	}
+
+	/**
+	 * Mark a task as in_progress.
+	 *
+	 * @since 5.3.0
+	 */
+	public static function mark_task_in_progress( array $ledger, string $key ): array {
+		$ledger = self::sanitize( $ledger );
+		$key    = sanitize_key( $key );
+
+		foreach ( $ledger['tasks'] as &$task ) {
+			if ( $key === ( $task['key'] ?? '' ) && 'pending' === $task['status'] ) {
+				$task['status'] = 'in_progress';
+				break;
+			}
+		}
+		unset( $task );
+
+		$ledger['updated_at'] = gmdate( 'c' );
+		return $ledger;
+	}
+
+	/**
+	 * Create a task with dependency edges.
+	 *
+	 * @since 5.3.0
+	 *
+	 * @param array    $ledger     Current ledger.
+	 * @param string   $key        Task key.
+	 * @param string   $label      Human-readable label.
+	 * @param string[] $depends_on Keys of tasks this one depends on.
+	 * @param array    $metadata   Optional metadata bag.
+	 * @return array Updated ledger.
+	 */
+	public static function add_task( array $ledger, string $key, string $label, array $depends_on = array(), array $metadata = array() ): array {
+		$ledger = self::sanitize( $ledger );
+		$key    = sanitize_key( $key );
+
+		// Don't add duplicates.
+		foreach ( $ledger['tasks'] as $task ) {
+			if ( $key === ( $task['key'] ?? '' ) ) {
+				return $ledger;
+			}
+		}
+
+		$deps = array();
+		foreach ( $depends_on as $dep ) {
+			$dep = sanitize_key( (string) $dep );
+			if ( '' !== $dep ) {
+				$deps[] = $dep;
+			}
+		}
+
+		$ledger['tasks'][] = array(
+			'key'        => $key,
+			'label'      => sanitize_text_field( $label ),
+			'status'     => empty( $deps ) ? 'pending' : 'blocked',
+			'evidence'   => '',
+			'depends_on' => array_unique( array_slice( $deps, 0, self::MAX_TASKS ) ),
+			'metadata'   => $metadata,
+		);
+		$ledger['tasks']   = array_slice( self::dedupe_tasks( $ledger['tasks'] ), 0, self::MAX_TASKS );
+		$ledger['updated_at'] = gmdate( 'c' );
+
+		return self::resolve_blocked( $ledger );
+	}
+
+	/**
+	 * Get the next actionable task — first `in_progress`, then first `pending`.
+	 *
+	 * @since 5.3.0
+	 * @return array|null Task array or null if none actionable.
+	 */
+	public static function next_actionable_task( array $ledger ): ?array {
+		$ledger = self::resolve_blocked( $ledger );
+
+		// Prefer already in-progress task.
+		foreach ( $ledger['tasks'] as $task ) {
+			if ( 'in_progress' === $task['status'] ) {
+				return $task;
+			}
+		}
+
+		// Then first pending.
+		foreach ( $ledger['tasks'] as $task ) {
+			if ( 'pending' === $task['status'] ) {
+				return $task;
+			}
+		}
+
+		return null;
 	}
 
 	/**
@@ -618,30 +874,191 @@ class PressArk_Execution_Ledger {
 		);
 	}
 
+	// ── Verification (v5.4.0) ──────────────────────────────────────────
+
+	/**
+	 * Record a verification result for a write tool.
+	 *
+	 * Finds the most recent receipt matching the tool, attaches evidence,
+	 * and updates the corresponding task status to `verified` or `uncertain`.
+	 *
+	 * @since 5.4.0
+	 *
+	 * @param array  $ledger          Current ledger.
+	 * @param string $tool_name       The write tool that was verified.
+	 * @param array  $readback_result Read-back tool result.
+	 * @param bool   $passed          Whether verification passed.
+	 * @param string $evidence        Compact human-readable evidence string.
+	 * @return array Updated ledger.
+	 */
+	public static function record_verification( array $ledger, string $tool_name, array $readback_result, bool $passed, string $evidence = '' ): array {
+		$ledger    = self::sanitize( $ledger );
+		$tool_name = sanitize_key( $tool_name );
+		$evidence  = sanitize_text_field( $evidence );
+		$new_status = $passed ? 'verified' : 'uncertain';
+
+		// Attach evidence to the most recent matching receipt.
+		$found_receipt = false;
+		for ( $i = count( $ledger['receipts'] ) - 1; $i >= 0; $i-- ) {
+			if ( $tool_name === ( $ledger['receipts'][ $i ]['tool'] ?? '' ) ) {
+				$ledger['receipts'][ $i ]['verification'] = array(
+					'status'   => $new_status,
+					'evidence' => $evidence,
+					'checked_at' => gmdate( 'c' ),
+				);
+				$found_receipt = true;
+				break;
+			}
+		}
+
+		// If no receipt found, append a verification-only receipt.
+		if ( ! $found_receipt ) {
+			$ledger['receipts'][] = array(
+				'tool'         => $tool_name,
+				'summary'      => $evidence ?: ( $tool_name . ' verification: ' . $new_status ),
+				'post_id'      => 0,
+				'post_title'   => '',
+				'url'          => '',
+				'verification' => array(
+					'status'     => $new_status,
+					'evidence'   => $evidence,
+					'checked_at' => gmdate( 'c' ),
+				),
+			);
+			$ledger['receipts'] = array_slice( $ledger['receipts'], -self::MAX_RECEIPTS );
+		}
+
+		// Update the matching task status if we can find one.
+		// Map tool names to task keys for common write patterns.
+		$task_key_map = array(
+			'create_post'            => 'create_post',
+			'elementor_create_page'  => 'create_post',
+			'edit_content'           => 'fulfill_request',
+			'fix_seo'               => 'optimize_seo',
+			'update_meta'           => 'optimize_seo',
+		);
+		$task_key = $task_key_map[ $tool_name ] ?? '';
+
+		if ( $task_key ) {
+			foreach ( $ledger['tasks'] as &$task ) {
+				if ( $task_key === ( $task['key'] ?? '' ) && in_array( $task['status'], array( 'completed', 'in_progress' ), true ) ) {
+					$task['status']   = $new_status;
+					$task['evidence'] = $evidence ?: $task['evidence'];
+					break;
+				}
+			}
+			unset( $task );
+		}
+
+		$ledger['updated_at'] = gmdate( 'c' );
+		return $ledger;
+	}
+
+	/**
+	 * Get a compact verification summary for continuation prompts.
+	 *
+	 * @since 5.4.0
+	 * @return array{verified: int, uncertain: int, unverified: int, details: string[]}
+	 */
+	public static function verification_summary( array $ledger ): array {
+		$ledger     = self::sanitize( $ledger );
+		$verified   = 0;
+		$uncertain  = 0;
+		$unverified = 0;
+		$details    = array();
+
+		foreach ( $ledger['receipts'] as $receipt ) {
+			$v_status = $receipt['verification']['status'] ?? '';
+			if ( 'verified' === $v_status ) {
+				$verified++;
+				$evidence = $receipt['verification']['evidence'] ?? '';
+				if ( $evidence ) {
+					$details[] = $receipt['tool'] . ': VERIFIED — ' . $evidence;
+				}
+			} elseif ( 'uncertain' === $v_status ) {
+				$uncertain++;
+				$evidence = $receipt['verification']['evidence'] ?? '';
+				$details[] = $receipt['tool'] . ': UNCERTAIN' . ( $evidence ? ' — ' . $evidence : '' );
+			} else {
+				// Write receipt with no verification.
+				$op = PressArk_Operation_Registry::resolve( $receipt['tool'] ?? '' );
+				if ( $op && $op->is_write() ) {
+					$unverified++;
+				}
+			}
+		}
+
+		return array(
+			'verified'   => $verified,
+			'uncertain'  => $uncertain,
+			'unverified' => $unverified,
+			'details'    => $details,
+		);
+	}
+
+	/**
+	 * Whether all write tasks in the ledger are in `verified` status.
+	 *
+	 * Returns true when there are no uncertain or unverified write receipts.
+	 * Ledgers with no write receipts also return true (nothing to verify).
+	 *
+	 * @since 5.4.0
+	 */
+	public static function is_fully_verified( array $ledger ): bool {
+		$summary = self::verification_summary( $ledger );
+		return 0 === $summary['uncertain'] && 0 === $summary['unverified'];
+	}
+
 	private static function extract_tasks( string $message ): array {
 		$msg   = strtolower( $message );
 		$tasks = array();
 
+		// v5.3.0: Tasks now carry dependency edges. We track which keys have been
+		// added so later tasks can declare depends_on references.
+		$added_keys = array();
+
 		if ( preg_match( '/\b(random|pick|select|choose)\b.*\bproduct\b/', $msg ) ) {
-			$tasks[] = self::task( 'select_source', 'Select a source product to feature' );
+			$tasks[]      = self::task( 'select_source', 'Select a source product to feature' );
+			$added_keys[] = 'select_source';
 		}
 
 		if ( preg_match( '/\b(create|write|draft|generate|compose|publish)\b.*\b(blog post|post|article|page)\b/', $msg )
 			|| preg_match( '/\bblog post\b/', $msg ) ) {
-			$tasks[] = self::task( 'create_post', 'Create the requested blog post or page' );
+			// create_post depends on select_source if present.
+			$deps         = in_array( 'select_source', $added_keys, true ) ? array( 'select_source' ) : array();
+			$tasks[]      = self::task( 'create_post', 'Create the requested blog post or page', $deps );
+			$added_keys[] = 'create_post';
 		}
 
 		if ( preg_match( '/\b(call to action|cta)\b/', $msg )
 			|| preg_match( '/\b(link|url)\b.*\bproduct\b/', $msg ) ) {
-			$tasks[] = self::task( 'add_cta', 'Add a call to action with the requested link' );
+			// CTA depends on create_post if present.
+			$deps         = in_array( 'create_post', $added_keys, true ) ? array( 'create_post' ) : array();
+			$tasks[]      = self::task( 'add_cta', 'Add a call to action with the requested link', $deps );
+			$added_keys[] = 'add_cta';
 		}
 
 		if ( preg_match( '/\bseo\b|\bmeta\b|\bslug\b|\bsearch engine\b|\brank\b/', $msg ) ) {
-			$tasks[] = self::task( 'optimize_seo', 'Optimize the content for SEO' );
+			// SEO depends on create_post if present.
+			$deps         = in_array( 'create_post', $added_keys, true ) ? array( 'create_post' ) : array();
+			$tasks[]      = self::task( 'optimize_seo', 'Optimize the content for SEO', $deps );
+			$added_keys[] = 'optimize_seo';
 		}
 
 		if ( preg_match( '/\bpublish\b|\blive\b/', $msg ) ) {
-			$tasks[] = self::task( 'publish_content', 'Publish the content' );
+			// Publish depends on create_post (and optionally SEO/CTA if present).
+			$deps = array();
+			if ( in_array( 'create_post', $added_keys, true ) ) {
+				$deps[] = 'create_post';
+			}
+			if ( in_array( 'optimize_seo', $added_keys, true ) ) {
+				$deps[] = 'optimize_seo';
+			}
+			if ( in_array( 'add_cta', $added_keys, true ) ) {
+				$deps[] = 'add_cta';
+			}
+			$tasks[]      = self::task( 'publish_content', 'Publish the content', $deps );
+			$added_keys[] = 'publish_content';
 		}
 
 		if ( empty( $tasks ) ) {
@@ -720,12 +1137,14 @@ class PressArk_Execution_Ledger {
 			&& empty( $target['url'] ?? '' );
 	}
 
-	private static function task( string $key, string $label ): array {
+	private static function task( string $key, string $label, array $depends_on = array(), array $metadata = array() ): array {
 		return array(
-			'key'      => sanitize_key( $key ),
-			'label'    => sanitize_text_field( $label ),
-			'status'   => 'pending',
-			'evidence' => '',
+			'key'        => sanitize_key( $key ),
+			'label'      => sanitize_text_field( $label ),
+			'status'     => empty( $depends_on ) ? 'pending' : 'blocked',
+			'evidence'   => '',
+			'depends_on' => $depends_on,
+			'metadata'   => $metadata,
 		);
 	}
 
@@ -758,9 +1177,11 @@ class PressArk_Execution_Ledger {
 			if ( $key !== ( $task['key'] ?? '' ) ) {
 				continue;
 			}
-			$task['status']   = 'done';
+			$task['status']   = 'completed';
 			$task['evidence'] = sanitize_text_field( $evidence );
-			return $ledger;
+
+			// v5.3.0: Completing a task may unblock dependents.
+			return self::resolve_blocked( $ledger );
 		}
 		unset( $task );
 
@@ -769,15 +1190,53 @@ class PressArk_Execution_Ledger {
 	}
 
 	private static function task_labels( array $ledger, string $status ): array {
+		// v5.3.0: Accept legacy `done` as alias for `completed`.
+		// v5.4.0: 'verified' counts as completed for task label queries.
+		$match_statuses = array( $status );
+		if ( 'done' === $status ) {
+			$match_statuses[] = 'completed';
+			$match_statuses[] = 'verified';
+		} elseif ( 'completed' === $status ) {
+			$match_statuses[] = 'done';
+			$match_statuses[] = 'verified';
+		} elseif ( 'pending' === $status ) {
+			$match_statuses[] = 'uncertain';
+		}
+
+		$labels = array();
+		foreach ( $ledger['tasks'] as $task ) {
+			if ( ! in_array( $task['status'] ?? '', $match_statuses, true ) ) {
+				continue;
+			}
+			$label = $task['label'] ?? '';
+			if ( in_array( $task['status'] ?? '', array( 'done', 'completed' ), true ) && ! empty( $task['evidence'] ) ) {
+				$label .= ' (' . $task['evidence'] . ')';
+			}
+			if ( 'blocked' === ( $task['status'] ?? '' ) ) {
+				$label .= ' [blocked]';
+			}
+			if ( 'in_progress' === ( $task['status'] ?? '' ) ) {
+				$label .= ' [active]';
+			}
+			if ( $label ) {
+				$labels[] = $label;
+			}
+		}
+		return $labels;
+	}
+
+	/**
+	 * Get task labels for a single exact status (no aliasing).
+	 *
+	 * @since 5.3.0
+	 */
+	private static function task_labels_by_status( array $ledger, string $status ): array {
 		$labels = array();
 		foreach ( $ledger['tasks'] as $task ) {
 			if ( $status !== ( $task['status'] ?? '' ) ) {
 				continue;
 			}
 			$label = $task['label'] ?? '';
-			if ( 'done' === $status && ! empty( $task['evidence'] ) ) {
-				$label .= ' (' . $task['evidence'] . ')';
-			}
 			if ( $label ) {
 				$labels[] = $label;
 			}
@@ -958,8 +1417,10 @@ class PressArk_Execution_Ledger {
 	}
 
 	private static function is_seo_task_complete( array $ledger ): bool {
+		// v5.4.0: 'verified' counts as completed.
+		$done_statuses = array( 'done', 'completed', 'verified' );
 		foreach ( $ledger['tasks'] as $task ) {
-			if ( 'optimize_seo' === ( $task['key'] ?? '' ) && 'done' === ( $task['status'] ?? '' ) ) {
+			if ( 'optimize_seo' === ( $task['key'] ?? '' ) && in_array( $task['status'] ?? '', $done_statuses, true ) ) {
 				return true;
 			}
 		}
@@ -969,8 +1430,10 @@ class PressArk_Execution_Ledger {
 
 	private static function has_pending_task( array $ledger, string $key ): bool {
 		$key = sanitize_key( $key );
+		// v5.4.0: 'verified' counts as completed (not pending).
+		$done_statuses = array( 'done', 'completed', 'verified' );
 		foreach ( $ledger['tasks'] as $task ) {
-			if ( $key === ( $task['key'] ?? '' ) && 'done' !== ( $task['status'] ?? '' ) ) {
+			if ( $key === ( $task['key'] ?? '' ) && ! in_array( $task['status'] ?? '', $done_statuses, true ) ) {
 				return true;
 			}
 		}

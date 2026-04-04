@@ -271,6 +271,46 @@ PROMPT;
 	}
 
 	/**
+	 * Get the conservative planning context window for the active model/provider.
+	 *
+	 * @since 5.4.0
+	 * @return int
+	 */
+	public function get_context_window(): int {
+		return PressArk_Model_Policy::context_window( $this->model, $this->provider );
+	}
+
+	/**
+	 * Build a token budget manager for the active request context.
+	 *
+	 * @since 5.4.0
+	 * @param array $args Optional overrides.
+	 * @return PressArk_Token_Budget_Manager
+	 */
+	public function build_token_budget_manager( array $args = array() ): PressArk_Token_Budget_Manager {
+		$bank = null;
+		if ( ! array_key_exists( 'provider', $args ) ) {
+			$args['provider'] = $this->provider;
+		}
+		if ( ! array_key_exists( 'model', $args ) ) {
+			$args['model'] = $this->model;
+		}
+		if ( ! array_key_exists( 'stable_prefix', $args ) ) {
+			$args['stable_prefix'] = $this->build_cached_system_prompt();
+		}
+		if ( ! array_key_exists( 'financial_snapshot', $args ) ) {
+			$bank = $bank ?: new PressArk_Token_Bank();
+			$args['financial_snapshot'] = $bank->get_financial_snapshot();
+		}
+		if ( ! array_key_exists( 'multiplier_config', $args ) ) {
+			$bank = $bank ?: new PressArk_Token_Bank();
+			$args['multiplier_config'] = $bank->get_multipliers();
+		}
+
+		return new PressArk_Token_Budget_Manager( $args );
+	}
+
+	/**
 	 * Get the current tier.
 	 *
 	 * @since 5.0.0
@@ -1066,6 +1106,66 @@ FSEPROMPT;
 	}
 
 	/**
+	 * Join prompt sections in a stable, cache-friendly order.
+	 *
+	 * Empty sections are dropped so callers can build prompts compositionally
+	 * without adding conditional separator noise.
+	 *
+	 * @param array $sections Ordered prompt section strings.
+	 * @return string
+	 */
+	public static function join_prompt_sections( array $sections ): string {
+		$parts = array();
+
+		foreach ( $sections as $section ) {
+			if ( is_array( $section ) ) {
+				$section = (string) ( $section['content'] ?? '' );
+			}
+			if ( ! is_string( $section ) ) {
+				continue;
+			}
+
+			$section = trim( $section );
+			if ( '' !== $section ) {
+				$parts[] = $section;
+			}
+		}
+
+		return trim( implode( "\n\n", $parts ) );
+	}
+
+	/**
+	 * Build the stable prefix-cached system prompt sections.
+	 *
+	 * These are the per-site instructions that rarely change and are worth
+	 * keeping byte-stable for provider prompt caches.
+	 *
+	 * IMPORTANT: No per-request data here (user, screen, conversation).
+	 * Those stay in the dynamic round prompt built by the agent.
+	 *
+	 * @return string[]
+	 */
+	private function get_cached_system_prompt_sections(): array {
+		$blocks        = array( PressArk_Skills::core() );
+		$has_woo       = class_exists( 'WooCommerce' );
+		$has_elementor = defined( 'ELEMENTOR_VERSION' );
+
+		if ( $has_woo ) {
+			$blocks[] = PressArk_Skills::woocommerce();
+		}
+		if ( $has_elementor ) {
+			$blocks[] = PressArk_Skills::elementor();
+		}
+
+		$blocks[] = PressArk_Skills::reference();
+
+		return array(
+			self::SYSTEM_PROMPT_BASE . self::SYSTEM_PROMPT_AGENT_CORE,
+			"## Domain Knowledge\n" . implode( "\n\n---\n\n", $blocks ),
+		);
+	}
+
+	/**
 	 * Build the static cacheable system prompt block.
 	 *
 	 * v3.6.0: Conditional injection based on site configuration.
@@ -1080,6 +1180,7 @@ FSEPROMPT;
 	 * @return string The complete static system prompt.
 	 */
 	public function build_cached_system_prompt(): string {
+		return self::join_prompt_sections( $this->get_cached_system_prompt_sections() );
 		// ── Core (always present) ──
 		$prompt = self::SYSTEM_PROMPT_BASE . self::SYSTEM_PROMPT_AGENT_CORE;
 
@@ -1547,11 +1648,46 @@ AUTOMATION;
 	 */
 	public function build_assistant_message( array $raw_response, string $provider ): array {
 		if ( 'anthropic' === $provider ) {
-			// Anthropic: assistant message content = array of text + tool_use blocks.
-			return array(
-				'role'    => 'assistant',
-				'content' => $raw_response['content'] ?? array(),
-			);
+			$text       = '';
+			$tool_calls = array();
+
+			foreach ( $raw_response['content'] ?? array() as $block ) {
+				if ( ! is_array( $block ) ) {
+					continue;
+				}
+
+				$type = sanitize_key( (string) ( $block['type'] ?? '' ) );
+				if ( 'text' === $type ) {
+					$text .= (string) ( $block['text'] ?? '' );
+					continue;
+				}
+
+				if ( 'tool_use' === $type ) {
+					$tool_calls[] = array(
+						'id'       => (string) ( $block['id'] ?? '' ),
+						'type'     => 'function',
+						'function' => array(
+							'name'      => sanitize_key( (string) ( $block['name'] ?? '' ) ),
+							'arguments' => wp_json_encode(
+								is_array( $block['input'] ?? null ) ? $block['input'] : array(),
+								JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES
+							),
+						),
+					);
+				}
+			}
+
+			$message = array( 'role' => 'assistant' );
+			if ( '' !== $text || empty( $tool_calls ) ) {
+				$message['content'] = $text;
+			} else {
+				$message['content'] = null;
+			}
+			if ( ! empty( $tool_calls ) ) {
+				$message['tool_calls'] = $tool_calls;
+			}
+
+			return $message;
 		}
 
 		// OpenAI / OpenRouter / DeepSeek.
@@ -1579,23 +1715,9 @@ AUTOMATION;
 	 * @return array Single message or { __multi: true, messages: array }.
 	 */
 	public function build_tool_result_message( array $tool_results, string $provider ): array {
-		if ( 'anthropic' === $provider ) {
-			// Anthropic: ALL results in ONE user message with content array.
-			$content = array();
-			foreach ( $tool_results as $tr ) {
-				$content[] = array(
-					'type'        => 'tool_result',
-					'tool_use_id' => $tr['tool_use_id'],
-					'content'     => is_string( $tr['result'] )
-						? $tr['result']
-						: wp_json_encode( $tr['result'] ),
-				);
-			}
-			return array( 'role' => 'user', 'content' => $content );
-		}
-
-		// OpenAI / OpenRouter / DeepSeek.
-		// Each result is a separate message with role 'tool'.
+		// Canonical transcript form keeps tool results as role=tool messages.
+		// Anthropic requests convert these back to tool_result blocks during
+		// request building so replay state can stay provider-neutral.
 		$messages = array();
 		foreach ( $tool_results as $tr ) {
 			$messages[] = array(
@@ -2036,6 +2158,50 @@ AUTOMATION;
 						'content' => array( $tool_result_block ),
 					);
 				}
+			} elseif ( 'assistant' === $role && ! empty( $msg['tool_calls'] ) && is_array( $msg['tool_calls'] ) ) {
+				$content = array();
+				$text    = $msg['content'] ?? null;
+
+				if ( is_string( $text ) && '' !== trim( $text ) ) {
+					$content[] = array(
+						'type' => 'text',
+						'text' => $text,
+					);
+				}
+
+				foreach ( $msg['tool_calls'] as $call ) {
+					if ( ! is_array( $call ) ) {
+						continue;
+					}
+
+					$function = is_array( $call['function'] ?? null ) ? $call['function'] : array();
+					$name     = $function['name'] ?? '';
+					$id       = $call['id'] ?? '';
+					if ( '' === $name || '' === $id ) {
+						continue;
+					}
+
+					$args = $function['arguments'] ?? '{}';
+					if ( is_string( $args ) ) {
+						$decoded = json_decode( $args, true );
+						$args    = JSON_ERROR_NONE === json_last_error() && is_array( $decoded ) ? $decoded : array();
+					}
+					if ( ! is_array( $args ) ) {
+						$args = array();
+					}
+
+					$content[] = array(
+						'type'  => 'tool_use',
+						'id'    => (string) $id,
+						'name'  => (string) $name,
+						'input' => $args,
+					);
+				}
+
+				$api_messages[] = array(
+					'role'    => 'assistant',
+					'content' => $content,
+				);
 			} elseif ( in_array( $role, array( 'user', 'assistant' ), true ) ) {
 				$api_messages[] = array(
 					'role'    => $role,

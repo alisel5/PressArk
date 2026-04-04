@@ -211,15 +211,12 @@ class PressArk_Token_Bank {
 		$response = $this->post(
 			'reserve',
 			array(
-				'site_domain'    => $this->site_domain(),
-				'user_id'        => $this->user_id(),
-				'icus_requested' => $estimated_icus,
+				'site_domain'      => $this->site_domain(),
+				'user_id'          => $this->user_id(),
+				'icus_requested'   => $estimated_icus,
 				'tokens_requested' => $estimated_icus,
-				'reservation_id' => $reservation_id,
-				'tier'           => PressArk_Entitlements::normalize_tier( $tier ),
-				'icu_budget'     => PressArk_Entitlements::icu_budget( $tier ),
-				'tokens_limit'   => PressArk_Entitlements::token_budget( $tier ),
-				'model'          => $model,
+				'reservation_id'   => $reservation_id,
+				'model'            => $model,
 			),
 			5
 		);
@@ -242,9 +239,6 @@ class PressArk_Token_Bank {
 					'icus_requested'   => $estimated_icus,
 					'tokens_requested' => $estimated_icus,
 					'reservation_id'   => $reservation_id,
-					'tier'             => PressArk_Entitlements::normalize_tier( $tier ),
-					'icu_budget'       => PressArk_Entitlements::icu_budget( $tier ),
-					'tokens_limit'     => PressArk_Entitlements::token_budget( $tier ),
 					'model'            => $model,
 				),
 				5
@@ -325,9 +319,6 @@ class PressArk_Token_Bank {
 				'output_tokens'     => (int) ( $payload['output_tokens'] ?? 0 ),
 				'cache_read_tokens' => (int) ( $payload['cache_read_tokens'] ?? 0 ),
 				'cache_write_tokens'=> (int) ( $payload['cache_write_tokens'] ?? 0 ),
-				'tier'              => PressArk_Entitlements::normalize_tier( $tier ),
-				'icu_budget'        => PressArk_Entitlements::icu_budget( $tier ),
-				'tokens_limit'      => PressArk_Entitlements::token_budget( $tier ),
 				'model'             => (string) ( $payload['model'] ?? '' ),
 			),
 			5
@@ -370,16 +361,15 @@ class PressArk_Token_Bank {
 			return $this->normalize_status( is_array( $cached ) ? $cached : array() );
 		}
 
-		$tier = $this->get_current_tier();
-		$data = $this->fetch_status( $tier );
+		$data = $this->fetch_status();
 
 		// Auto-heal: if the bank says we're unregistered, register and retry once.
 		if ( isset( $data['error']['code'] ) && 'unregistered_site' === $data['error']['code'] ) {
-			$this->register_site( $tier );
-			$data = $this->fetch_status( $tier );
+			$this->register_site();
+			$data = $this->fetch_status();
 		}
 
-		$data = $this->normalize_status( is_array( $data ) ? $data : array(), $tier );
+		$data = $this->normalize_status( is_array( $data ) ? $data : array() );
 
 		if ( $data ) {
 			$this->cache_status( $data );
@@ -393,7 +383,7 @@ class PressArk_Token_Bank {
 	 *
 	 * @since 5.0.0
 	 */
-	private function fetch_status( string $tier ): array {
+	private function fetch_status(): array {
 		// Ensure we have a token before hitting the bank.
 		$this->ensure_handshaked();
 
@@ -406,9 +396,6 @@ class PressArk_Token_Bank {
 				'site_domain'       => $this->site_domain(),
 				'installation_uuid' => $this->installation_uuid(),
 				'user_id'           => $this->user_id(),
-				'tier'              => $tier,
-				'icu_budget'        => PressArk_Entitlements::icu_budget( $tier ),
-				'tokens_limit'      => PressArk_Entitlements::token_budget( $tier ),
 			),
 			trailingslashit( $this->server_url ) . 'check'
 		);
@@ -493,16 +480,99 @@ class PressArk_Token_Bank {
 		);
 	}
 
-	public function purchase_credits( int $user_id, string $pack_type, string $payment_id, string $tier = '' ): array {
-		$tier = $tier ?: $this->get_current_tier();
+	public function get_billing_catalog( bool $force_refresh = false ): array {
+		$cache_key = 'pressark_bank_billing_catalog';
 
+		if ( ! $force_refresh ) {
+			$cached = get_transient( $cache_key );
+			if ( is_array( $cached ) ) {
+				return $cached;
+			}
+		}
+
+		$this->ensure_handshaked();
+		if ( ! $this->site_token ) {
+			return array();
+		}
+
+		$response = wp_remote_get(
+			trailingslashit( $this->server_url ) . 'catalog',
+			array(
+				'timeout' => 5,
+				'headers' => $this->auth_headers(),
+			)
+		);
+
+		if ( is_wp_error( $response ) ) {
+			return array();
+		}
+
+		$data = json_decode( wp_remote_retrieve_body( $response ), true );
+		$data = $this->normalize_billing_catalog( is_array( $data ) ? $data : array() );
+		if ( ! empty( $data ) ) {
+			set_transient( $cache_key, $data, DAY_IN_SECONDS );
+		}
+
+		return $data;
+	}
+
+	public function get_financial_snapshot(): array {
+		if ( $this->is_byok() ) {
+			return array(
+				'billing_authority'       => 'byok',
+				'verified_handshake'      => (bool) get_option( 'pressark_handshake_verified', false ),
+				'provisional_handshake'   => ! (bool) get_option( 'pressark_handshake_verified', false ),
+				'monthly_icu_budget'      => 0,
+				'monthly_included_icu_budget' => 0,
+				'monthly_remaining'       => PHP_INT_MAX,
+				'monthly_included_remaining' => PHP_INT_MAX,
+				'credits_remaining'       => 0,
+				'purchased_credits_remaining' => 0,
+				'legacy_bonus_remaining'  => 0,
+				'total_available'         => PHP_INT_MAX,
+				'total_remaining'         => PHP_INT_MAX,
+				'spendable_credits_remaining' => PHP_INT_MAX,
+				'spendable_icus_remaining' => PHP_INT_MAX,
+				'using_purchased_credits' => false,
+				'using_legacy_bonus'      => false,
+				'budget_pressure_state'   => 'normal',
+				'is_byok'                 => true,
+			);
+		}
+
+		$status = $this->get_status();
+		return array(
+			'billing_authority'           => (string) ( $status['billing_authority'] ?? $this->local_billing_authority( ! empty( $status['offline'] ) ) ),
+			'verified_handshake'          => (bool) get_option( 'pressark_handshake_verified', false ),
+			'provisional_handshake'       => ! (bool) get_option( 'pressark_handshake_verified', false ),
+			'billing_tier'                => (string) ( $status['tier'] ?? $this->get_current_tier() ),
+			'monthly_icu_budget'          => (int) ( $status['monthly_icu_budget'] ?? $status['icu_budget'] ?? 0 ),
+			'monthly_included_icu_budget' => (int) ( $status['monthly_included_icu_budget'] ?? $status['monthly_icu_budget'] ?? $status['icu_budget'] ?? 0 ),
+			'monthly_remaining'           => (int) ( $status['monthly_remaining'] ?? $status['monthly_included_remaining'] ?? 0 ),
+			'monthly_included_remaining'  => (int) ( $status['monthly_included_remaining'] ?? $status['monthly_remaining'] ?? 0 ),
+			'credits_remaining'           => (int) ( $status['credits_remaining'] ?? $status['purchased_credits_remaining'] ?? 0 ),
+			'purchased_credits_remaining' => (int) ( $status['purchased_credits_remaining'] ?? $status['credits_remaining'] ?? 0 ),
+			'legacy_bonus_remaining'      => (int) ( $status['legacy_bonus_remaining'] ?? 0 ),
+			'total_available'             => (int) ( $status['total_available'] ?? 0 ),
+			'total_remaining'             => (int) ( $status['total_remaining'] ?? 0 ),
+			'spendable_credits_remaining' => (int) ( $status['spendable_credits_remaining'] ?? $status['total_remaining'] ?? 0 ),
+			'spendable_icus_remaining'    => (int) ( $status['spendable_icus_remaining'] ?? $status['total_remaining'] ?? 0 ),
+			'using_purchased_credits'     => ! empty( $status['using_purchased_credits'] ),
+			'using_legacy_bonus'          => ! empty( $status['using_legacy_bonus'] ),
+			'budget_pressure_state'       => (string) ( $status['budget_pressure_state'] ?? 'normal' ),
+			'is_byok'                     => false,
+			'offline'                     => ! empty( $status['offline'] ),
+		);
+	}
+
+	public function purchase_credits( int $user_id, string $pack_type, string $payment_id, string $tier = '' ): array {
+		unset( $tier );
 		$response = $this->post(
 			'purchase-credits',
 			array(
 				'site_domain' => $this->site_domain(),
 				'user_id'     => $user_id,
 				'pack_type'   => $pack_type,
-				'tier'        => PressArk_Entitlements::normalize_tier( $tier ),
 				'payment_id'  => $payment_id,
 			),
 			5
@@ -570,9 +640,6 @@ class PressArk_Token_Bank {
 				'user_id'     => $this->user_id(),
 				'icus_used'   => $icus_used,
 				'tokens_used' => $icus_used,
-				'tier'        => PressArk_Entitlements::normalize_tier( $tier ),
-				'icu_budget'  => PressArk_Entitlements::icu_budget( $tier ),
-				'tokens_limit'=> PressArk_Entitlements::token_budget( $tier ),
 			),
 			3
 		);
@@ -650,12 +717,10 @@ class PressArk_Token_Bank {
 			array(
 				'site_domain'    => $this->site_domain(),
 				'user_id'        => $this->user_id(),
-				'tier'           => PressArk_Entitlements::normalize_tier( $tier ),
 				'model'          => $model,
 				'provider'       => $provider,
 				'stream'         => false,
 				'estimated_icus' => $estimated_icus,
-				'icu_budget'     => PressArk_Entitlements::icu_budget( $tier ),
 				'request_body'   => $request_body,
 			),
 			$timeout
@@ -787,26 +852,38 @@ class PressArk_Token_Bank {
 		$limit = PressArk_Entitlements::icu_budget( $tier );
 
 		return array(
-			'icus_used'         => 0,
-			'icus_reserved'     => 0,
-			'icu_budget'        => $limit,
-			'icus_remaining'    => $limit,
-			'credits_remaining' => 0,
-			'total_available'   => $limit,
-			'total_remaining'   => $limit,
-			'next_reset_at'     => '',
-			'billing_period_start' => '',
-			'billing_period_end'   => '',
+			'tier'                    => $tier,
+			'icus_used'               => 0,
+			'icus_reserved'           => 0,
+			'icu_budget'              => $limit,
+			'monthly_icu_budget'      => $limit,
+			'monthly_included_icu_budget' => $limit,
+			'icus_remaining'          => $limit,
+			'monthly_remaining'       => $limit,
+			'monthly_included_remaining' => $limit,
+			'credits_remaining'       => 0,
+			'purchased_credits_remaining' => 0,
+			'legacy_bonus_remaining'  => 0,
+			'total_available'         => $limit,
+			'total_remaining'         => $limit,
+			'spendable_credits_remaining' => $limit,
+			'spendable_icus_remaining' => $limit,
+			'next_reset_at'           => '',
+			'billing_period_start'    => '',
+			'billing_period_end'      => '',
 			'uses_anniversary_reset' => false,
-			'percent_used'      => 0,
-			'at_limit'          => false,
-			'warn'              => false,
-			'tier'              => $tier,
-			'offline'           => true,
-			'tokens_used'       => 0,
-			'tokens_reserved'   => 0,
-			'tokens_limit'      => $limit,
-			'tokens_remaining'  => $limit,
+			'percent_used'            => 0,
+			'at_limit'                => false,
+			'warn'                    => false,
+			'offline'                 => true,
+			'billing_authority'       => $this->local_billing_authority( true ),
+			'budget_pressure_state'   => 'normal',
+			'using_purchased_credits' => false,
+			'using_legacy_bonus'      => false,
+			'tokens_used'             => 0,
+			'tokens_reserved'         => 0,
+			'tokens_limit'            => $limit,
+			'tokens_remaining'        => $limit,
 		);
 	}
 
@@ -897,38 +974,134 @@ class PressArk_Token_Bank {
 	}
 
 	private function normalize_status( array $data, string $tier = '' ): array {
-		$tier           = $tier ? PressArk_Entitlements::normalize_tier( $tier ) : $this->get_current_tier();
-		$icu_budget     = (int) ( $data['icu_budget'] ?? $data['tokens_limit'] ?? PressArk_Entitlements::icu_budget( $tier ) );
-		$icus_used      = (int) ( $data['icus_used'] ?? $data['tokens_used'] ?? 0 );
-		$icus_reserved  = (int) ( $data['icus_reserved'] ?? $data['tokens_reserved'] ?? 0 );
-		$monthly_remaining = (int) ( $data['monthly_remaining'] ?? max( 0, $icu_budget - $icus_used ) );
-		$credits_remaining = (int) ( $data['credits_remaining'] ?? 0 );
-		$icus_remaining = (int) ( $data['icus_remaining'] ?? $data['tokens_remaining'] ?? max( 0, $monthly_remaining + $credits_remaining - $icus_reserved ) );
-		$total_remaining = (int) ( $data['total_remaining'] ?? $icus_remaining );
+		$resolved_tier      = '';
+		if ( ! empty( $data['tier'] ) ) {
+			$resolved_tier = PressArk_Entitlements::normalize_tier( (string) $data['tier'] );
+		} elseif ( $tier ) {
+			$resolved_tier = PressArk_Entitlements::normalize_tier( $tier );
+		} else {
+			$resolved_tier = $this->get_current_tier();
+		}
 
-		$data['tier']              = $tier;
+		$icu_budget         = (int) ( $data['monthly_included_icu_budget'] ?? $data['monthly_icu_budget'] ?? $data['icu_budget'] ?? $data['tokens_limit'] ?? PressArk_Entitlements::icu_budget( $resolved_tier ) );
+		$icus_used          = (int) ( $data['icus_used'] ?? $data['tokens_used'] ?? 0 );
+		$icus_reserved      = (int) ( $data['icus_reserved'] ?? $data['tokens_reserved'] ?? 0 );
+		$monthly_remaining  = (int) ( $data['monthly_included_remaining'] ?? $data['monthly_remaining'] ?? max( 0, $icu_budget - $icus_used ) );
+		$credits_remaining  = (int) ( $data['purchased_credits_remaining'] ?? $data['credits_remaining'] ?? 0 );
+		$legacy_bonus       = (int) ( $data['legacy_bonus_remaining'] ?? 0 );
+		$icus_remaining     = (int) ( $data['icus_remaining'] ?? $data['tokens_remaining'] ?? max( 0, $monthly_remaining + $credits_remaining + $legacy_bonus - $icus_reserved ) );
+		$total_remaining    = (int) ( $data['total_remaining'] ?? $icus_remaining );
+		$total_available    = (int) ( $data['total_available'] ?? ( $icu_budget + $credits_remaining + $legacy_bonus ) );
+		$raw_tokens_used    = (int) ( $data['raw_tokens_used'] ?? $icus_used );
+		$using_purchased    = ! empty( $data['using_purchased_credits'] ) || ( $monthly_remaining <= 0 && $credits_remaining > 0 );
+		$using_legacy_bonus = ! empty( $data['using_legacy_bonus'] ) || ( $monthly_remaining <= 0 && 0 === $credits_remaining && $legacy_bonus > 0 );
+		$pressure_state     = (string) ( $data['budget_pressure_state'] ?? $this->calculate_budget_pressure_state( $icu_budget, $monthly_remaining, $total_remaining, $total_available ) );
+		$billing_authority  = (string) ( $data['billing_authority'] ?? '' );
+		if ( '' === $billing_authority || 'token_bank' === $billing_authority ) {
+			$billing_authority = $this->local_billing_authority( ! empty( $data['offline'] ) );
+		}
+
+		$data['tier']              = $resolved_tier;
+		$data['billing_tier']      = $resolved_tier;
 		$data['icu_budget']        = $icu_budget;
+		$data['monthly_icu_budget'] = (int) ( $data['monthly_icu_budget'] ?? $icu_budget );
+		$data['monthly_included_icu_budget'] = $icu_budget;
 		$data['icus_used']         = $icus_used;
 		$data['icus_reserved']     = $icus_reserved;
 		$data['icus_remaining']    = $icus_remaining;
-		$data['monthly_remaining'] = $monthly_remaining;
+		$data['monthly_remaining'] = (int) ( $data['monthly_remaining'] ?? $monthly_remaining );
+		$data['monthly_included_remaining'] = $monthly_remaining;
 		$data['monthly_exhausted'] = ! empty( $data['monthly_exhausted'] ) || $monthly_remaining <= 0;
-		$data['using_purchased_credits'] = ! empty( $data['using_purchased_credits'] ) || ( $monthly_remaining <= 0 && $credits_remaining > 0 );
+		$data['using_purchased_credits'] = $using_purchased;
+		$data['using_legacy_bonus'] = $using_legacy_bonus;
 		$data['credits_remaining'] = $credits_remaining;
-		$data['raw_tokens_used']   = (int) ( $data['raw_tokens_used'] ?? $icus_used );
-		$data['total_available']   = (int) ( $data['total_available'] ?? ( $icu_budget + $credits_remaining ) );
+		$data['purchased_credits_remaining'] = $credits_remaining;
+		$data['legacy_bonus_remaining'] = $legacy_bonus;
+		$data['raw_tokens_used']   = $raw_tokens_used;
+		$data['total_available']   = $total_available;
 		$data['total_remaining']   = $total_remaining;
+		$data['spendable_credits_remaining'] = $total_remaining;
+		$data['spendable_icus_remaining'] = $total_remaining;
 		$data['next_reset_at']     = (string) ( $data['next_reset_at'] ?? '' );
 		$data['billing_period_start'] = (string) ( $data['billing_period_start'] ?? '' );
 		$data['billing_period_end']   = (string) ( $data['billing_period_end'] ?? '' );
 		$data['uses_anniversary_reset'] = ! empty( $data['uses_anniversary_reset'] );
+		$data['budget_pressure_state'] = $pressure_state;
+		$data['billing_authority'] = $billing_authority;
 		$data['tokens_used']       = $icus_used;
 		$data['tokens_reserved']   = $icus_reserved;
 		$data['tokens_limit']      = $icu_budget;
 		$data['tokens_remaining']  = $icus_remaining;
-		$data['bonus_tokens']      = (int) ( $data['bonus_tokens'] ?? $credits_remaining );
+		$data['bonus_tokens']      = (int) ( $data['bonus_tokens'] ?? ( $credits_remaining + $legacy_bonus ) );
 
 		return $data;
+	}
+
+	private function normalize_billing_catalog( array $data ): array {
+		if ( empty( $data['credit_packs'] ) || ! is_array( $data['credit_packs'] ) ) {
+			return array();
+		}
+
+		$credit_packs = array();
+		foreach ( $data['credit_packs'] as $pack_type => $pack ) {
+			if ( ! is_array( $pack ) ) {
+				continue;
+			}
+
+			$normalized_type = sanitize_key( (string) ( $pack['pack_type'] ?? $pack_type ) );
+			if ( '' === $normalized_type ) {
+				continue;
+			}
+
+			$credit_packs[ $normalized_type ] = array(
+				'pack_type'   => $normalized_type,
+				'pricing_id'  => (int) ( $pack['pricing_id'] ?? 0 ),
+				'icus'        => (int) ( $pack['icus'] ?? 0 ),
+				'price_cents' => (int) ( $pack['price_cents'] ?? 0 ),
+				'label'       => sanitize_text_field( (string) ( $pack['label'] ?? '' ) ),
+			);
+		}
+
+		return array(
+			'version'       => (int) ( $data['version'] ?? 1 ),
+			'contract_hash' => sanitize_text_field( (string) ( $data['contract_hash'] ?? '' ) ),
+			'plan_to_tier'  => is_array( $data['plan_to_tier'] ?? null ) ? $data['plan_to_tier'] : array(),
+			'credit_packs'  => $credit_packs,
+			'freemius'      => is_array( $data['freemius'] ?? null )
+				? array(
+					'main_plugin_id'     => sanitize_text_field( (string) ( $data['freemius']['main_plugin_id'] ?? '' ) ),
+					'credits_product_id' => sanitize_text_field( (string) ( $data['freemius']['credits_product_id'] ?? '' ) ),
+					'credits_plan_id'    => sanitize_text_field( (string) ( $data['freemius']['credits_plan_id'] ?? '' ) ),
+				)
+				: array(),
+		);
+	}
+
+	private function calculate_budget_pressure_state( int $monthly_budget, int $monthly_remaining, int $total_remaining, int $total_available ): string {
+		$total_ratio        = $total_available > 0 ? ( $total_remaining / $total_available ) : 0.0;
+		$has_monthly_budget = $monthly_budget > 0;
+		$monthly_ratio      = $has_monthly_budget ? ( $monthly_remaining / $monthly_budget ) : 1.0;
+		$monthly_critical   = $has_monthly_budget && $monthly_ratio <= 0.02;
+		$monthly_conserve   = $has_monthly_budget && ( $monthly_remaining <= 0 || $monthly_ratio <= 0.1 );
+
+		if ( $total_remaining <= 0 || $total_ratio <= 0.08 || $monthly_critical ) {
+			return 'critical';
+		}
+
+		if ( $total_ratio <= 0.2 || $monthly_conserve ) {
+			return 'conserve';
+		}
+
+		return 'normal';
+	}
+
+	private function local_billing_authority( bool $offline = false ): string {
+		$verified = (bool) get_option( 'pressark_handshake_verified', false );
+		if ( $offline ) {
+			return 'token_bank_cached';
+		}
+
+		return $verified ? 'token_bank_verified' : 'token_bank_provisional';
 	}
 
 	private function default_multiplier_config(): array {

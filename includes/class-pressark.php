@@ -195,16 +195,17 @@ class PressArk {
 		$usage = $tracker->get_usage_data();
 
 		$credit_packs = array();
-		foreach ( PressArk_Entitlements::CREDIT_PACKS as $pack_type => $pack ) {
+		foreach ( PressArk_Entitlements::get_credit_pack_catalog() as $pack_type => $pack ) {
 			$credit_packs[] = array(
-				'pack_type'          => $pack_type,
-				'icus'               => (int) $pack['icus'],
-				'price_cents'        => (int) $pack['price_cents'],
-				'label'              => (string) $pack['label'],
-				'freemius_pricing_id' => (int) ( $pack['freemius_pricing_id'] ?? 0 ),
-				'checkoutUrl'        => pressark_credit_pack_checkout_url( $pack_type ),
+				'pack_type'           => $pack_type,
+				'icus'                => (int) ( $pack['icus'] ?? 0 ),
+				'price_cents'         => (int) ( $pack['price_cents'] ?? 0 ),
+				'label'               => (string) ( $pack['label'] ?? '' ),
+				'freemius_pricing_id' => (int) ( $pack['pricing_id'] ?? $pack['freemius_pricing_id'] ?? 0 ),
+				'checkoutUrl'         => pressark_credit_pack_checkout_url( $pack_type ),
 			);
 		}
+		$checkout_config = PressArk_Entitlements::get_credit_checkout_config();
 
 		wp_localize_script( 'pressark-chat', 'pressarkData', array(
 			'restUrl'        => esc_url_raw( rest_url( 'pressark/v1/' ) ),
@@ -227,9 +228,10 @@ class PressArk {
 			'creditStoreUrl' => admin_url( 'admin.php?page=pressark#pressark-credit-store' ),
 			'creditPacks'    => $credit_packs,
 			'creditsProduct' => array(
-				'product_id' => PressArk_Entitlements::CREDITS_PRODUCT_ID,
-				'plan_id'    => PressArk_Entitlements::CREDITS_PLAN_ID,
-				'public_key' => PressArk_Entitlements::CREDITS_PUBLIC_KEY,
+				'product_id'    => (int) $checkout_config['product_id'],
+				'plan_id'       => (int) $checkout_config['plan_id'],
+				'public_key'    => (string) $checkout_config['public_key'],
+				'contract_hash' => (string) ( $checkout_config['contract_hash'] ?? '' ),
 			),
 			'activity_url'   => PressArk_Chat::get_activity_url( $initial_unread > 0 ),
 			'initial_unread_count' => $initial_unread,
@@ -303,16 +305,17 @@ class PressArk {
 		$usage = $tracker->get_usage_data();
 
 		$credit_packs = array();
-		foreach ( PressArk_Entitlements::CREDIT_PACKS as $pack_type => $pack ) {
+		foreach ( PressArk_Entitlements::get_credit_pack_catalog() as $pack_type => $pack ) {
 			$credit_packs[] = array(
-				'pack_type'          => $pack_type,
-				'icus'               => (int) $pack['icus'],
-				'price_cents'        => (int) $pack['price_cents'],
-				'label'              => (string) $pack['label'],
-				'freemius_pricing_id' => (int) ( $pack['freemius_pricing_id'] ?? 0 ),
-				'checkoutUrl'        => pressark_credit_pack_checkout_url( $pack_type ),
+				'pack_type'           => $pack_type,
+				'icus'                => (int) ( $pack['icus'] ?? 0 ),
+				'price_cents'         => (int) ( $pack['price_cents'] ?? 0 ),
+				'label'               => (string) ( $pack['label'] ?? '' ),
+				'freemius_pricing_id' => (int) ( $pack['pricing_id'] ?? $pack['freemius_pricing_id'] ?? 0 ),
+				'checkoutUrl'         => pressark_credit_pack_checkout_url( $pack_type ),
 			);
 		}
+		$checkout_config = PressArk_Entitlements::get_credit_checkout_config();
 
 		$is_byok = (bool) get_option( 'pressark_byok_enabled', false );
 
@@ -337,9 +340,10 @@ class PressArk {
 			'creditStoreUrl' => admin_url( 'admin.php?page=pressark#pressark-credit-store' ),
 			'creditPacks'    => $credit_packs,
 			'creditsProduct' => array(
-				'product_id' => PressArk_Entitlements::CREDITS_PRODUCT_ID,
-				'plan_id'    => PressArk_Entitlements::CREDITS_PLAN_ID,
-				'public_key' => PressArk_Entitlements::CREDITS_PUBLIC_KEY,
+				'product_id'    => (int) $checkout_config['product_id'],
+				'plan_id'       => (int) $checkout_config['plan_id'],
+				'public_key'    => (string) $checkout_config['public_key'],
+				'contract_hash' => (string) ( $checkout_config['contract_hash'] ?? '' ),
 			),
 			'activity_url'   => PressArk_Chat::get_activity_url( $initial_unread > 0 ),
 			'initial_unread_count' => $initial_unread,
