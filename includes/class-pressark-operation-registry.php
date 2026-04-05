@@ -914,6 +914,14 @@ class PressArk_Operation_Registry {
 		) );
 
 		// ── Aliases (hallucinated / legacy tool names) ──────────
+		/**
+		 * Fires after the built-in operations are registered.
+		 * Third-party PressArk extensions can register their own operations here.
+		 *
+		 * @since 5.4.0
+		 */
+		do_action( 'pressark_register_operations' );
+
 		self::alias( 'get_posts',     'list_posts' );
 		self::alias( 'get_pages',     'list_posts' );
 		self::alias( 'get_products',  'list_posts' );
@@ -1686,11 +1694,12 @@ class PressArk_Operation_Registry {
 	 * @since 5.3.0
 	 */
 	private static function apply_contract_filters(): void {
-		if ( ! has_filter( 'pressark_operation_contract' ) ) {
-			return;
-		}
-
 		foreach ( self::$operations as $op ) {
+			$filtered = $op->execution_contract();
+			if ( class_exists( 'PressArk_Extension_Manifests' ) ) {
+				$filtered = PressArk_Extension_Manifests::overlay_operation_contract( $filtered, $op );
+			}
+
 			/**
 			 * Filter the execution contract for a registered operation.
 			 *
@@ -1699,7 +1708,9 @@ class PressArk_Operation_Registry {
 			 * @param PressArk_Operation $op       The operation object.
 			 * @return array Modified contract (only extended fields are applied).
 			 */
-			$filtered = apply_filters( 'pressark_operation_contract', $op->execution_contract(), $op );
+			if ( has_filter( 'pressark_operation_contract' ) ) {
+				$filtered = apply_filters( 'pressark_operation_contract', $filtered, $op );
+			}
 
 			if ( is_array( $filtered ) ) {
 				$op->apply_contract( $filtered );

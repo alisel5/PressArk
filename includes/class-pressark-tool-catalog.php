@@ -952,6 +952,7 @@ class PressArk_Tool_Catalog {
 
 		$score         = 0;
 		$group_matched = false;
+		$group_health  = $this->tool_group_health( $group );
 
 		if ( str_contains( $name_lower, $query_lower ) ) {
 			$score += 90;
@@ -1000,6 +1001,8 @@ class PressArk_Tool_Catalog {
 			}
 		}
 
+		$score += $this->health_score_adjustment( $group_health, 'tool' );
+
 		if ( in_array( $name, array( 'discover_tools', 'load_tools', 'get_available_tools' ), true )
 			&& ! preg_match( '/\b(tool|tools|discover|load|available)\b/i', $query_lower )
 		) {
@@ -1020,6 +1023,9 @@ class PressArk_Tool_Catalog {
 			'group'          => $group,
 			'loaded'         => isset( $loaded_set[ $name ] ),
 			'score'          => $score,
+			'health_state'   => sanitize_key( (string) ( $group_health['state'] ?? 'healthy' ) ),
+			'health_status'  => sanitize_key( (string) ( $group_health['status'] ?? 'available' ) ),
+			'health_summary' => sanitize_text_field( (string) ( $group_health['summary'] ?? '' ) ),
 			'_kind'          => 'tool',
 			'_loaded_bonus'  => isset( $loaded_set[ $name ] ) ? 1 : 0,
 			'_utility_bonus' => $this->tool_capability_sort_value( $operation ),
@@ -1033,13 +1039,18 @@ class PressArk_Tool_Catalog {
 	 * @return array<string,mixed>
 	 */
 	private function score_discovery_resource( array $resource_match ): array {
-		$group = sanitize_key( (string) ( $resource_match['group'] ?? '' ) );
-		$score = (int) ( $resource_match['score'] ?? 0 );
+		$group        = sanitize_key( (string) ( $resource_match['group'] ?? '' ) );
+		$score        = (int) ( $resource_match['score'] ?? 0 );
+		$group_health = $this->resource_group_health( $group );
 
 		$score += 'tool-results' === $group ? 14 : 30;
+		$score += $this->health_score_adjustment( $group_health, 'resource' );
 
 		$resource_match['type']           = 'resource';
 		$resource_match['score']          = $score;
+		$resource_match['health_state']   = sanitize_key( (string) ( $group_health['state'] ?? 'healthy' ) );
+		$resource_match['health_status']  = sanitize_key( (string) ( $group_health['status'] ?? 'available' ) );
+		$resource_match['health_summary'] = sanitize_text_field( (string) ( $group_health['summary'] ?? '' ) );
 		$resource_match['_kind']          = 'resource';
 		$resource_match['_loaded_bonus']  = 0;
 		$resource_match['_utility_bonus'] = 3;
@@ -1095,6 +1106,57 @@ class PressArk_Tool_Catalog {
 			'deny'  => -100,
 			default => 0,
 		};
+	}
+
+	/**
+	 * Get normalized health for a tool group, falling back to a neutral row.
+	 *
+	 * @param string $group Tool group name.
+	 * @return array<string,mixed>
+	 */
+	private function tool_group_health( string $group ): array {
+		if ( '' === $group || ! class_exists( 'PressArk_Capability_Health' ) || ! method_exists( 'PressArk_Capability_Health', 'get_tool_group_state' ) ) {
+			return array(
+				'state'   => 'healthy',
+				'status'  => 'available',
+				'summary' => '',
+			);
+		}
+
+		return PressArk_Capability_Health::get_tool_group_state( $group );
+	}
+
+	/**
+	 * Get normalized health for a resource group, falling back to a neutral row.
+	 *
+	 * @param string $group Resource group name.
+	 * @return array<string,mixed>
+	 */
+	private function resource_group_health( string $group ): array {
+		if ( '' === $group || ! class_exists( 'PressArk_Capability_Health' ) || ! method_exists( 'PressArk_Capability_Health', 'get_resource_group_state' ) ) {
+			return array(
+				'state'   => 'healthy',
+				'status'  => 'available',
+				'summary' => '',
+			);
+		}
+
+		return PressArk_Capability_Health::get_resource_group_state( $group );
+	}
+
+	/**
+	 * Apply capability-health ranking nudges without hiding results.
+	 *
+	 * @param array<string,mixed> $surface Tool-group or resource-group health row.
+	 * @param string              $kind    tool|resource
+	 * @return int
+	 */
+	private function health_score_adjustment( array $surface, string $kind ): int {
+		if ( ! class_exists( 'PressArk_Capability_Health' ) || ! method_exists( 'PressArk_Capability_Health', 'discovery_score_adjustment' ) ) {
+			return 0;
+		}
+
+		return (int) PressArk_Capability_Health::discovery_score_adjustment( $surface, $kind );
 	}
 
 	/**

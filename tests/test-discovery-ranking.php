@@ -200,6 +200,40 @@ if ( ! class_exists( 'PressArk_Capability_Bridge' ) ) {
 	}
 }
 
+if ( ! class_exists( 'PressArk_Capability_Health' ) ) {
+	class PressArk_Capability_Health {
+		public static array $tool_groups = array();
+		public static array $resource_groups = array();
+
+		public static function get_tool_group_state( string $group ): array {
+			return self::$tool_groups[ $group ] ?? array(
+				'state'   => 'healthy',
+				'status'  => 'available',
+				'summary' => '',
+			);
+		}
+
+		public static function get_resource_group_state( string $group ): array {
+			return self::$resource_groups[ $group ] ?? array(
+				'state'   => 'healthy',
+				'status'  => 'available',
+				'summary' => '',
+			);
+		}
+
+		public static function discovery_score_adjustment( array $surface, string $kind = 'tool' ): int {
+			unset( $kind );
+			$state = (string) ( $surface['state'] ?? 'healthy' );
+			return match ( $state ) {
+				'degraded'     => -8,
+				'auth_blocked' => -18,
+				'absent'       => -16,
+				default        => 0,
+			};
+		}
+	}
+}
+
 if ( ! class_exists( 'PressArk_Resource_Registry' ) ) {
 	class PressArk_Resource_Registry {
 		public static function search( string $query ): array {
@@ -299,6 +333,11 @@ PressArk_Permission_Service::$decisions = array(
 	'delete_site_settings' => decision_row( 'deny', false ),
 	'discover_tools'       => decision_row( 'allow', true ),
 );
+PressArk_Capability_Health::$tool_groups = array(
+	'settings'  => array( 'state' => 'healthy', 'status' => 'available', 'summary' => 'Settings group is available.' ),
+	'health'    => array( 'state' => 'degraded', 'status' => 'degraded', 'summary' => 'Health group is degraded.' ),
+	'discovery' => array( 'state' => 'healthy', 'status' => 'available', 'summary' => 'Discovery group is available.' ),
+);
 
 echo "=== Discovery Ranking Tests ===\n\n";
 
@@ -343,6 +382,44 @@ assert_discovery(
 	'Denied tools stay hidden from discovery output',
 	! in_array( 'delete_site_settings', $names, true ),
 	'Unexpected names: ' . implode( ', ', $names )
+);
+
+PressArk_Operation_Registry::$ops['site_status_probe'] = array(
+	'capability'    => 'read',
+	'group'         => 'health',
+	'risk'          => 'safe',
+	'description'   => 'Read live site settings status from a degraded health surface.',
+	'search_hint'   => 'live site settings configuration status',
+	'tags'          => array( 'status', 'health' ),
+	'output_policy' => 'full',
+	'cacheable'     => false,
+);
+PressArk_Permission_Service::$decisions['site_status_probe'] = decision_row( 'allow', true );
+
+$health_results = $catalog->discover(
+	'show live site settings status',
+	array(),
+	array(
+		'permission_context' => 'interactive',
+		'permission_meta'    => array( 'tier' => 'pro' ),
+	)
+);
+$health_names = array_values( array_map(
+	static function ( array $row ): string {
+		return (string) ( $row['name'] ?? '' );
+	},
+	$health_results
+) );
+
+echo '  Health-ranked: ' . implode( ' -> ', $health_names ) . "\n";
+
+$settings_health_index = array_search( 'get_site_settings', $health_names, true );
+$probe_index           = array_search( 'site_status_probe', $health_names, true );
+
+assert_discovery(
+	'Healthy group ranks ahead of a degraded-group candidate',
+	false !== $settings_health_index && false !== $probe_index && $settings_health_index < $probe_index,
+	'Order was ' . implode( ', ', $health_names )
 );
 
 echo "\nResults: {$passed} passed, {$failed} failed\n";

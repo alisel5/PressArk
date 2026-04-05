@@ -78,6 +78,7 @@ class PressArk_Admin_Activity {
 		$support_mode   = $this->is_support_mode();
 		$activity_user  = $support_mode ? 0 : $viewer_user_id;
 		$status_filter  = sanitize_key( wp_unslash( $_GET['status'] ?? '' ) );
+		$search_query   = sanitize_text_field( wp_unslash( $_GET['q'] ?? '' ) );
 		$page_num       = max( 1, (int) ( $_GET['paged'] ?? 1 ) );
 		$per_page       = 25;
 		$offset         = ( $page_num - 1 ) * $per_page;
@@ -142,8 +143,14 @@ class PressArk_Admin_Activity {
 		echo '</ul>';
 		echo '<br class="clear" />';
 
+		if ( self::VIEW_POLICY !== $view ) {
+			$this->render_operational_search_form( $view, $support_mode, $search_query );
+		}
+
 		if ( self::VIEW_POLICY === $view && $this->can_view_policy_diagnostics() ) {
 			$this->render_policy_diagnostics();
+		} elseif ( '' !== $search_query ) {
+			$this->render_operational_search_results( $search_query, $activity_user, $support_mode );
 		} elseif ( self::VIEW_TASKS === $view ) {
 			$this->render_tasks_table( $activity_user, $status_filter, $per_page, $offset, $page_num, $support_mode );
 		} else {
@@ -263,6 +270,15 @@ class PressArk_Admin_Activity {
 			return;
 		}
 
+		$progress_snapshots = $task_store->get_progress_snapshots(
+			array_map(
+				static function ( array $row ): string {
+					return (string) ( $row['task_id'] ?? '' );
+				},
+				$rows
+			)
+		);
+
 		echo '<table class="wp-list-table widefat fixed striped pressark-tasks-table">';
 		echo '<thead><tr>';
 		echo '<th>' . esc_html__( 'Status', 'pressark' ) . '</th>';
@@ -281,6 +297,7 @@ class PressArk_Admin_Activity {
 		foreach ( $rows as $row ) {
 			$status_class  = $this->status_class( $row['status'] );
 			$message_short = mb_substr( $row['message'], 0, 80 );
+			$progress      = is_array( $progress_snapshots[ $row['task_id'] ] ?? null ) ? $progress_snapshots[ $row['task_id'] ] : array();
 			if ( mb_strlen( $row['message'] ) > 80 ) {
 				$message_short .= '...';
 			}
@@ -298,7 +315,19 @@ class PressArk_Admin_Activity {
 			echo '<tr' . ( $unread ? ' class="pressark-unread"' : '' ) . '>';
 			echo '<td><span class="pressark-status ' . esc_attr( $status_class ) . '">'
 				. esc_html( $row['status'] ) . '</span></td>';
-			echo '<td><a href="' . esc_url( $detail_url ) . '">' . esc_html( $message_short ) . '</a></td>';
+			echo '<td>';
+			echo '<a href="' . esc_url( $detail_url ) . '">' . esc_html( $message_short ) . '</a>';
+			if ( ! empty( $progress['headline'] ) ) {
+				echo '<div class="pressark-progress-headline pressark-progress-headline--compact">'
+					. esc_html( (string) $progress['headline'] ) . '</div>';
+			}
+			if ( ! empty( $progress['summary'] ) ) {
+				echo '<div class="pressark-progress-meta">' . esc_html( (string) $progress['summary'] ) . '</div>';
+			}
+			if ( ! empty( $progress['milestone_summary'] ) ) {
+				echo '<div class="pressark-progress-milestone">' . esc_html( (string) $progress['milestone_summary'] ) . '</div>';
+			}
+			echo '</td>';
 			if ( $support_mode ) {
 				echo '<td>' . esc_html( $this->user_summary( (int) $row['user_id'] ) ) . '</td>';
 			}
@@ -314,6 +343,178 @@ class PressArk_Admin_Activity {
 		echo '</tbody></table>';
 
 		$this->render_pagination( $total, $per_page, $page_num );
+	}
+
+	/**
+	 * Render the operator-facing cross-run search form.
+	 */
+	private function render_operational_search_form( string $view, bool $support_mode, string $query ): void {
+		echo '<div class="pressark-operational-search-card">';
+		echo '<form class="pressark-operational-search" method="get" action="' . esc_url( admin_url( 'admin.php' ) ) . '">';
+		echo '<input type="hidden" name="page" value="' . esc_attr( self::PAGE_SLUG ) . '" />';
+		echo '<input type="hidden" name="view" value="' . esc_attr( $view ) . '" />';
+		if ( $support_mode ) {
+			echo '<input type="hidden" name="scope" value="' . esc_attr( self::SCOPE_ALL ) . '" />';
+		}
+		echo '<label class="screen-reader-text" for="pressark-operational-search-input">' . esc_html__( 'Search operational history', 'pressark' ) . '</label>';
+		echo '<input id="pressark-operational-search-input" class="regular-text" type="search" name="q" value="' . esc_attr( $query ) . '" placeholder="' . esc_attr__( 'Search page, product, template, fallback, approval, receipt...', 'pressark' ) . '" />';
+		echo '<button type="submit" class="button button-primary">' . esc_html__( 'Search History', 'pressark' ) . '</button>';
+		if ( '' !== $query ) {
+			echo '<a class="button button-secondary" href="' . esc_url( $this->activity_url( array( 'view' => $view ), $support_mode ) ) . '">' . esc_html__( 'Clear', 'pressark' ) . '</a>';
+		}
+		echo '</form>';
+		echo '<p class="description">' . esc_html__( 'Searches recent runs, tasks, traces, receipts, and site notes for support, debug, and resume workflows.', 'pressark' ) . '</p>';
+		echo '</div>';
+	}
+
+	/**
+	 * Render cross-run operational search results.
+	 */
+	private function render_operational_search_results( string $query, int $user_id, bool $support_mode ): void {
+		$search = ( new PressArk_Operational_Search() )->search(
+			array(
+				'query'   => $query,
+				'user_id' => $user_id,
+				'limit'   => 24,
+			)
+		);
+
+		echo '<div class="pressark-detail-card pressark-operational-results-card">';
+		echo '<h2>' . esc_html__( 'Operational Search', 'pressark' ) . '</h2>';
+		echo '<p class="description">' . esc_html__( 'Operator-first recall across durable runs, tasks, traces, receipts, and site notes. Results are shown for debugging and resume work, not for automatic prompt stuffing.', 'pressark' ) . '</p>';
+		echo '<p class="pressark-operational-query"><strong>' . esc_html__( 'Query:', 'pressark' ) . '</strong> ' . esc_html( $query ) . '</p>';
+
+		if ( ! empty( $search['counts'] ) ) {
+			echo '<div class="pressark-operational-chip-row">';
+			foreach ( $search['counts'] as $kind => $count ) {
+				echo '<span class="pressark-operational-chip"><strong>' . esc_html( $this->operational_result_kind_label( (string) $kind ) ) . '</strong> ' . esc_html( number_format_i18n( (int) $count ) ) . '</span>';
+			}
+			echo '</div>';
+		}
+
+		if ( ! empty( $search['signals'] ) ) {
+			echo '<div class="pressark-operational-chip-row">';
+			foreach ( $search['signals'] as $signal => $count ) {
+				echo '<span class="pressark-operational-chip pressark-operational-chip--signal"><strong>' . esc_html( $this->operational_signal_label( (string) $signal ) ) . '</strong> ' . esc_html( number_format_i18n( (int) $count ) ) . '</span>';
+			}
+			echo '</div>';
+		}
+
+		if ( empty( $search['results'] ) ) {
+			echo '<p>' . esc_html__( 'No matching operational history found in the recent scan window.', 'pressark' ) . '</p>';
+			echo '</div>';
+			return;
+		}
+
+		$this->render_operational_results_table( (array) $search['results'], $support_mode, true );
+		echo '</div>';
+	}
+
+	/**
+	 * Render related operational history for one detail page.
+	 *
+	 * @param array<string,mixed> $search Search payload from PressArk_Operational_Search.
+	 */
+	private function render_related_operational_history( array $search, bool $support_mode ): void {
+		$results = is_array( $search['results'] ?? null ) ? (array) $search['results'] : array();
+		if ( empty( $results ) ) {
+			return;
+		}
+
+		echo '<h3>' . esc_html__( 'Related Operational History', 'pressark' ) . '</h3>';
+		echo '<p class="description">' . esc_html__( 'Nearby history surfaced from shared targets, receipts, approvals, fallbacks, and failure reasons.', 'pressark' ) . '</p>';
+		$this->render_operational_results_table( $results, $support_mode, true );
+	}
+
+	/**
+	 * Render a table of operational search results.
+	 *
+	 * @param array<int,array<string,mixed>> $results Search results.
+	 */
+	private function render_operational_results_table( array $results, bool $support_mode, bool $show_matched_on ): void {
+		echo '<table class="wp-list-table widefat striped pressark-operational-table">';
+		echo '<thead><tr>';
+		echo '<th>' . esc_html__( 'Type', 'pressark' ) . '</th>';
+		echo '<th>' . esc_html__( 'Title', 'pressark' ) . '</th>';
+		if ( $support_mode ) {
+			echo '<th>' . esc_html__( 'User', 'pressark' ) . '</th>';
+		}
+		echo '<th>' . esc_html__( 'Summary', 'pressark' ) . '</th>';
+		if ( $show_matched_on ) {
+			echo '<th>' . esc_html__( 'Matched On', 'pressark' ) . '</th>';
+		}
+		echo '<th>' . esc_html__( 'Signals', 'pressark' ) . '</th>';
+		echo '<th>' . esc_html__( 'When', 'pressark' ) . '</th>';
+		echo '</tr></thead><tbody>';
+
+		foreach ( $results as $result ) {
+			$url       = $this->operational_result_url( $result, $support_mode );
+			$title     = sanitize_text_field( (string) ( $result['title'] ?? '' ) );
+			$summary   = sanitize_text_field( (string) ( $result['summary'] ?? '' ) );
+			$created_at = sanitize_text_field( (string) ( $result['created_at'] ?? '' ) );
+			$meta_bits = array();
+
+			if ( ! empty( $result['run_id'] ) ) {
+				$meta_bits[] = '<code title="run_id">' . esc_html__( 'Run', 'pressark' ) . ' ' . esc_html( $this->short_identifier( (string) $result['run_id'] ) ) . '</code>';
+			}
+			if ( ! empty( $result['task_id'] ) ) {
+				$meta_bits[] = '<code title="task_id">' . esc_html__( 'Task', 'pressark' ) . ' ' . esc_html( $this->short_identifier( (string) $result['task_id'] ) ) . '</code>';
+			}
+
+			echo '<tr>';
+			echo '<td><span class="pressark-operational-kind">' . esc_html( $this->operational_result_kind_label( (string) ( $result['kind'] ?? '' ) ) ) . '</span></td>';
+			echo '<td>';
+			if ( '' !== $url ) {
+				echo '<a href="' . esc_url( $url ) . '">' . esc_html( $title ) . '</a>';
+			} else {
+				echo esc_html( $title ?: __( 'Operational result', 'pressark' ) );
+			}
+			if ( ! empty( $meta_bits ) ) {
+				echo '<div class="pressark-ids pressark-operational-meta">' . wp_kses_post( implode( ' ', $meta_bits ) ) . '</div>';
+			}
+			echo '</td>';
+			if ( $support_mode ) {
+				$user_id = (int) ( $result['user_id'] ?? 0 );
+				echo '<td>' . esc_html( $user_id > 0 ? $this->user_summary( $user_id ) : '-' ) . '</td>';
+			}
+			echo '<td>' . esc_html( '' !== $summary ? $summary : '-' ) . '</td>';
+			if ( $show_matched_on ) {
+				$matched_on = array_values(
+					array_filter(
+						array_map(
+							static function ( $label ): string {
+								return sanitize_text_field( (string) $label );
+							},
+							(array) ( $result['matched_on'] ?? array() )
+						)
+					)
+				);
+				echo '<td>' . esc_html( ! empty( $matched_on ) ? implode( ', ', $matched_on ) : '-' ) . '</td>';
+			}
+			echo '<td>';
+			$signals = array_values(
+				array_filter(
+					array_map(
+						function ( $signal ): string {
+							return $this->operational_signal_label( (string) $signal );
+						},
+						(array) ( $result['signals'] ?? array() )
+					)
+				)
+			);
+			if ( empty( $signals ) ) {
+				echo '-';
+			} else {
+				foreach ( $signals as $signal ) {
+					echo '<span class="pressark-operational-chip pressark-operational-chip--signal">' . esc_html( $signal ) . '</span> ';
+				}
+			}
+			echo '</td>';
+			echo '<td title="' . esc_attr( $created_at ) . '">' . esc_html( $created_at ? $this->relative_time( $created_at ) : '-' ) . '</td>';
+			echo '</tr>';
+		}
+
+		echo '</tbody></table>';
 	}
 
 	/**
@@ -375,6 +576,10 @@ class PressArk_Admin_Activity {
 
 		echo '</table>';
 
+		if ( ! empty( $task['progress'] ) && is_array( $task['progress'] ) ) {
+			$this->render_task_progress_card( $task['progress'] );
+		}
+
 		if ( ! empty( $task['handoff_capsule'] ) && is_array( $task['handoff_capsule'] ) ) {
 			$this->render_json_block( __( 'Handoff Capsule', 'pressark' ), $task['handoff_capsule'] );
 		}
@@ -386,6 +591,12 @@ class PressArk_Admin_Activity {
 			echo '<p class="description">' . esc_html__( 'Queue-native handoff and worker runs that share this lineage root.', 'pressark' ) . '</p>';
 			$this->render_lineage_family( $family, $support_mode );
 		}
+
+		$related_history = ( new PressArk_Operational_Search() )->related_for_task(
+			$task,
+			$support_mode ? 0 : $viewer_user_id
+		);
+		$this->render_related_operational_history( $related_history, $support_mode );
 
 		if ( ! empty( $task['result'] ) && is_array( $task['result'] ) ) {
 			echo '<h3>' . esc_html__( 'Result', 'pressark' ) . '</h3>';
@@ -427,8 +638,8 @@ class PressArk_Admin_Activity {
 
 		$worker_events = $event_store->get_by_task( $task_id, 120 );
 		if ( ! empty( $worker_events ) ) {
-			echo '<h3>' . esc_html__( 'Worker Events', 'pressark' ) . '</h3>';
-			echo '<p class="description">' . esc_html__( 'Queue claim, defer, retry, contention, completion, cancellation, and handoff events for this task.', 'pressark' ) . '</p>';
+			echo '<h3>' . esc_html__( 'Task Timeline', 'pressark' ) . '</h3>';
+			echo '<p class="description">' . esc_html__( 'Queue handoff, worker lifecycle, approval pauses, retries, and task-linked execution events for this task.', 'pressark' ) . '</p>';
 			$this->render_trace_table( $worker_events );
 		}
 
@@ -632,6 +843,12 @@ class PressArk_Admin_Activity {
 			$this->render_lineage_family( $family, $support_mode );
 		}
 
+		$related_history = ( new PressArk_Operational_Search() )->related_for_run(
+			$run,
+			$support_mode ? 0 : $viewer_user_id
+		);
+		$this->render_related_operational_history( $related_history, $support_mode );
+
 		if ( ! empty( $joined_trace ) ) {
 			echo '<h3>' . esc_html__( 'Joined Trace', 'pressark' ) . '</h3>';
 			echo '<p class="description">' . esc_html__( 'Merged plugin and token-bank activity for this correlation spine.', 'pressark' ) . '</p>';
@@ -716,6 +933,7 @@ class PressArk_Admin_Activity {
 
 		echo '<details class="pressark-inspector-section" open><summary>' . esc_html__( 'Prompt Composition', 'pressark' ) . '</summary>';
 		$capability_variant = (string) ( $prompt['capability_map_variant'] ?? '' );
+		$site_playbook      = is_array( $prompt['site_playbook'] ?? null ) ? $prompt['site_playbook'] : array();
 		$site_notes         = is_array( $prompt['site_notes'] ?? null ) ? $prompt['site_notes'] : array();
 		$dynamic_skills     = array_values( array_filter( array_map( 'strval', (array) ( $prompt['dynamic_skill_names'] ?? array() ) ) ) );
 		$conditional_blocks = array_values( array_filter( array_map( 'strval', (array) ( $prompt['conditional_blocks'] ?? array() ) ) ) );
@@ -741,6 +959,13 @@ class PressArk_Admin_Activity {
 		echo '<p><strong>' . esc_html__( 'Capability map variant', 'pressark' ) . ':</strong> ' . esc_html( $capability_variant ?: '-' ) . '</p>';
 		echo '<p><strong>' . esc_html__( 'Dynamic skills', 'pressark' ) . ':</strong> ' . esc_html( ! empty( $dynamic_skills ) ? implode( ', ', $dynamic_skills ) : '-' ) . '</p>';
 		echo '<p><strong>' . esc_html__( 'Conditional blocks', 'pressark' ) . ':</strong> ' . esc_html( ! empty( $conditional_blocks ) ? implode( ', ', $conditional_blocks ) : '-' ) . '</p>';
+		echo '<p><strong>' . esc_html__( 'Site playbook included', 'pressark' ) . ':</strong> ' . esc_html( ! empty( $site_playbook['included'] ) ? __( 'Yes', 'pressark' ) : __( 'No', 'pressark' ) ) . '</p>';
+		if ( ! empty( $site_playbook['titles'] ) ) {
+			echo '<p class="pressark-inspector-subtle">' . esc_html( implode( ', ', array_map( 'strval', (array) $site_playbook['titles'] ) ) ) . '</p>';
+		}
+		if ( ! empty( $site_playbook['preview'] ) ) {
+			echo '<p class="pressark-inspector-subtle">' . esc_html( (string) $site_playbook['preview'] ) . '</p>';
+		}
 		echo '<p><strong>' . esc_html__( 'Site notes included', 'pressark' ) . ':</strong> ' . esc_html( ! empty( $site_notes['included'] ) ? __( 'Yes', 'pressark' ) : __( 'No', 'pressark' ) ) . '</p>';
 		if ( ! empty( $site_notes['preview'] ) ) {
 			echo '<p class="pressark-inspector-subtle">' . esc_html( (string) $site_notes['preview'] ) . '</p>';
@@ -1276,6 +1501,60 @@ class PressArk_Admin_Activity {
 			. '<td>' . wp_kses_post( $html ) . '</td></tr>';
 	}
 
+	private function render_task_progress_card( array $progress ): void {
+		$headline = sanitize_text_field( (string) ( $progress['headline'] ?? '' ) );
+		$summary  = sanitize_text_field( (string) ( $progress['summary'] ?? '' ) );
+		$milestone = sanitize_text_field( (string) ( $progress['milestone_summary'] ?? '' ) );
+		$facts    = array(
+			__( 'State', 'pressark' )  => sanitize_text_field( (string) ( $progress['state_label'] ?? '' ) ),
+			__( 'Stage', 'pressark' )  => sanitize_text_field( (string) ( $progress['stage_label'] ?? '' ) ),
+			__( 'Latest', 'pressark' ) => sanitize_text_field( (string) ( $progress['event_label'] ?? '' ) ),
+			__( 'Target', 'pressark' ) => sanitize_text_field( (string) ( $progress['target_label'] ?? '' ) ),
+			__( 'Completed', 'pressark' ) => $this->format_progress_labels( (array) ( $progress['completed_labels'] ?? array() ) ),
+			__( 'Remaining', 'pressark' ) => $this->format_progress_labels( (array) ( $progress['remaining_labels'] ?? array() ) ),
+			__( 'Blocked', 'pressark' ) => $this->format_progress_labels( (array) ( $progress['blocked_labels'] ?? array() ) ),
+		);
+
+		echo '<div class="pressark-progress-card">';
+		echo '<h3>' . esc_html__( 'Progress Headline', 'pressark' ) . '</h3>';
+		if ( '' !== $headline ) {
+			echo '<p class="pressark-progress-headline">' . esc_html( $headline ) . '</p>';
+		}
+		if ( '' !== $summary ) {
+			echo '<p class="pressark-progress-meta">' . esc_html( $summary ) . '</p>';
+		}
+		if ( '' !== $milestone ) {
+			echo '<p class="pressark-progress-milestone">' . esc_html( $milestone ) . '</p>';
+		}
+
+		echo '<div class="pressark-progress-grid">';
+		foreach ( $facts as $label => $value ) {
+			if ( '' === $value ) {
+				continue;
+			}
+
+			echo '<div class="pressark-progress-fact">';
+			echo '<h4>' . esc_html( $label ) . '</h4>';
+			echo '<p>' . esc_html( $value ) . '</p>';
+			echo '</div>';
+		}
+		echo '</div>';
+		echo '</div>';
+	}
+
+	private function format_progress_labels( array $labels, int $limit = 3 ): string {
+		$labels = array_values(
+			array_filter(
+				array_map( 'sanitize_text_field', array_slice( $labels, 0, $limit ) ),
+				static function ( string $label ): bool {
+					return '' !== $label;
+				}
+			)
+		);
+
+		return implode( ', ', $labels );
+	}
+
 	private function run_link_html( string $run_id, bool $support_mode, string $label = '' ): string {
 		if ( '' === $run_id ) {
 			return '-';
@@ -1308,6 +1587,79 @@ class PressArk_Admin_Activity {
 		);
 
 		return '<a href="' . esc_url( $url ) . '"><code>' . esc_html( $display ) . '</code></a>';
+	}
+
+	private function operational_result_url( array $result, bool $support_mode ): string {
+		$task_id = sanitize_text_field( (string) ( $result['task_id'] ?? '' ) );
+		$run_id  = sanitize_text_field( (string) ( $result['run_id'] ?? '' ) );
+		$kind    = sanitize_key( (string) ( $result['kind'] ?? '' ) );
+
+		if ( in_array( $kind, array( 'task', 'receipt' ), true ) && '' !== $task_id ) {
+			return $this->activity_url(
+				array(
+					'view'    => self::VIEW_TASKS,
+					'task_id' => $task_id,
+				),
+				$support_mode
+			);
+		}
+
+		if ( in_array( $kind, array( 'run', 'decision', 'trace' ), true ) && '' !== $run_id ) {
+			return $this->activity_url(
+				array(
+					'view'   => self::VIEW_RUNS,
+					'run_id' => $run_id,
+				),
+				$support_mode
+			);
+		}
+
+		if ( '' !== $task_id ) {
+			return $this->activity_url(
+				array(
+					'view'    => self::VIEW_TASKS,
+					'task_id' => $task_id,
+				),
+				$support_mode
+			);
+		}
+
+		if ( '' !== $run_id ) {
+			return $this->activity_url(
+				array(
+					'view'   => self::VIEW_RUNS,
+					'run_id' => $run_id,
+				),
+				$support_mode
+			);
+		}
+
+		return '';
+	}
+
+	private function operational_result_kind_label( string $kind ): string {
+		return match ( sanitize_key( $kind ) ) {
+			'run'       => __( 'Run', 'pressark' ),
+			'task'      => __( 'Task', 'pressark' ),
+			'decision'  => __( 'Decision', 'pressark' ),
+			'receipt'   => __( 'Receipt', 'pressark' ),
+			'trace'     => __( 'Trace', 'pressark' ),
+			'site_note' => __( 'Site Note', 'pressark' ),
+			default     => __( 'Result', 'pressark' ),
+		};
+	}
+
+	private function operational_signal_label( string $signal ): string {
+		return match ( sanitize_key( $signal ) ) {
+			'approval' => __( 'Approval', 'pressark' ),
+			'billing'  => __( 'Billing', 'pressark' ),
+			'failure'  => __( 'Failure', 'pressark' ),
+			'fallback' => __( 'Fallback', 'pressark' ),
+			'note'     => __( 'Note', 'pressark' ),
+			'pending'  => __( 'Pending', 'pressark' ),
+			'receipt'  => __( 'Receipt', 'pressark' ),
+			default    => ucfirst( sanitize_text_field( $signal ) ),
+		};
 	}
 
 	private function short_identifier( string $value ): string {
@@ -1728,6 +2080,57 @@ class PressArk_Admin_Activity {
 	private function get_inline_css(): string {
 		return '
 		.pressark-scope-tabs { margin-bottom: 6px; }
+		.pressark-operational-search-card {
+			margin: 12px 0 16px;
+			padding: 12px 16px;
+			background: #fff;
+			border: 1px solid #dcdcde;
+			border-radius: 6px;
+		}
+		.pressark-operational-search {
+			display: flex;
+			flex-wrap: wrap;
+			gap: 8px;
+			align-items: center;
+		}
+		.pressark-operational-search .regular-text {
+			flex: 1 1 360px;
+			max-width: 720px;
+		}
+		.pressark-operational-results-card {
+			margin-top: 0;
+		}
+		.pressark-operational-query {
+			margin: 10px 0 12px;
+		}
+		.pressark-operational-chip-row {
+			display: flex;
+			flex-wrap: wrap;
+			gap: 8px;
+			margin: 8px 0;
+		}
+		.pressark-operational-chip,
+		.pressark-operational-kind {
+			display: inline-flex;
+			align-items: center;
+			gap: 6px;
+			padding: 3px 9px;
+			border-radius: 999px;
+			background: #eef2ff;
+			color: #1d2327;
+			font-size: 12px;
+			line-height: 1.4;
+			white-space: nowrap;
+		}
+		.pressark-operational-chip--signal {
+			background: #f0f6fc;
+		}
+		.pressark-operational-table td {
+			vertical-align: top;
+		}
+		.pressark-operational-meta {
+			margin-top: 6px;
+		}
 		.pressark-status {
 			display: inline-block;
 			padding: 2px 8px;
@@ -1756,6 +2159,56 @@ class PressArk_Admin_Activity {
 			margin-top: 16px;
 		}
 		.pressark-detail-card .form-table th { width: 150px; }
+		.pressark-progress-card {
+			margin: 16px 0;
+			padding: 16px;
+			border: 1px solid #dcdcde;
+			border-radius: 6px;
+			background: #f6f7f7;
+		}
+		.pressark-progress-card h3 {
+			margin: 0 0 8px;
+		}
+		.pressark-progress-headline {
+			margin: 6px 0;
+			font-size: 15px;
+			font-weight: 600;
+			color: #1d2327;
+		}
+		.pressark-progress-headline--compact {
+			font-size: 13px;
+			margin-top: 6px;
+		}
+		.pressark-progress-meta,
+		.pressark-progress-milestone {
+			margin: 4px 0 0;
+			font-size: 12px;
+			color: #50575e;
+		}
+		.pressark-progress-grid {
+			display: grid;
+			grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+			gap: 10px;
+			margin-top: 12px;
+		}
+		.pressark-progress-fact {
+			padding: 10px 12px;
+			border: 1px solid #dcdcde;
+			border-radius: 4px;
+			background: #fff;
+		}
+		.pressark-progress-fact h4 {
+			margin: 0 0 4px;
+			font-size: 11px;
+			text-transform: uppercase;
+			letter-spacing: 0.04em;
+			color: #50575e;
+		}
+		.pressark-progress-fact p {
+			margin: 0;
+			font-size: 13px;
+			color: #1d2327;
+		}
 		.pressark-result-message {
 			background: #f6f7f7;
 			border-left: 4px solid #2271b1;

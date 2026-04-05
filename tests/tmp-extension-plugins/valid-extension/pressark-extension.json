@@ -1,0 +1,35 @@
+{
+    "schema_version": "1.0",
+    "name": "Valid PressArk Extension",
+    "version": "1.2.0",
+    "trust": {
+        "class": "verified_evidence",
+        "prompt_injection_class": "none"
+    },
+    "operations": [
+        {
+            "name": "ext_sync",
+            "verification": {
+                "strategy": "read_back",
+                "read_tool": "read_content",
+                "intensity": "thorough",
+                "nudge": true
+            },
+            "invalidation": {
+                "scope": "site",
+                "reason": "Extension sync changes site state."
+            }
+        }
+    ],
+    "resources": [
+        {
+            "uri": "pressark://ext/demo",
+            "trust_class": "verified_evidence",
+            "prompt_injection_class": "none"
+        }
+    ],
+    "self_test": {
+        "hook": "valid_extension_self_test",
+        "required": true
+    }
+}

@@ -169,6 +169,7 @@ require_once __DIR__ . '/../includes/class-pressark-evidence-receipt.php';
 require_once __DIR__ . '/../includes/class-pressark-execution-ledger.php';
 require_once __DIR__ . '/../includes/class-pressark-checkpoint.php';
 require_once __DIR__ . '/../includes/class-pressark-run-trust-surface.php';
+require_once __DIR__ . '/../includes/class-pressark-site-playbook.php';
 require_once __DIR__ . '/../includes/class-pressark-tool-result-artifacts.php';
 require_once __DIR__ . '/../includes/class-pressark-resource-registry.php';
 require_once __DIR__ . '/helpers/harness-fixtures.php';
@@ -479,6 +480,24 @@ $ledger['receipts'][0]['verification'] = array(
 	'evidence' => 'Read-back matched title.',
 );
 $prompt_checkpoint->set_execution( $ledger );
+$pressark_test_options[ PressArk_Site_Playbook::OPTION_KEY ] = array(
+	array(
+		'id'          => 'playbook_brand',
+		'title'       => 'Brand guardrails',
+		'body'        => 'Avoid the phrase "cheap plan"; use "entry plan" instead.',
+		'task_types'  => array( 'analyze', 'generate', 'edit' ),
+		'tool_groups' => array( 'generation', 'core' ),
+		'updated_at'  => '2026-04-05 09:00:00',
+	),
+	array(
+		'id'          => 'playbook_checkout',
+		'title'       => 'Checkout approvals',
+		'body'        => 'Never modify checkout, pricing, or shipping workflows without explicit human approval.',
+		'task_types'  => array( 'edit' ),
+		'tool_groups' => array( 'woocommerce', 'settings' ),
+		'updated_at'  => '2026-04-05 08:00:00',
+	),
+);
 
 $agent           = new PressArk_Agent( new PressArk_AI_Connector(), new PressArk_Action_Engine(), 'free' );
 $sections_method = new ReflectionMethod( PressArk_Agent::class, 'build_round_prompt_sections' );
@@ -492,7 +511,7 @@ $sections = $sections_method->invoke(
 	42,
 	'Summarize the Alpha page',
 	'analyze',
-	array( 'groups' => array() ),
+	array( 'groups' => array( 'generation', 'core' ) ),
 	$prompt_checkpoint
 );
 $prompt = $compose_method->invoke( $agent, $sections );
@@ -524,6 +543,24 @@ assert_contains_rmt(
 	'Untrusted content appears in the untrusted section',
 	'Alpha page content loaded',
 	$untrusted_slice
+);
+assert_contains_rmt(
+	'Relevant Site Playbook entry is injected into the prompt',
+	'Brand guardrails: Avoid the phrase "cheap plan"; use "entry plan" instead.',
+	$prompt
+);
+assert_true_rmt(
+	'Irrelevant Site Playbook entry is not injected for non-matching task/group scope',
+	false === strpos( $prompt, 'Checkout approvals' )
+);
+assert_true_rmt(
+	'Prompt inspector reports Site Playbook inclusion',
+	! empty( $sections['inspector']['site_playbook_included'] )
+);
+assert_eq_rmt(
+	'Prompt inspector exposes selected Site Playbook title',
+	'Brand guardrails',
+	$sections['inspector']['site_playbook_titles'][0] ?? ''
 );
 
 $evidence_ledger = PressArk_Execution_Ledger::record_write(

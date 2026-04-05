@@ -73,7 +73,7 @@ class PressArk_Harness_Readiness {
 	 *
 	 * @return array<string,mixed>
 	 */
-	public static function get_snapshot(): array {
+	public static function get_snapshot( bool $include_graph = true ): array {
 		$license        = new PressArk_License();
 		$tier           = $license->get_tier();
 		$is_byok        = PressArk_Entitlements::is_byok();
@@ -104,7 +104,7 @@ class PressArk_Harness_Readiness {
 		}
 		$issues = array_values( array_unique( array_filter( array_map( 'sanitize_text_field', $issues ) ) ) );
 
-		return array(
+		$snapshot = array(
 			'contract'       => 'HarnessReadiness',
 			'version'        => 1,
 			'generated_at'   => gmdate( 'c' ),
@@ -127,6 +127,12 @@ class PressArk_Harness_Readiness {
 			),
 			'tool_groups'    => $tool_groups,
 		);
+
+		if ( $include_graph && class_exists( 'PressArk_Capability_Health' ) ) {
+			$snapshot['capability_graph'] = PressArk_Capability_Health::get_snapshot( $snapshot );
+		}
+
+		return $snapshot;
 	}
 
 	/**

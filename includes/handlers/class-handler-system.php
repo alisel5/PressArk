@@ -1261,25 +1261,39 @@ class PressArk_Handler_System extends PressArk_Handler_Base {
 		$active   = count( array_filter( $plugins, fn( $p ) => $p['active'] ) );
 		$inactive = count( $plugins ) - $active;
 		$updates  = count( array_filter( $plugins, fn( $p ) => $p['update_available'] ) );
+		$extensions = count( array_filter(
+			$plugins,
+			static fn( array $plugin ): bool => ! empty( $plugin['pressark_extension']['detected'] )
+		) );
+
+		$message = $updates
+			? sprintf(
+				/* translators: 1: total plugins, 2: active plugins, 3: inactive plugins, 4: plugins with updates available. */
+				__( '%1$d plugins installed (%2$d active, %3$d inactive, %4$d updates available).', 'pressark' ),
+				count( $plugins ),
+				$active,
+				$inactive,
+				$updates
+			)
+			: sprintf(
+				/* translators: 1: total plugins, 2: active plugins, 3: inactive plugins. */
+				__( '%1$d plugins installed (%2$d active, %3$d inactive).', 'pressark' ),
+				count( $plugins ),
+				$active,
+				$inactive
+			);
+
+		if ( $extensions > 0 ) {
+			$message .= ' ' . sprintf(
+				/* translators: %d: number of detected PressArk extensions */
+				__( '%d PressArk extension manifest(s) detected.', 'pressark' ),
+				$extensions
+			);
+		}
 
 		return array(
 			'success' => true,
-			'message' => $updates
-				? sprintf(
-					/* translators: 1: total plugins, 2: active plugins, 3: inactive plugins, 4: plugins with updates available. */
-					__( '%1$d plugins installed (%2$d active, %3$d inactive, %4$d updates available).', 'pressark' ),
-					count( $plugins ),
-					$active,
-					$inactive,
-					$updates
-				)
-				: sprintf(
-					/* translators: 1: total plugins, 2: active plugins, 3: inactive plugins. */
-					__( '%1$d plugins installed (%2$d active, %3$d inactive).', 'pressark' ),
-					count( $plugins ),
-					$active,
-					$inactive
-				),
+			'message' => $message,
 			'data'    => $plugins,
 		);
 	}
@@ -2005,14 +2019,43 @@ class PressArk_Handler_System extends PressArk_Handler_Base {
 	public function preview_toggle_plugin( array $params, array $action ): array {
 		$pf = $params['plugin_file'] ?? ( $action['plugin_file'] ?? '' );
 		$pa = (bool) ( $params['activate'] ?? ( $action['activate'] ?? true ) );
-		return array(
-			'changes' => array(
-				array(
-					'field'  => __( 'Plugin', 'pressark' ),
-					'before' => $pf,
-					'after'  => $pa ? __( 'Activate', 'pressark' ) : __( 'Deactivate', 'pressark' ),
-				),
+		$changes = array(
+			array(
+				'field'  => __( 'Plugin', 'pressark' ),
+				'before' => $pf,
+				'after'  => $pa ? __( 'Activate', 'pressark' ) : __( 'Deactivate', 'pressark' ),
 			),
+		);
+
+		if ( $pa && class_exists( 'PressArk_Extension_Manifests' ) ) {
+			$report = PressArk_Extension_Manifests::get_report( (string) $pf );
+			if ( ! empty( $report['has_manifest'] ) ) {
+				$summary = is_array( $report['summary'] ?? null ) ? $report['summary'] : array();
+				$changes[] = array(
+					'field'  => __( 'Extension Manifest', 'pressark' ),
+					'before' => ! empty( $report['valid'] ) ? __( 'Validated', 'pressark' ) : __( 'Blocked', 'pressark' ),
+					'after'  => sprintf(
+						/* translators: 1: operation count 2: resource count */
+						__( '%1$d operations, %2$d resources', 'pressark' ),
+						(int) ( $summary['operations_count'] ?? 0 ),
+						(int) ( $summary['resources_count'] ?? 0 )
+					),
+				);
+
+				$changes[] = array(
+					'field'  => __( 'Trust Review', 'pressark' ),
+					'before' => sprintf(
+						'%s / %s',
+						(string) ( $summary['trust_class'] ?? 'derived_summary' ),
+						(string) ( $summary['prompt_injection_class'] ?? 'guarded' )
+					),
+					'after'  => sanitize_text_field( (string) ( $report['errors'][0] ?? $report['trust_warning'] ?? __( 'Review extension manifest metadata before enabling.', 'pressark' ) ) ),
+				);
+			}
+		}
+
+		return array(
+			'changes' => $changes,
 		);
 	}
 

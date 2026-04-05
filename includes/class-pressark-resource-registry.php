@@ -34,6 +34,9 @@ class PressArk_Resource_Registry {
 	/** Maximum transient TTL (24 hours). */
 	private const MAX_TTL = DAY_IN_SECONDS;
 
+	/** Safe one-minute cache TTL for stripped-down test contexts. */
+	private const FALLBACK_MINUTE_TTL = 60;
+
 	// ── Registration ────────────────────────────────────────────────
 
 	/**
@@ -55,6 +58,10 @@ class PressArk_Resource_Registry {
 		$uri = $def['uri'] ?? '';
 		if ( empty( $uri ) || ! str_starts_with( $uri, 'pressark://' ) ) {
 			return;
+		}
+
+		if ( class_exists( 'PressArk_Extension_Manifests' ) ) {
+			$def = PressArk_Extension_Manifests::overlay_resource_definition( $def );
 		}
 
 		self::$resources[ $uri ] = wp_parse_args( $def, array(
@@ -259,6 +266,135 @@ class PressArk_Resource_Registry {
 	}
 
 	/**
+	 * Describe resource-group availability, including hidden providers.
+	 *
+	 * @return array<string,array<string,mixed>>
+	 */
+	public static function get_group_health(): array {
+		self::ensure_booted();
+
+		$groups = array();
+
+		foreach ( self::$resources as $uri => $def ) {
+			$group = sanitize_key( (string) ( $def['group'] ?? 'general' ) );
+			if ( '' === $group ) {
+				$group = 'general';
+			}
+
+			if ( ! isset( $groups[ $group ] ) ) {
+				$groups[ $group ] = array(
+					'group'          => $group,
+					'label'          => ucwords( str_replace( array( '_', '-' ), ' ', $group ) ),
+					'state'          => 'healthy',
+					'status'         => 'available',
+					'summary'        => 'Resource provider is available.',
+					'available'      => true,
+					'visible'        => true,
+					'hidden'         => false,
+					'visible_count'  => 0,
+					'hidden_count'   => 0,
+					'requires'       => array(),
+					'hidden_reasons' => array(),
+				);
+			}
+
+			$requires = sanitize_key( (string) ( $def['requires'] ?? '' ) );
+			$visible  = self::dependency_met( $def );
+
+			if ( $visible ) {
+				++$groups[ $group ]['visible_count'];
+			} else {
+				++$groups[ $group ]['hidden_count'];
+				if ( '' !== $requires ) {
+					$groups[ $group ]['hidden_reasons'][] = self::dependency_summary( $requires, 'resource' );
+				}
+			}
+
+			if ( '' !== $requires ) {
+				$groups[ $group ]['requires'][ $requires ] = true;
+			}
+
+			$groups[ $group ]['resources'][] = array(
+				'uri'           => $uri,
+				'name'          => sanitize_text_field( (string) ( $def['name'] ?? '' ) ),
+				'visible'       => $visible,
+				'requires'      => $requires,
+				'hidden_reason' => $visible || '' === $requires ? '' : self::dependency_summary( $requires, 'resource' ),
+			);
+		}
+
+		if ( PressArk_Tool_Result_Artifacts::has_resource_entries( get_current_user_id() ) ) {
+			$groups['tool-results'] = array(
+				'group'          => 'tool-results',
+				'label'          => 'Tool Results',
+				'state'          => 'healthy',
+				'status'         => 'available',
+				'summary'        => 'Recent tool-result artifacts are available as resources.',
+				'available'      => true,
+				'visible'        => true,
+				'hidden'         => false,
+				'visible_count'  => count( PressArk_Tool_Result_Artifacts::list_resource_entries( get_current_user_id(), 8 ) ),
+				'hidden_count'   => 0,
+				'requires'       => array(),
+				'hidden_reasons' => array(),
+				'resources'      => array(),
+			);
+		}
+
+		foreach ( $groups as $group => $data ) {
+			$visible_count  = (int) ( $data['visible_count'] ?? 0 );
+			$hidden_count   = (int) ( $data['hidden_count'] ?? 0 );
+			$hidden_reasons = array_values(
+				array_unique(
+					array_filter(
+						array_map( 'sanitize_text_field', (array) ( $data['hidden_reasons'] ?? array() ) )
+					)
+				)
+			);
+
+			$groups[ $group ]['requires']       = array_values( array_map( 'sanitize_key', array_keys( (array) ( $data['requires'] ?? array() ) ) ) );
+			$groups[ $group ]['hidden_reasons'] = $hidden_reasons;
+
+			if ( $visible_count > 0 && 0 === $hidden_count ) {
+				$groups[ $group ]['state']     = 'healthy';
+				$groups[ $group ]['status']    = 'available';
+				$groups[ $group ]['summary']   = 'Resource provider is available.';
+				$groups[ $group ]['available'] = true;
+				$groups[ $group ]['visible']   = true;
+				$groups[ $group ]['hidden']    = false;
+				continue;
+			}
+
+			if ( $visible_count > 0 && $hidden_count > 0 ) {
+				$groups[ $group ]['state']     = 'degraded';
+				$groups[ $group ]['status']    = 'partial';
+				$groups[ $group ]['summary']   = ! empty( $hidden_reasons )
+					? $hidden_reasons[0]
+					: 'Some resources in this provider are hidden until their prerequisites are available.';
+				$groups[ $group ]['available'] = true;
+				$groups[ $group ]['visible']   = true;
+				$groups[ $group ]['hidden']    = false;
+				continue;
+			}
+
+			if ( 0 === $visible_count && $hidden_count > 0 ) {
+				$groups[ $group ]['state']     = 'absent';
+				$groups[ $group ]['status']    = 'hidden';
+				$groups[ $group ]['summary']   = ! empty( $hidden_reasons )
+					? $hidden_reasons[0]
+					: 'Resources are hidden until their prerequisites are available.';
+				$groups[ $group ]['available'] = false;
+				$groups[ $group ]['visible']   = false;
+				$groups[ $group ]['hidden']    = true;
+			}
+		}
+
+		ksort( $groups );
+
+		return $groups;
+	}
+
+	/**
 	 * Check if a resource URI exists.
 	 */
 	public static function exists( string $uri ): bool {
@@ -388,7 +524,17 @@ class PressArk_Resource_Registry {
 			'description'   => 'Canonical PressArk readiness across billing, providers, profiles, indexing, and background work',
 			'group'         => 'site',
 			'resolver'      => array( 'PressArk_Harness_Readiness', 'get_snapshot' ),
-			'ttl'           => MINUTE_IN_SECONDS,
+			'ttl'           => self::minute_in_seconds(),
+			'invalidate_on' => array(),
+		) );
+
+		self::register( array(
+			'uri'           => 'pressark://site/capability-health',
+			'name'          => 'Capability Health Graph',
+			'description'   => 'Normalized capability and provider health across bank reachability, profile freshness, indexing, and hidden domains',
+			'group'         => 'site',
+			'resolver'      => array( 'PressArk_Capability_Health', 'get_snapshot' ),
+			'ttl'           => self::minute_in_seconds(),
 			'invalidate_on' => array(),
 		) );
 
@@ -478,6 +624,18 @@ class PressArk_Resource_Registry {
 			'resolver'      => array( __CLASS__, 'resolve_plugin_namespaces' ),
 			'ttl'           => HOUR_IN_SECONDS,
 			'invalidate_on' => array( 'activated_plugin', 'deactivated_plugin' ),
+		) );
+
+		self::register( array(
+			'uri'           => 'pressark://extensions/manifests',
+			'name'          => 'PressArk Extension Manifests',
+			'description'   => 'Normalized manifest declarations for third-party PressArk extensions and add-ons',
+			'group'         => 'extensions',
+			'resolver'      => array( 'PressArk_Extension_Manifests', 'list_resource_payload' ),
+			'ttl'           => HOUR_IN_SECONDS,
+			'invalidate_on' => array( 'activated_plugin', 'deactivated_plugin' ),
+			'trust_class'   => 'derived_summary',
+			'provider'      => 'extension_manifest_registry',
 		) );
 
 		// ── Conditional: WooCommerce ──
@@ -989,6 +1147,28 @@ class PressArk_Resource_Registry {
 			'elementor'   => defined( 'ELEMENTOR_VERSION' ),
 			default       => true,
 		};
+	}
+
+	private static function dependency_summary( string $dependency, string $surface = 'resource' ): string {
+		$dependency = sanitize_key( $dependency );
+		$surface    = sanitize_key( $surface );
+
+		return match ( $dependency ) {
+			'woocommerce' => 'resource' === $surface
+				? 'WooCommerce resources are hidden until WooCommerce is active.'
+				: 'WooCommerce tool groups are hidden until WooCommerce is active.',
+			'elementor' => 'resource' === $surface
+				? 'Elementor resources are hidden until Elementor is active.'
+				: 'Elementor tool groups are hidden until Elementor is active.',
+			default => ucfirst( sanitize_text_field( str_replace( array( '_', '-' ), ' ', $dependency ) ) )
+				. ' '
+				. ( 'resource' === $surface ? 'resources are' : 'tool groups are' )
+				. ' hidden until the dependency is available.',
+		};
+	}
+
+	private static function minute_in_seconds(): int {
+		return defined( 'MINUTE_IN_SECONDS' ) ? MINUTE_IN_SECONDS : self::FALLBACK_MINUTE_TTL;
 	}
 
 	/**

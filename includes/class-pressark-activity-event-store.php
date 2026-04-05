@@ -179,6 +179,67 @@ class PressArk_Activity_Event_Store {
 	}
 
 	/**
+	 * Read recent events for multiple task IDs in one query.
+	 *
+	 * Returns a map keyed by task_id with each value ordered oldest → newest.
+	 *
+	 * @param array<int,string> $task_ids Task IDs.
+	 * @param int               $limit_per_task Max events to retain per task.
+	 * @return array<string,array<int,array<string,mixed>>>
+	 */
+	public function get_by_tasks( array $task_ids, int $limit_per_task = 40 ): array {
+		global $wpdb;
+		$table = self::table_name();
+
+		$task_ids = array_values(
+			array_filter(
+				array_map(
+					static function ( $task_id ): string {
+						return sanitize_text_field( (string) $task_id );
+					},
+					$task_ids
+				),
+				static function ( string $task_id ): bool {
+					return '' !== $task_id;
+				}
+			)
+		);
+
+		if ( empty( $task_ids ) ) {
+			return array();
+		}
+
+		$rows = $wpdb->get_results(
+			$wpdb->prepare(
+				"SELECT * FROM {$table}
+				 WHERE task_id IN (" . implode( ',', array_fill( 0, count( $task_ids ), '%s' ) ) . ')
+				 ORDER BY created_at ASC, id ASC',
+				...$task_ids
+			),
+			ARRAY_A
+		);
+
+		$grouped = array();
+		foreach ( $this->decode_rows( is_array( $rows ) ? $rows : array() ) as $row ) {
+			$task_id = (string) ( $row['task_id'] ?? '' );
+			if ( '' === $task_id ) {
+				continue;
+			}
+
+			if ( ! isset( $grouped[ $task_id ] ) ) {
+				$grouped[ $task_id ] = array();
+			}
+
+			$grouped[ $task_id ][] = $row;
+			if ( $limit_per_task > 0 && count( $grouped[ $task_id ] ) > $limit_per_task ) {
+				array_shift( $grouped[ $task_id ] );
+			}
+		}
+
+		return $grouped;
+	}
+
+	/**
 	 * Query recent events for diagnostics dashboards.
 	 *
 	 * Supported filters: event_types, reasons, since, run_id, task_id.

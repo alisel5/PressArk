@@ -847,6 +847,8 @@ class PressArk_Task_Store {
 			$task['read_at'] = current_time( 'mysql', true );
 		}
 
+		$task['progress'] = $this->build_progress_snapshot( $task );
+
 		return $task;
 	}
 
@@ -971,6 +973,645 @@ class PressArk_Task_Store {
 	/**
 	 * Emit a concise insert failure log for support/debugging.
 	 */
+	public function get_progress_snapshots( array $task_ids ): array {
+		global $wpdb;
+		$table = self::table_name();
+
+		$task_ids = array_values(
+			array_filter(
+				array_map(
+					static function ( $task_id ): string {
+						return sanitize_text_field( (string) $task_id );
+					},
+					$task_ids
+				),
+				static function ( string $task_id ): bool {
+					return '' !== $task_id;
+				}
+			)
+		);
+
+		if ( empty( $task_ids ) ) {
+			return array();
+		}
+
+		$rows = $wpdb->get_results(
+			$wpdb->prepare(
+				"SELECT task_id, run_id, parent_run_id, root_run_id, user_id, message, status,
+				        retries, max_retries, fail_reason, payload, handoff_capsule, result,
+				        created_at, started_at, completed_at
+				 FROM {$table}
+				 WHERE task_id IN (" . implode( ',', array_fill( 0, count( $task_ids ), '%s' ) ) . ')',
+				...$task_ids
+			),
+			ARRAY_A
+		);
+
+		if ( ! $rows ) {
+			return array();
+		}
+
+		$events_by_task = class_exists( 'PressArk_Activity_Event_Store' )
+			? ( new PressArk_Activity_Event_Store() )->get_by_tasks( $task_ids, 40 )
+			: array();
+
+		$snapshots = array();
+		foreach ( $rows as $row ) {
+			$task = $this->decode_row( $row );
+			$snapshots[ $task['task_id'] ] = $this->build_progress_snapshot(
+				$task,
+				$events_by_task[ $task['task_id'] ] ?? array()
+			);
+		}
+
+		return $snapshots;
+	}
+
+	/**
+	 * Build a deterministic background-progress snapshot from task state + events.
+	 *
+	 * @param array<string,mixed>                 $task   Decoded task row.
+	 * @param array<int,array<string,mixed>>|null $events Optional task-linked events.
+	 * @return array<string,mixed>
+	 */
+	public function build_progress_snapshot( array $task, ?array $events = null ): array {
+		$task_id = sanitize_text_field( (string) ( $task['task_id'] ?? '' ) );
+		if ( '' === $task_id ) {
+			return array();
+		}
+
+		if ( null === $events && class_exists( 'PressArk_Activity_Event_Store' ) ) {
+			$events = ( new PressArk_Activity_Event_Store() )->get_by_task( $task_id, 40 );
+		}
+		$events = is_array( $events ) ? $events : array();
+
+		$checkpoints      = $this->progress_checkpoints( $task );
+		$plan_phase       = $this->extract_progress_plan_phase( $task, $checkpoints );
+		$stage_key        = $this->extract_progress_stage( $task, $events, $checkpoints );
+		$stage_label      = $this->progress_stage_label( $stage_key, $plan_phase );
+		$stage_action     = $this->progress_stage_action( $stage_key, $plan_phase );
+		$target_label     = $this->extract_progress_target( $task, $checkpoints );
+		$execution        = $this->extract_execution_progress( $task, $checkpoints );
+		$meaningful_event = $this->select_meaningful_progress_event( $events );
+		$event_label      = $this->format_progress_event_label( $meaningful_event );
+		$result_type      = sanitize_key( (string) ( $task['result']['type'] ?? '' ) );
+		$failure          = $this->extract_failure_context( $task );
+		$state_key        = $this->determine_progress_state(
+			$task,
+			$meaningful_event,
+			$stage_key,
+			$result_type,
+			$execution,
+			$failure
+		);
+		$state_label      = $this->progress_state_label( $state_key );
+
+		return array(
+			'state_key'         => $state_key,
+			'state_label'       => $state_label,
+			'stage_key'         => $stage_key,
+			'stage_label'       => $stage_label,
+			'event_label'       => $event_label,
+			'event_type'        => (string) ( $meaningful_event['event_type'] ?? '' ),
+			'target_label'      => $target_label,
+			'headline'          => $this->build_progress_headline(
+				$task,
+				$state_key,
+				$stage_action,
+				$stage_label,
+				$target_label,
+				$result_type,
+				$meaningful_event,
+				$failure
+			),
+			'summary'           => $this->build_progress_summary( $state_label, $stage_label, $event_label, $target_label ),
+			'milestone_summary' => $this->build_progress_milestone_summary( $task, $execution, $state_key ),
+			'completed_labels'  => $execution['completed_labels'],
+			'remaining_labels'  => $execution['remaining_labels'],
+			'blocked_labels'    => $execution['blocked_labels'],
+			'latest_event_at'   => (string) ( $meaningful_event['occurred_at'] ?? $meaningful_event['created_at'] ?? '' ),
+		);
+	}
+
+	private function progress_checkpoints( array $task ): array {
+		$candidates = array(
+			$task['result']['checkpoint'] ?? null,
+			$task['result']['workflow_state'] ?? null,
+			$task['payload']['checkpoint'] ?? null,
+		);
+
+		$checkpoints = array();
+		foreach ( $candidates as $candidate ) {
+			if ( is_array( $candidate ) && ! empty( $candidate ) ) {
+				$checkpoints[] = $candidate;
+			}
+		}
+
+		return $checkpoints;
+	}
+
+	private function extract_progress_stage( array $task, array $events, array $checkpoints ): string {
+		$result_type = sanitize_key( (string) ( $task['result']['type'] ?? '' ) );
+		if ( in_array( $result_type, array( 'preview', 'confirm_card' ), true ) ) {
+			return 'preview';
+		}
+
+		foreach ( $checkpoints as $checkpoint ) {
+			$stage = sanitize_key( (string) ( $checkpoint['workflow_stage'] ?? '' ) );
+			if ( '' !== $stage ) {
+				return $stage;
+			}
+		}
+
+		for ( $index = count( $events ) - 1; $index >= 0; $index-- ) {
+			$event = $events[ $index ];
+			if ( ! is_array( $event ) ) {
+				continue;
+			}
+
+			$payload = is_array( $event['payload'] ?? null ) ? $event['payload'] : array();
+			$stage   = sanitize_key( (string) ( $payload['workflow_stage'] ?? '' ) );
+			if ( '' !== $stage ) {
+				return $stage;
+			}
+		}
+
+		return sanitize_key( (string) ( $task['handoff_capsule']['workflow_stage'] ?? '' ) );
+	}
+
+	private function extract_progress_plan_phase( array $task, array $checkpoints ): string {
+		foreach ( $checkpoints as $checkpoint ) {
+			$phase = sanitize_key( (string) ( $checkpoint['plan_state']['phase'] ?? '' ) );
+			if ( '' !== $phase ) {
+				return $phase;
+			}
+		}
+
+		return sanitize_key( (string) ( $task['handoff_capsule']['plan_phase'] ?? '' ) );
+	}
+
+	private function extract_progress_target( array $task, array $checkpoints ): string {
+		foreach ( $checkpoints as $checkpoint ) {
+			$selected = is_array( $checkpoint['selected_target'] ?? null ) ? $checkpoint['selected_target'] : array();
+			if ( ! empty( $selected ) ) {
+				$label = $this->format_progress_target( $selected );
+				if ( '' !== $label ) {
+					return $label;
+				}
+			}
+
+			$current = is_array( $checkpoint['execution']['current_target'] ?? null ) ? $checkpoint['execution']['current_target'] : array();
+			if ( ! empty( $current ) ) {
+				$label = $this->format_progress_target( $current );
+				if ( '' !== $label ) {
+					return $label;
+				}
+			}
+		}
+
+		return sanitize_text_field( (string) ( $task['handoff_capsule']['target'] ?? '' ) );
+	}
+
+	private function format_progress_target( array $target ): string {
+		$title = sanitize_text_field( (string) ( $target['title'] ?? $target['post_title'] ?? '' ) );
+		$id    = absint( $target['id'] ?? $target['post_id'] ?? 0 );
+		$type  = sanitize_key( (string) ( $target['type'] ?? $target['post_type'] ?? '' ) );
+		$parts = array();
+
+		if ( '' !== $title ) {
+			$parts[] = $title;
+		}
+		if ( $id > 0 ) {
+			$parts[] = '#' . $id;
+		}
+		if ( '' !== $type ) {
+			$parts[] = '(' . $type . ')';
+		}
+
+		return trim( implode( ' ', $parts ) );
+	}
+
+	private function extract_execution_progress( array $task, array $checkpoints ): array {
+		$fallback = array(
+			'completed_labels' => array_values( array_filter( array_map( 'sanitize_text_field', (array) ( $task['handoff_capsule']['completed'] ?? array() ) ) ) ),
+			'remaining_labels' => array_values( array_filter( array_map( 'sanitize_text_field', (array) ( $task['handoff_capsule']['remaining'] ?? array() ) ) ) ),
+			'blocked_labels'   => array(),
+			'recent_receipts'  => array_values( array_filter( array_map( 'sanitize_text_field', (array) ( $task['handoff_capsule']['recent_receipts'] ?? array() ) ) ) ),
+		);
+
+		if ( ! class_exists( 'PressArk_Execution_Ledger' ) ) {
+			return $fallback;
+		}
+
+		foreach ( $checkpoints as $checkpoint ) {
+			$execution = is_array( $checkpoint['execution'] ?? null ) ? $checkpoint['execution'] : array();
+			if ( empty( $execution ) ) {
+				continue;
+			}
+
+			$progress = PressArk_Execution_Ledger::progress_snapshot( $execution );
+			if ( ! is_array( $progress ) || empty( $progress ) ) {
+				continue;
+			}
+
+			return array(
+				'completed_labels' => array_values( array_filter( array_map( 'sanitize_text_field', (array) ( $progress['completed_labels'] ?? array() ) ) ) ),
+				'remaining_labels' => array_values( array_filter( array_map( 'sanitize_text_field', (array) ( $progress['remaining_labels'] ?? array() ) ) ) ),
+				'blocked_labels'   => array_values( array_filter( array_map( 'sanitize_text_field', (array) ( $progress['blocked_labels'] ?? array() ) ) ) ),
+				'recent_receipts'  => $fallback['recent_receipts'],
+			);
+		}
+
+		return $fallback;
+	}
+
+	private function select_meaningful_progress_event( array $events ): array {
+		$best          = array();
+		$best_priority = -1;
+
+		for ( $index = count( $events ) - 1; $index >= 0; $index-- ) {
+			$event = $events[ $index ];
+			if ( ! is_array( $event ) ) {
+				continue;
+			}
+
+			$priority = $this->progress_event_priority( $event );
+			if ( $priority > $best_priority ) {
+				$best          = $event;
+				$best_priority = $priority;
+			}
+
+			if ( $priority >= 120 ) {
+				break;
+			}
+		}
+
+		return $best;
+	}
+
+	private function progress_event_priority( array $event ): int {
+		$event_type = (string) ( $event['event_type'] ?? '' );
+		$reason     = sanitize_key( (string) ( $event['reason'] ?? '' ) );
+		$status     = sanitize_key( (string) ( $event['status'] ?? '' ) );
+
+		if ( in_array( $reason, array( 'approval_wait_preview', 'approval_wait_confirm', 'approval_partial_progress' ), true ) ) {
+			return 120;
+		}
+		if ( 'worker.retry_scheduled' === $event_type ) {
+			return 115;
+		}
+		if ( 'worker.slot_contention' === $event_type ) {
+			return 112;
+		}
+		if ( 'worker.deferred' === $event_type ) {
+			return 110;
+		}
+		if ( 'worker.cancelled' === $event_type ) {
+			return 108;
+		}
+		if ( 'run.completed' === $event_type && 'failed' === $status ) {
+			return 106;
+		}
+		if ( 'worker.completed' === $event_type && 'failed' === $status ) {
+			return 104;
+		}
+		if ( 'blocked' === $status || in_array( $reason, array( 'preflight_blocked', 'entitlement_denied' ), true ) ) {
+			return 102;
+		}
+		if ( 'run.completed' === $event_type ) {
+			return 100;
+		}
+		if ( 'worker.claimed' === $event_type ) {
+			return 95;
+		}
+		if ( 'worker.completed' === $event_type ) {
+			return 92;
+		}
+		if ( 'worker.handoff' === $event_type ) {
+			return 85;
+		}
+		if ( ! empty( $event['summary'] ) && ! in_array( $event_type, array( 'run.started', 'run.phase_completed' ), true ) ) {
+			return 70;
+		}
+
+		return 0;
+	}
+
+	private function format_progress_event_label( array $event ): string {
+		if ( empty( $event ) ) {
+			return '';
+		}
+
+		$event_type  = (string) ( $event['event_type'] ?? '' );
+		$reason      = sanitize_key( (string) ( $event['reason'] ?? '' ) );
+		$status      = sanitize_key( (string) ( $event['status'] ?? '' ) );
+		$payload     = is_array( $event['payload'] ?? null ) ? $event['payload'] : array();
+		$delay       = absint( $payload['delay_seconds'] ?? 0 );
+		$result_type = sanitize_key( (string) ( $payload['result_type'] ?? '' ) );
+
+		return match ( true ) {
+			'approval_wait_preview' === $reason => 'Waiting for preview review',
+			'approval_wait_confirm' === $reason => 'Waiting for confirmation',
+			'approval_partial_progress' === $reason => 'Some confirmations are complete',
+			'worker.slot_contention' === $event_type => 'Waiting for a worker slot',
+			'worker.deferred' === $event_type && $delay > 0 => 'Re-queued for ' . $delay . 's',
+			'worker.deferred' === $event_type => 'Re-queued for the next slot',
+			'worker.retry_scheduled' === $event_type && $delay > 0 => 'Retry scheduled in ' . $delay . 's',
+			'worker.retry_scheduled' === $event_type => 'Retry scheduled',
+			'worker.claimed' === $event_type => 'Worker started',
+			'worker.handoff' === $event_type => 'Saved to the queue',
+			'worker.cancelled' === $event_type => 'Cancelled before execution',
+			'worker.completed' === $event_type && 'failed' === $status => 'Worker finished with a failure',
+			'worker.completed' === $event_type && 'preview' === $result_type => 'Preview prepared',
+			'worker.completed' === $event_type && 'confirm_card' === $result_type => 'Confirmation prepared',
+			'worker.completed' === $event_type => 'Background work completed',
+			'run.completed' === $event_type && 'failed' === $status => 'Run failed',
+			'run.completed' === $event_type => 'Run settled',
+			'blocked' === $status || in_array( $reason, array( 'preflight_blocked', 'entitlement_denied' ), true ) => 'Blocked by safety checks',
+			default => rtrim( sanitize_text_field( (string) ( $event['summary'] ?? '' ) ), '.' ),
+		};
+	}
+
+	private function extract_failure_context( array $task ): array {
+		$failure_class   = '';
+		$failure_message = '';
+		$last_failure    = is_array( $task['payload']['_last_failure'] ?? null ) ? $task['payload']['_last_failure'] : array();
+
+		if ( ! empty( $last_failure['class'] ) ) {
+			$failure_class = sanitize_key( (string) $last_failure['class'] );
+		}
+		if ( ! empty( $last_failure['message'] ) ) {
+			$failure_message = sanitize_text_field( (string) $last_failure['message'] );
+		}
+
+		$reason = trim( (string) ( $task['fail_reason'] ?? '' ) );
+		if ( '' !== $reason && preg_match( '/^\[([a-z0-9_]+)\]\s*(.+)$/i', $reason, $matches ) ) {
+			if ( '' === $failure_class ) {
+				$failure_class = sanitize_key( (string) $matches[1] );
+			}
+			$reason = (string) $matches[2];
+		}
+		if ( '' !== $reason ) {
+			$failure_message = sanitize_text_field( $reason );
+		}
+
+		return array(
+			'class'   => $failure_class,
+			'message' => $failure_message,
+		);
+	}
+
+	private function determine_progress_state(
+		array $task,
+		array $event,
+		string $stage_key,
+		string $result_type,
+		array $execution,
+		array $failure
+	): string {
+		$task_status  = sanitize_key( (string) ( $task['status'] ?? '' ) );
+		$event_reason = sanitize_key( (string) ( $event['reason'] ?? '' ) );
+		$event_status = sanitize_key( (string) ( $event['status'] ?? '' ) );
+
+		if ( in_array( $event_reason, array( 'approval_wait_preview', 'approval_wait_confirm', 'approval_partial_progress' ), true )
+			|| in_array( $result_type, array( 'preview', 'confirm_card' ), true ) ) {
+			return 'waiting';
+		}
+
+		if ( 'retry_async_failure' === $event_reason
+			|| 'retrying' === $event_status
+			|| ( 'queued' === $task_status && (int) ( $task['retries'] ?? 0 ) > 0 && ! empty( $task['payload']['_last_failure'] ) ) ) {
+			return 'retrying';
+		}
+
+		if ( in_array( $event_reason, array( 'worker_slot_contention', 'worker_deferred' ), true )
+			|| ( 'waiting' === $event_status && in_array( $task_status, array( 'queued', 'running' ), true ) ) ) {
+			return 'waiting';
+		}
+
+		if ( 'worker_cancelled' === $event_reason ) {
+			return 'blocked';
+		}
+
+		if ( 'verify' === $stage_key && 'running' === $task_status ) {
+			return 'verifying';
+		}
+
+		if ( 'blocked' === $event_status || ! empty( $execution['blocked_labels'] ) ) {
+			return 'blocked';
+		}
+
+		if ( in_array( $task_status, array( 'failed', 'dead_letter' ), true ) ) {
+			return $this->is_blocked_failure( $failure['class'], $failure['message'] ) ? 'blocked' : 'failed';
+		}
+
+		if ( in_array( $task_status, array( 'complete', 'delivered', 'undelivered' ), true ) ) {
+			return 'complete';
+		}
+
+		if ( 'running' === $task_status ) {
+			return 'running';
+		}
+
+		return 'queued';
+	}
+
+	private function is_blocked_failure( string $failure_class, string $failure_message ): bool {
+		if ( in_array( $failure_class, array( 'validation', 'bad_retrieval', 'side_effect_risk' ), true ) ) {
+			return true;
+		}
+
+		$message = strtolower( $failure_message );
+		return str_contains( $message, 'blocked' )
+			|| str_contains( $message, 'denied' )
+			|| str_contains( $message, 'not allowed' )
+			|| str_contains( $message, 'cannot safely retry' )
+			|| str_contains( $message, 'cancelled before execution' );
+	}
+
+	private function progress_state_label( string $state_key ): string {
+		return match ( $state_key ) {
+			'queued'    => 'Queued',
+			'running'   => 'In Progress',
+			'waiting'   => 'Waiting',
+			'retrying'  => 'Retrying',
+			'verifying' => 'Verifying',
+			'blocked'   => 'Blocked',
+			'failed'    => 'Failed',
+			'complete'  => 'Complete',
+			default     => 'Queued',
+		};
+	}
+
+	private function progress_stage_label( string $stage_key, string $plan_phase = '' ): string {
+		if ( 'plan' === $stage_key ) {
+			return match ( $plan_phase ) {
+				'exploring' => 'Explore',
+				'executing' => 'Execute',
+				default     => 'Plan',
+			};
+		}
+
+		return match ( $stage_key ) {
+			'discover' => 'Discover',
+			'gather'   => 'Gather',
+			'preview'  => 'Preview',
+			'apply'    => 'Apply',
+			'verify'   => 'Verify',
+			'settled'  => 'Settled',
+			default    => '',
+		};
+	}
+
+	private function progress_stage_action( string $stage_key, string $plan_phase = '' ): string {
+		if ( 'plan' === $stage_key ) {
+			return match ( $plan_phase ) {
+				'exploring' => 'exploring the request',
+				'executing' => 'executing the approved plan',
+				default     => 'planning the work',
+			};
+		}
+
+		return match ( $stage_key ) {
+			'discover' => 'discovering the right tools',
+			'gather'   => 'gathering context',
+			'preview'  => 'preparing a preview',
+			'apply'    => 'applying changes',
+			'verify'   => 'verifying results',
+			'settled'  => 'settling the run',
+			default    => 'working through the request',
+		};
+	}
+
+	private function build_progress_headline(
+		array $task,
+		string $state_key,
+		string $stage_action,
+		string $stage_label,
+		string $target_label,
+		string $result_type,
+		array $event,
+		array $failure
+	): string {
+		$event_reason    = sanitize_key( (string) ( $event['reason'] ?? '' ) );
+		$target_suffix   = '' !== $target_label ? ' for ' . $target_label : '';
+		$failure_summary = $this->summarize_failure_message( $failure['message'] );
+
+		switch ( $state_key ) {
+			case 'waiting':
+				if ( 'approval_wait_preview' === $event_reason || 'preview' === $result_type ) {
+					return 'Waiting for preview review' . $target_suffix . '.';
+				}
+				if ( 'approval_wait_confirm' === $event_reason || 'confirm_card' === $result_type ) {
+					return 'Waiting for confirmation before applying changes' . $target_suffix . '.';
+				}
+				if ( 'approval_partial_progress' === $event_reason ) {
+					return 'Waiting on the remaining confirmations' . $target_suffix . '.';
+				}
+				if ( in_array( $event_reason, array( 'worker_slot_contention', 'worker_deferred' ), true ) ) {
+					return 'Waiting for a worker slot to continue ' . $stage_action . $target_suffix . '.';
+				}
+				return 'Waiting to continue ' . $stage_action . $target_suffix . '.';
+
+			case 'retrying':
+				$headline = 'Retrying ' . $stage_action . $target_suffix;
+				if ( '' !== $failure_summary ) {
+					$headline .= ' after ' . $failure_summary;
+				}
+				return $headline . '.';
+
+			case 'verifying':
+				return 'Verifying results' . $target_suffix . '.';
+
+			case 'blocked':
+				if ( 'worker_cancelled' === $event_reason ) {
+					return 'Stopped because the parent run was already closed' . $target_suffix . '.';
+				}
+				if ( '' !== $failure_summary ) {
+					$stage_fragment = '' !== $stage_label ? ' during ' . strtolower( $stage_label ) : '';
+					return 'Blocked' . $stage_fragment . $target_suffix . ': ' . $failure_summary . '.';
+				}
+				return 'Blocked' . $target_suffix . '.';
+
+			case 'failed':
+				$headline = 'Background work failed' . $target_suffix;
+				if ( '' !== $failure_summary ) {
+					$headline .= ': ' . $failure_summary;
+				}
+				return $headline . '.';
+
+			case 'complete':
+				if ( 'verify' === sanitize_key( (string) ( $task['result']['checkpoint']['workflow_stage'] ?? '' ) ) ) {
+					return 'Verification completed' . $target_suffix . '.';
+				}
+				return 'Background work completed' . $target_suffix . '.';
+
+			case 'running':
+				return 'Currently ' . $stage_action . $target_suffix . '.';
+
+			case 'queued':
+			default:
+				return 'Queued to start ' . $stage_action . $target_suffix . '.';
+		}
+	}
+
+	private function build_progress_summary( string $state_label, string $stage_label, string $event_label, string $target_label ): string {
+		$parts = array();
+
+		if ( '' !== $state_label ) {
+			$parts[] = 'State: ' . $state_label;
+		}
+		if ( '' !== $stage_label ) {
+			$parts[] = 'Stage: ' . $stage_label;
+		}
+		if ( '' !== $event_label ) {
+			$parts[] = 'Latest: ' . $event_label;
+		}
+		if ( '' !== $target_label ) {
+			$parts[] = 'Target: ' . $target_label;
+		}
+
+		return implode( ' • ', $parts );
+	}
+
+	private function build_progress_milestone_summary( array $task, array $execution, string $state_key ): string {
+		$parts     = array();
+		$completed = array_slice( (array) ( $execution['completed_labels'] ?? array() ), 0, 2 );
+		$remaining = array_slice( (array) ( $execution['remaining_labels'] ?? array() ), 0, 2 );
+		$blocked   = array_slice( (array) ( $execution['blocked_labels'] ?? array() ), 0, 2 );
+		$receipts  = array_slice( (array) ( $execution['recent_receipts'] ?? array() ), 0, 1 );
+
+		if ( ! empty( $completed ) ) {
+			$parts[] = 'Completed: ' . implode( ', ', $completed );
+		}
+
+		if ( ! empty( $blocked ) ) {
+			$parts[] = 'Blocked: ' . implode( ', ', $blocked );
+		} elseif ( ! empty( $remaining ) ) {
+			$prefix  = in_array( $state_key, array( 'waiting', 'retrying' ), true ) ? 'Next when resumed' : 'Next';
+			$parts[] = $prefix . ': ' . $remaining[0];
+		} elseif ( ! empty( $receipts ) ) {
+			$parts[] = 'Latest receipt: ' . $receipts[0];
+		} elseif ( ! empty( $task['handoff_capsule']['summary'] ) ) {
+			$parts[] = 'Goal: ' . sanitize_text_field( (string) $task['handoff_capsule']['summary'] );
+		}
+
+		return implode( ' • ', $parts );
+	}
+
+	private function summarize_failure_message( string $message ): string {
+		$message = trim( sanitize_text_field( $message ) );
+		if ( '' === $message ) {
+			return '';
+		}
+
+		if ( mb_strlen( $message ) > 96 ) {
+			return mb_substr( $message, 0, 93 ) . '...';
+		}
+
+		return rtrim( $message, '.' );
+	}
+
 	private function log_insert_failure( string $task_id, ?string $idempotency_key, string $db_error ): void {
 		PressArk_Error_Tracker::error( 'TaskStore', 'Task insert failed', array( 'task_id' => $task_id, 'idempotency_key' => $idempotency_key ?: 'none', 'db_error' => $db_error ?: 'unknown database error' ) );
 	}

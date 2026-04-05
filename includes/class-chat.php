@@ -595,6 +595,7 @@ class PressArk_Chat {
 			'status'       => $task['status'],
 			'message'      => $task['message'],
 			'result'       => $task['result'],
+			'progress'     => is_array( $task['progress'] ?? null ) ? $task['progress'] : array(),
 			'fail_reason'  => $task['fail_reason'] ?? null,
 			'created_at'   => $task['created_at'],
 			'completed_at' => $task['completed_at'],
@@ -1582,6 +1583,9 @@ class PressArk_Chat {
 		$context      = new PressArk_Context();
 		$context_text = $context->build( $screen, $post_id );
 		$context_text .= PressArk_Handler_Discovery::format_site_notes_basic();
+		if ( class_exists( 'PressArk_Site_Playbook' ) ) {
+			$context_text .= (string) ( PressArk_Site_Playbook::resolve_prompt_context( $task_type, array(), $message )['text'] ?? '' );
+		}
 
 		// v3.3.0: Inject retrieval-grounded content from the content index.
 		$content_index     = new PressArk_Content_Index();

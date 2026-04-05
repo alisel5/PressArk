@@ -2116,10 +2116,14 @@ class PressArk_Agent {
 			                . "Still use the preview/confirm flow, but don't over-warn about risks.";
 		}
 
-		// Site memory — selective note injection.
-		$site_memory = $this->resolve_site_notes( $message );
-		if ( '' !== $site_memory ) {
-			$system_prompt .= $site_memory;
+		// Operator-authored playbook memory — selective task/group injection.
+		$playbook_context = $this->resolve_site_playbook(
+			$task_type,
+			$this->resolve_playbook_tool_groups( $tool_set ),
+			$message
+		);
+		if ( '' !== ( $playbook_context['text'] ?? '' ) ) {
+			$system_prompt .= (string) $playbook_context['text'];
 		}
 
 		$tool_set       = $this->apply_budgeted_tool_support( $tool_set, $system_prompt, $messages );
@@ -2149,8 +2153,10 @@ class PressArk_Agent {
 			),
 			'inspector' => array(),
 		);
-		$site_notes   = $this->resolve_site_notes( $message );
-		$verification = PressArk_Execution_Ledger::verification_summary( $checkpoint->get_execution() );
+		$site_notes      = $this->resolve_site_notes( $message );
+		$playbook_groups = $this->resolve_playbook_tool_groups( $tool_set );
+		$playbook        = $this->resolve_site_playbook( $task_type, $playbook_groups, $message );
+		$verification    = PressArk_Execution_Ledger::verification_summary( $checkpoint->get_execution() );
 		$read_strata  = class_exists( 'PressArk_Read_Metadata' )
 			? PressArk_Read_Metadata::build_prompt_strata( $checkpoint->get_read_state(), $verification, $site_notes )
 			: array();
@@ -2212,6 +2218,13 @@ class PressArk_Agent {
 			$sections['labels']['stable'],
 			'task_scoped_skills',
 			$task_skills
+		);
+
+		$this->append_round_prompt_section(
+			$sections['stable'],
+			$sections['labels']['stable'],
+			'site_playbook',
+			(string) ( $playbook['text'] ?? '' )
 		);
 
 		$execution_guard = PressArk_Execution_Ledger::build_runtime_guard( $checkpoint->get_execution() );
@@ -2281,6 +2294,16 @@ class PressArk_Agent {
 		$sections['inspector'] = array(
 			'site_notes_included'  => '' !== trim( $site_notes ),
 			'site_notes_preview'   => $this->preview_context_text( $site_notes, 220 ),
+			'site_playbook_included' => '' !== trim( (string) ( $playbook['text'] ?? '' ) ),
+			'site_playbook_preview'  => sanitize_text_field( (string) ( $playbook['preview'] ?? '' ) ),
+			'site_playbook_titles'   => array_values(
+				array_filter(
+					array_map(
+						'sanitize_text_field',
+						(array) ( $playbook['titles'] ?? array() )
+					)
+				)
+			),
 			'dynamic_skill_names'  => $this->resolve_dynamic_skill_names( $task_type ),
 			'conditional_blocks'   => $this->resolve_conditional_prompt_blocks(
 				$task_type,
@@ -2337,6 +2360,7 @@ class PressArk_Agent {
 			'automation_context'    => 'Automation Context',
 			'conditional_blocks'    => 'Conditional Prompt Blocks',
 			'task_scoped_skills'    => 'Task-Scoped Skills',
+			'site_playbook'         => 'Site Playbook',
 			'trusted_system_facts'  => 'Trusted System Facts',
 			'verified_evidence'     => 'Verified Evidence',
 			'derived_summaries'     => 'Derived Summaries',
@@ -2352,6 +2376,10 @@ class PressArk_Agent {
 	}
 
 	private function resolve_dynamic_skill_names( string $task_type ): array {
+		if ( ! is_callable( array( 'PressArk_Skills', 'skills_for_task' ) ) ) {
+			return array();
+		}
+
 		$skills = array_values( array_filter( array_map(
 			'sanitize_key',
 			PressArk_Skills::skills_for_task( $task_type )
@@ -2668,6 +2696,20 @@ class PressArk_Agent {
 				'capability_map_included' => ! empty( $tool_set['capability_map'] ),
 				'dynamic_skill_names'  => array_values( array_filter( array_map( 'sanitize_key', (array) ( $inspector_meta['dynamic_skill_names'] ?? array() ) ) ) ),
 				'conditional_blocks'   => array_values( array_filter( array_map( 'sanitize_key', (array) ( $inspector_meta['conditional_blocks'] ?? array() ) ) ) ),
+				'site_playbook'        => ! empty( $inspector_meta['site_playbook_included'] )
+					? array(
+						'included' => true,
+						'titles'   => array_values(
+							array_filter(
+								array_map(
+									'sanitize_text_field',
+									(array) ( $inspector_meta['site_playbook_titles'] ?? array() )
+								)
+							)
+						),
+						'preview'  => sanitize_text_field( (string) ( $inspector_meta['site_playbook_preview'] ?? '' ) ),
+					)
+					: array(),
 				'site_notes'           => ! empty( $inspector_meta['site_notes_included'] )
 					? array(
 						'included' => true,
@@ -2853,6 +2895,50 @@ class PressArk_Agent {
 	}
 
 	// ── Site Memory ──────────────────────────────────────────────────
+
+	/**
+	 * Merge currently-loaded and currently-available tool groups for memory recall.
+	 *
+	 * @param array $tool_set Active tool-set metadata.
+	 * @return array<int,string>
+	 */
+	private function resolve_playbook_tool_groups( array $tool_set = array() ): array {
+		$merged = array_merge(
+			(array) $this->loaded_groups,
+			(array) ( $tool_set['groups'] ?? array() )
+		);
+
+		return array_values(
+			array_unique(
+				array_filter(
+					array_map( 'sanitize_key', $merged )
+				)
+			)
+		);
+	}
+
+	/**
+	 * Resolve operator-authored Site Playbook instructions for this run.
+	 *
+	 * @param string $task_type Current routed task type.
+	 * @param array<int,string> $tool_groups Active tool groups.
+	 * @param string $message Current user message.
+	 * @return array{text:string,preview:string,entries:array,titles:array,task_type:string,tool_groups:array}
+	 */
+	private function resolve_site_playbook( string $task_type, array $tool_groups, string $message ): array {
+		if ( ! class_exists( 'PressArk_Site_Playbook' ) ) {
+			return array(
+				'text'        => '',
+				'preview'     => '',
+				'entries'     => array(),
+				'titles'      => array(),
+				'task_type'   => sanitize_key( $task_type ),
+				'tool_groups' => array_values( array_filter( array_map( 'sanitize_key', $tool_groups ) ) ),
+			);
+		}
+
+		return PressArk_Site_Playbook::resolve_prompt_context( $task_type, $tool_groups, $message );
+	}
 
 	/**
 	 * Resolve and format relevant site notes for injection into the system prompt.

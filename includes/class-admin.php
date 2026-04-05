@@ -81,6 +81,13 @@ class PressArk_Admin {
 			'autoload'          => false,
 		) );
 
+		register_setting( 'pressark_settings', PressArk_Site_Playbook::OPTION_KEY, array(
+			'type'              => 'array',
+			'sanitize_callback' => array( $this, 'sanitize_site_playbook' ),
+			'default'           => array(),
+			'autoload'          => false,
+		) );
+
 		// API section.
 		add_settings_section(
 			'pressark_api_section',
@@ -343,6 +350,12 @@ class PressArk_Admin {
 			echo '<div class="notice notice-success is-dismissible"><p>' . esc_html__( 'Content index rebuild scheduled. It will process in the background.', 'pressark' ) . '</p></div>';
 		}
 
+		$harness_snapshot = PressArk_Harness_Readiness::get_snapshot();
+		$capability_graph = is_array( $harness_snapshot['capability_graph'] ?? null )
+			? (array) $harness_snapshot['capability_graph']
+			: ( class_exists( 'PressArk_Capability_Health' )
+				? PressArk_Capability_Health::get_snapshot( $harness_snapshot )
+				: array() );
 		$logo_url = $this->find_brand_image( array( 'WHITE-APP-LOGO', 'logo', 'icon', 'pressark-logo' ) );
 		?>
 		<div class="wrap">
@@ -353,6 +366,8 @@ class PressArk_Admin {
 				<h1><?php echo esc_html( get_admin_page_title() ); ?></h1>
 			</div>
 
+			<?php $this->render_capability_health_notice( $capability_graph ); ?>
+			<?php $this->render_extension_manifest_notices(); ?>
 			<?php $this->render_usage_stats_box(); ?>
 			<?php $this->render_plan_capabilities_section(); ?>
 
@@ -364,8 +379,10 @@ class PressArk_Admin {
 				?>
 			</form>
 
-			<?php $this->render_harness_readiness_section(); ?>
+			<?php $this->render_harness_readiness_section( $harness_snapshot ); ?>
+			<?php $this->render_extension_manifest_section(); ?>
 			<?php $this->render_site_profile_section(); ?>
+			<?php $this->render_site_playbook_section(); ?>
 			<?php $this->render_content_index_section(); ?>
 			<?php $this->render_permissions_section(); ?>
 		</div>
@@ -375,9 +392,47 @@ class PressArk_Admin {
 	/**
 	 * Render harness readiness section on settings page.
 	 */
-	private function render_harness_readiness_section(): void {
-		$snapshot       = PressArk_Harness_Readiness::get_snapshot();
+	private function render_capability_health_notice( array $graph ): void {
+		if ( empty( $graph ) || ! class_exists( 'PressArk_Capability_Health' ) ) {
+			return;
+		}
+
+		$notices = PressArk_Capability_Health::collect_admin_notices( $graph );
+		if ( empty( $notices ) ) {
+			return;
+		}
+
+		foreach ( $notices as $notice ) {
+			$class = match ( sanitize_key( (string) ( $notice['severity'] ?? 'warning' ) ) ) {
+				'error'   => 'notice notice-error',
+				'success' => 'notice notice-success',
+				default   => 'notice notice-warning',
+			};
+			?>
+			<div class="<?php echo esc_attr( $class ); ?>">
+				<p>
+					<strong><?php echo esc_html( (string) ( $notice['title'] ?? __( 'Capability health', 'pressark' ) ) ); ?>:</strong>
+					<?php echo esc_html( (string) ( $notice['summary'] ?? '' ) ); ?>
+				</p>
+			</div>
+			<?php
+		}
+	}
+
+	/**
+	 * Render harness readiness section on settings page.
+	 *
+	 * @param array<string,mixed>|null $snapshot Optional readiness snapshot.
+	 */
+	private function render_harness_readiness_section( ?array $snapshot = null ): void {
+		$snapshot       = is_array( $snapshot ) ? $snapshot : PressArk_Harness_Readiness::get_snapshot();
 		$facets         = (array) ( $snapshot['facets'] ?? array() );
+		$capability_graph = is_array( $snapshot['capability_graph'] ?? null ) ? (array) $snapshot['capability_graph'] : array();
+		$capability_nodes = (array) ( $capability_graph['nodes'] ?? array() );
+		$hidden_capability_rows = array(
+			'tool_groups'     => (array) ( $capability_graph['hidden']['tool_groups'] ?? array() ),
+			'resource_groups' => (array) ( $capability_graph['hidden']['resource_groups'] ?? array() ),
+		);
 		$problem_groups = PressArk_Harness_Readiness::summarize_problem_groups( $snapshot, 6 );
 		$state          = sanitize_key( (string) ( $snapshot['state'] ?? 'degraded' ) );
 		$badge          = $this->get_harness_state_styles( $state );
@@ -390,6 +445,15 @@ class PressArk_Admin {
 			'site_profile'  => __( 'Site Profile', 'pressark' ),
 			'content_index' => __( 'Content Index', 'pressark' ),
 			'background'    => __( 'Background', 'pressark' ),
+		);
+		$capability_rows = array(
+			'bank'               => __( 'Bank', 'pressark' ),
+			'provider_transport' => __( 'Provider Transport', 'pressark' ),
+			'site_profile'       => __( 'Site Profile Freshness', 'pressark' ),
+			'content_index'      => __( 'Content Index Freshness', 'pressark' ),
+			'woocommerce'        => __( 'WooCommerce Domain', 'pressark' ),
+			'elementor'          => __( 'Elementor Domain', 'pressark' ),
+			'seo_integrations'   => __( 'SEO Integrations', 'pressark' ),
 		);
 		?>
 		<h2><?php esc_html_e( 'Harness Readiness', 'pressark' ); ?></h2>
@@ -443,6 +507,40 @@ class PressArk_Admin {
 				</tbody>
 			</table>
 
+			<?php if ( ! empty( $capability_nodes ) ) : ?>
+				<div style="margin-top:24px;">
+					<p style="margin:0 0 10px;color:#0f172a;font-size:14px;font-weight:700;"><?php esc_html_e( 'Capability / Provider Health', 'pressark' ); ?></p>
+					<table style="width:100%;border-collapse:collapse;">
+						<thead>
+							<tr>
+								<th style="padding:10px 12px;border-bottom:2px solid #e2e8f0;text-align:left;color:#0f172a;font-size:13px;"><?php esc_html_e( 'Domain', 'pressark' ); ?></th>
+								<th style="padding:10px 12px;border-bottom:2px solid #e2e8f0;text-align:left;color:#0f172a;font-size:13px;"><?php esc_html_e( 'State', 'pressark' ); ?></th>
+								<th style="padding:10px 12px;border-bottom:2px solid #e2e8f0;text-align:left;color:#0f172a;font-size:13px;"><?php esc_html_e( 'Status', 'pressark' ); ?></th>
+								<th style="padding:10px 12px;border-bottom:2px solid #e2e8f0;text-align:left;color:#0f172a;font-size:13px;"><?php esc_html_e( 'Summary', 'pressark' ); ?></th>
+							</tr>
+						</thead>
+						<tbody>
+							<?php foreach ( $capability_rows as $node_key => $label ) : ?>
+								<?php $node = is_array( $capability_nodes[ $node_key ] ?? null ) ? (array) $capability_nodes[ $node_key ] : array(); ?>
+								<?php if ( empty( $node ) ) { continue; } ?>
+								<?php $node_state = sanitize_key( (string) ( $node['state'] ?? 'healthy' ) ); ?>
+								<?php $node_badge = $this->get_harness_state_styles( $node_state ); ?>
+								<tr>
+									<td style="padding:14px 12px;border-bottom:1px solid #f1f5f9;color:#0f172a;font-size:14px;font-weight:600;"><?php echo esc_html( $label ); ?></td>
+									<td style="padding:14px 12px;border-bottom:1px solid #f1f5f9;">
+										<span style="display:inline-flex;align-items:center;border:1px solid <?php echo esc_attr( $node_badge['border'] ); ?>;background:<?php echo esc_attr( $node_badge['background'] ); ?>;color:<?php echo esc_attr( $node_badge['text'] ); ?>;border-radius:999px;padding:4px 10px;font-size:12px;font-weight:700;">
+											<?php echo esc_html( $this->format_harness_label( $node_state ) ); ?>
+										</span>
+									</td>
+									<td style="padding:14px 12px;border-bottom:1px solid #f1f5f9;color:#64748b;font-size:13px;line-height:1.5;"><?php echo esc_html( $this->format_harness_label( (string) ( $node['status'] ?? '' ) ) ); ?></td>
+									<td style="padding:14px 12px;border-bottom:1px solid #f1f5f9;color:#475569;font-size:13px;line-height:1.5;"><?php echo esc_html( (string) ( $node['summary'] ?? '' ) ); ?></td>
+								</tr>
+							<?php endforeach; ?>
+						</tbody>
+					</table>
+				</div>
+			<?php endif; ?>
+
 			<?php if ( ! empty( $problem_groups ) ) : ?>
 				<div style="margin-top:24px;padding:16px 18px;border:1px solid #e2e8f0;border-radius:12px;background:#f8fafc;">
 					<p style="margin:0 0 10px;color:#0f172a;font-size:14px;font-weight:700;"><?php esc_html_e( 'Tool Group Dependency Gaps', 'pressark' ); ?></p>
@@ -456,12 +554,33 @@ class PressArk_Admin {
 					</ul>
 				</div>
 			<?php endif; ?>
+
+			<?php if ( ! empty( $hidden_capability_rows['tool_groups'] ) || ! empty( $hidden_capability_rows['resource_groups'] ) ) : ?>
+				<div style="margin-top:24px;padding:16px 18px;border:1px solid #e2e8f0;border-radius:12px;background:#f8fafc;">
+					<p style="margin:0 0 10px;color:#0f172a;font-size:14px;font-weight:700;"><?php esc_html_e( 'Hidden Capability Surfaces', 'pressark' ); ?></p>
+					<ul style="margin:0;padding-left:18px;color:#475569;font-size:13px;line-height:1.6;">
+						<?php foreach ( array_slice( $hidden_capability_rows['tool_groups'], 0, 4 ) as $hidden_group ) : ?>
+							<li>
+								<strong><?php echo esc_html( (string) ( $hidden_group['label'] ?? __( 'Tool group', 'pressark' ) ) ); ?>:</strong>
+								<?php echo esc_html( (string) ( $hidden_group['summary'] ?? '' ) ); ?>
+							</li>
+						<?php endforeach; ?>
+						<?php foreach ( array_slice( $hidden_capability_rows['resource_groups'], 0, 4 ) as $hidden_group ) : ?>
+							<li>
+								<strong><?php echo esc_html( (string) ( $hidden_group['label'] ?? __( 'Resource group', 'pressark' ) ) ); ?>:</strong>
+								<?php echo esc_html( (string) ( $hidden_group['summary'] ?? '' ) ); ?>
+							</li>
+						<?php endforeach; ?>
+					</ul>
+				</div>
+			<?php endif; ?>
 		</div>
 		<?php
 	}
 
 	private function get_harness_state_styles( string $state ): array {
 		return match ( $state ) {
+			'auth_blocked',
 			'blocked'  => array(
 				'background' => '#fef2f2',
 				'border'     => '#fecaca',
@@ -471,6 +590,11 @@ class PressArk_Admin {
 				'background' => '#fffbeb',
 				'border'     => '#fde68a',
 				'text'       => '#b45309',
+			),
+			'absent'   => array(
+				'background' => '#f8fafc',
+				'border'     => '#cbd5e1',
+				'text'       => '#475569',
 			),
 			default    => array(
 				'background' => '#f0fdf4',
@@ -587,6 +711,170 @@ class PressArk_Admin {
 	}
 
 	/**
+	 * Render notices for active extensions that need review.
+	 */
+	private function render_extension_manifest_notices(): void {
+		if ( ! class_exists( 'PressArk_Extension_Manifests' ) ) {
+			return;
+		}
+
+		$reports = array_filter(
+			PressArk_Extension_Manifests::list_installed(),
+			static function ( array $report ): bool {
+				return ! empty( $report['active'] ) && ( ! empty( $report['errors'] ) || ! empty( $report['warnings'] ) );
+			}
+		);
+
+		foreach ( array_slice( array_values( $reports ), 0, 3 ) as $report ) {
+			$class = ! empty( $report['errors'] ) ? 'notice notice-error' : 'notice notice-warning';
+			$issue = sanitize_text_field( (string) ( $report['errors'][0] ?? $report['warnings'][0] ?? '' ) );
+			$summary = sanitize_text_field( (string) ( $report['trust_warning'] ?? '' ) );
+			?>
+			<div class="<?php echo esc_attr( $class ); ?>">
+				<p>
+					<strong><?php echo esc_html( (string) ( $report['plugin_name'] ?? __( 'Extension manifest', 'pressark' ) ) ); ?>:</strong>
+					<?php echo esc_html( $issue ?: $summary ); ?>
+				</p>
+			</div>
+			<?php
+		}
+	}
+
+	/**
+	 * Render the extension manifest overview on the settings page.
+	 */
+	private function render_extension_manifest_section(): void {
+		if ( ! class_exists( 'PressArk_Extension_Manifests' ) ) {
+			return;
+		}
+
+		$reports = PressArk_Extension_Manifests::list_installed();
+		?>
+		<h2><?php esc_html_e( 'Extension Manifests', 'pressark' ); ?></h2>
+		<div style="background:#fff;border:1px solid rgba(226,232,240,0.8);border-radius:12px;padding:32px;margin:20px 0;box-shadow:0 4px 12px rgba(0,0,0,0.02);">
+			<p style="margin:0 0 18px;color:#475569;font-size:14px;line-height:1.6;">
+				<?php esc_html_e( 'Third-party PressArk add-ons can declare operations, resources, trust class, prompt-injection exposure, verification expectations, and required dependencies in a formal manifest. PressArk validates that manifest before enabling the extension through its own plugin controls.', 'pressark' ); ?>
+			</p>
+
+			<?php if ( empty( $reports ) ) : ?>
+				<p style="margin:0;color:#64748b;font-size:14px;"><?php esc_html_e( 'No PressArk extension manifests were detected in the installed plugin set.', 'pressark' ); ?></p>
+			<?php else : ?>
+				<table style="width:100%;border-collapse:collapse;">
+					<thead>
+						<tr>
+							<th style="padding:10px 12px;border-bottom:2px solid #e2e8f0;text-align:left;color:#0f172a;font-size:13px;"><?php esc_html_e( 'Extension', 'pressark' ); ?></th>
+							<th style="padding:10px 12px;border-bottom:2px solid #e2e8f0;text-align:left;color:#0f172a;font-size:13px;"><?php esc_html_e( 'Status', 'pressark' ); ?></th>
+							<th style="padding:10px 12px;border-bottom:2px solid #e2e8f0;text-align:left;color:#0f172a;font-size:13px;"><?php esc_html_e( 'Declared Surface', 'pressark' ); ?></th>
+							<th style="padding:10px 12px;border-bottom:2px solid #e2e8f0;text-align:left;color:#0f172a;font-size:13px;"><?php esc_html_e( 'Trust', 'pressark' ); ?></th>
+							<th style="padding:10px 12px;border-bottom:2px solid #e2e8f0;text-align:left;color:#0f172a;font-size:13px;"><?php esc_html_e( 'Requirements', 'pressark' ); ?></th>
+							<th style="padding:10px 12px;border-bottom:2px solid #e2e8f0;text-align:left;color:#0f172a;font-size:13px;"><?php esc_html_e( 'Validation', 'pressark' ); ?></th>
+						</tr>
+					</thead>
+					<tbody>
+						<?php foreach ( $reports as $report ) : ?>
+							<?php
+							$manifest = is_array( $report['manifest'] ?? null ) ? $report['manifest'] : array();
+							$status   = sanitize_key( (string) ( $report['status'] ?? 'review' ) );
+							$badge    = match ( $status ) {
+								'blocked' => array(
+									'background' => '#fef2f2',
+									'border'     => '#fecaca',
+									'text'       => '#b91c1c',
+								),
+								'validated' => array(
+									'background' => '#f0fdf4',
+									'border'     => '#86efac',
+									'text'       => '#166534',
+								),
+								default => array(
+									'background' => '#fffbeb',
+									'border'     => '#fde68a',
+									'text'       => '#b45309',
+								),
+							};
+							$requires = is_array( $manifest['requires'] ?? null ) ? $manifest['requires'] : array();
+							$requirement_bits = array();
+							if ( ! empty( $requires['plugins'] ) ) {
+								$requirement_bits[] = sprintf(
+									/* translators: %d: plugin dependency count */
+									_n( '%d plugin dependency', '%d plugin dependencies', count( (array) $requires['plugins'] ), 'pressark' ),
+									count( (array) $requires['plugins'] )
+								);
+							}
+							if ( ! empty( $requires['capabilities'] ) ) {
+								$requirement_bits[] = sprintf(
+									/* translators: %d: capability count */
+									_n( '%d capability', '%d capabilities', count( (array) $requires['capabilities'] ), 'pressark' ),
+									count( (array) $requires['capabilities'] )
+								);
+							}
+							foreach ( array( 'pressark_min_version', 'wordpress_min_version', 'php_min_version' ) as $version_key ) {
+								if ( ! empty( $requires[ $version_key ] ) ) {
+									$requirement_bits[] = str_replace( '_', ' ', $version_key ) . ': ' . $requires[ $version_key ];
+								}
+							}
+							$validation_text = sanitize_text_field(
+								(string) (
+									$report['errors'][0]
+									?? $report['warnings'][0]
+									?? $report['trust_warning']
+									?? __( 'Manifest validated with no review notes.', 'pressark' )
+								)
+							);
+							?>
+							<tr>
+								<td style="padding:14px 12px;border-bottom:1px solid #f1f5f9;color:#0f172a;font-size:14px;line-height:1.5;">
+									<strong><?php echo esc_html( (string) ( $report['plugin_name'] ?? '' ) ); ?></strong>
+									<div style="color:#64748b;font-size:12px;margin-top:4px;">
+										<?php echo esc_html( (string) ( $report['plugin_file'] ?? '' ) ); ?>
+									</div>
+								</td>
+								<td style="padding:14px 12px;border-bottom:1px solid #f1f5f9;">
+									<span style="display:inline-flex;align-items:center;border:1px solid <?php echo esc_attr( $badge['border'] ); ?>;background:<?php echo esc_attr( $badge['background'] ); ?>;color:<?php echo esc_attr( $badge['text'] ); ?>;border-radius:999px;padding:4px 10px;font-size:12px;font-weight:700;">
+										<?php echo esc_html( ucfirst( $status ) ); ?>
+									</span>
+									<div style="color:#64748b;font-size:12px;margin-top:6px;">
+										<?php echo ! empty( $report['active'] ) ? esc_html__( 'Active', 'pressark' ) : esc_html__( 'Inactive', 'pressark' ); ?>
+									</div>
+								</td>
+								<td style="padding:14px 12px;border-bottom:1px solid #f1f5f9;color:#475569;font-size:13px;line-height:1.6;">
+									<?php
+									printf(
+										/* translators: 1: operation count 2: resource count */
+										esc_html__( '%1$d operations, %2$d resources', 'pressark' ),
+										count( (array) ( $manifest['operations'] ?? array() ) ),
+										count( (array) ( $manifest['resources'] ?? array() ) )
+									);
+									?>
+									<?php if ( ! empty( $manifest['self_test']['hook'] ) || ! empty( $manifest['self_test']['callback'] ) ) : ?>
+										<div style="color:#64748b;font-size:12px;margin-top:4px;"><?php esc_html_e( 'Self-test declared', 'pressark' ); ?></div>
+									<?php endif; ?>
+								</td>
+								<td style="padding:14px 12px;border-bottom:1px solid #f1f5f9;color:#475569;font-size:13px;line-height:1.6;">
+									<?php echo esc_html( (string) ( $manifest['trust']['class'] ?? 'derived_summary' ) ); ?>
+									<div style="color:#64748b;font-size:12px;margin-top:4px;">
+										<?php echo esc_html( (string) ( $manifest['trust']['prompt_injection_class'] ?? 'guarded' ) ); ?>
+										<?php if ( ! empty( $manifest['billing_sensitive'] ) ) : ?>
+											<?php esc_html_e( ' | billing-sensitive', 'pressark' ); ?>
+										<?php endif; ?>
+									</div>
+								</td>
+								<td style="padding:14px 12px;border-bottom:1px solid #f1f5f9;color:#475569;font-size:13px;line-height:1.6;">
+									<?php echo esc_html( empty( $requirement_bits ) ? __( 'None declared', 'pressark' ) : implode( ' | ', $requirement_bits ) ); ?>
+								</td>
+								<td style="padding:14px 12px;border-bottom:1px solid #f1f5f9;color:#475569;font-size:13px;line-height:1.6;">
+									<?php echo esc_html( $validation_text ); ?>
+								</td>
+							</tr>
+						<?php endforeach; ?>
+					</tbody>
+				</table>
+			<?php endif; ?>
+		</div>
+		<?php
+	}
+
+	/**
 	 * Render site profile section on settings page.
 	 */
 	private function render_site_profile_section(): void {
@@ -615,6 +903,204 @@ class PressArk_Admin {
 			<p style="color:#64748b; font-size:14px; margin-bottom:24px;"><?php esc_html_e( 'Site profile has not been generated yet. It will be created automatically, or you can trigger it manually.', 'pressark' ); ?></p>
 			<p><a href="<?php echo esc_url( wp_nonce_url( admin_url( 'admin.php?page=pressark&action=refresh_profile' ), 'pressark_refresh_profile' ) ); ?>" class="button button-primary"><?php esc_html_e( 'Generate Profile Now', 'pressark' ); ?></a></p>
 			<?php endif; ?>
+		</div>
+		<?php
+	}
+
+	/**
+	 * Render Site Playbook section on settings page.
+	 */
+	private function render_site_playbook_section(): void {
+		$entries      = PressArk_Site_Playbook::get_all();
+		$task_labels  = PressArk_Site_Playbook::task_labels();
+		$group_labels = PressArk_Site_Playbook::tool_group_labels();
+		?>
+		<h2><?php esc_html_e( 'Site Playbook', 'pressark' ); ?></h2>
+		<div id="pressark-site-playbook-editor" data-max-entries="<?php echo esc_attr( (string) PressArk_Site_Playbook::MAX_ENTRIES ); ?>" style="background:#fff;border:1px solid rgba(226,232,240,0.8);border-radius:12px;padding:32px;margin:20px 0;box-shadow:0 4px 12px rgba(0,0,0,0.02);">
+			<p style="margin-top:0;color:#475569;font-size:14px;max-width:880px;line-height:1.7;">
+				<?php esc_html_e( 'Store durable operator-authored instructions here. This layer is separate from the inferred site profile and lightweight site notes, and PressArk only injects the most relevant entries for the current task and tool group.', 'pressark' ); ?>
+			</p>
+			<p class="description" style="margin-bottom:20px;max-width:880px;">
+				<?php esc_html_e( 'Good playbook entries cover brand guardrails, canonical truth sources, high-risk workflows, editorial constraints, and approval preferences. Keep each entry short, durable, and specific.', 'pressark' ); ?>
+			</p>
+
+			<form action="options.php" method="post">
+				<?php settings_fields( 'pressark_settings' ); ?>
+				<input type="hidden" name="<?php echo esc_attr( PressArk_Site_Playbook::OPTION_KEY ); ?>[_sentinel]" value="1">
+
+				<div data-playbook-empty <?php echo ! empty( $entries ) ? 'hidden' : ''; ?> style="padding:18px 20px;border:1px dashed #cbd5e1;border-radius:12px;background:#f8fafc;color:#64748b;font-size:14px;margin-bottom:18px;">
+					<?php esc_html_e( 'No playbook entries yet. Add durable instructions PressArk should remember across sessions.', 'pressark' ); ?>
+				</div>
+
+				<div data-playbook-list>
+					<?php foreach ( $entries as $index => $entry ) : ?>
+						<?php $this->render_site_playbook_entry_fields( $index, $entry, $task_labels, $group_labels ); ?>
+					<?php endforeach; ?>
+				</div>
+
+				<p style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin:20px 0 0;">
+					<button type="button" class="button" data-playbook-add><?php esc_html_e( 'Add Entry', 'pressark' ); ?></button>
+					<?php submit_button( __( 'Save Playbook', 'pressark' ), 'primary', 'submit', false ); ?>
+					<span class="description">
+						<?php
+						printf(
+							/* translators: %d: number of entries kept in prompt recall at once. */
+							esc_html__( 'Prompt recall is capped to the most relevant %d entries per run.', 'pressark' ),
+							PressArk_Site_Playbook::MAX_PROMPT_ENTRIES
+						);
+						?>
+					</span>
+				</p>
+			</form>
+
+			<div id="pressark-site-playbook-template" hidden>
+				<?php $this->render_site_playbook_entry_fields( '__INDEX__', array(), $task_labels, $group_labels ); ?>
+			</div>
+
+			<script>
+			(function() {
+				const root = document.getElementById('pressark-site-playbook-editor');
+				if (!root) {
+					return;
+				}
+
+				const list = root.querySelector('[data-playbook-list]');
+				const empty = root.querySelector('[data-playbook-empty]');
+				const addButton = root.querySelector('[data-playbook-add]');
+				const template = root.querySelector('#pressark-site-playbook-template');
+				const maxEntries = parseInt(root.getAttribute('data-max-entries') || '12', 10);
+				let nextIndex = list ? list.querySelectorAll('[data-playbook-entry]').length : 0;
+
+				const syncState = function() {
+					const count = list ? list.querySelectorAll('[data-playbook-entry]').length : 0;
+					if (empty) {
+						empty.hidden = count > 0;
+					}
+					if (addButton) {
+						addButton.disabled = count >= maxEntries;
+					}
+				};
+
+				if (addButton && list && template) {
+					addButton.addEventListener('click', function() {
+						if (list.querySelectorAll('[data-playbook-entry]').length >= maxEntries) {
+							return;
+						}
+
+						const html = template.innerHTML.replace(/__INDEX__/g, String(nextIndex++));
+						list.insertAdjacentHTML('beforeend', html);
+						syncState();
+					});
+				}
+
+				if (list) {
+					list.addEventListener('click', function(event) {
+						const removeButton = event.target.closest('[data-playbook-remove]');
+						if (!removeButton) {
+							return;
+						}
+
+						event.preventDefault();
+						const card = removeButton.closest('[data-playbook-entry]');
+						if (card) {
+							card.remove();
+							syncState();
+						}
+					});
+				}
+
+				syncState();
+			})();
+			</script>
+		</div>
+		<?php
+	}
+
+	/**
+	 * Render one Site Playbook entry editor card.
+	 *
+	 * @param int|string $index Entry index placeholder.
+	 * @param array      $entry Playbook entry data.
+	 * @param array      $task_labels Task label map.
+	 * @param array      $group_labels Tool group label map.
+	 */
+	private function render_site_playbook_entry_fields( $index, array $entry, array $task_labels, array $group_labels ): void {
+		$name_prefix     = PressArk_Site_Playbook::OPTION_KEY . '[' . $index . ']';
+		$selected_tasks  = array_map( 'sanitize_key', (array) ( $entry['task_types'] ?? array( 'all' ) ) );
+		$selected_groups = array_map( 'sanitize_key', (array) ( $entry['tool_groups'] ?? array( 'all' ) ) );
+		?>
+		<div data-playbook-entry style="border:1px solid #e2e8f0;border-radius:14px;padding:20px 20px 18px;margin-bottom:16px;background:#fcfdff;">
+			<div style="display:flex;justify-content:space-between;gap:12px;align-items:center;margin-bottom:16px;">
+				<strong style="color:#0f172a;font-size:14px;"><?php esc_html_e( 'Playbook Entry', 'pressark' ); ?></strong>
+				<button type="button" class="button-link-delete" data-playbook-remove><?php esc_html_e( 'Remove', 'pressark' ); ?></button>
+			</div>
+
+			<input type="hidden" name="<?php echo esc_attr( $name_prefix ); ?>[id]" value="<?php echo esc_attr( (string) ( $entry['id'] ?? '' ) ); ?>">
+			<input type="hidden" name="<?php echo esc_attr( $name_prefix ); ?>[updated_at]" value="<?php echo esc_attr( (string) ( $entry['updated_at'] ?? '' ) ); ?>">
+
+			<p style="margin:0 0 14px;">
+				<label style="display:block;font-weight:600;color:#0f172a;margin-bottom:6px;" for="<?php echo esc_attr( 'pressark-playbook-title-' . $index ); ?>">
+					<?php esc_html_e( 'Label', 'pressark' ); ?>
+				</label>
+				<input
+					type="text"
+					class="regular-text"
+					id="<?php echo esc_attr( 'pressark-playbook-title-' . $index ); ?>"
+					name="<?php echo esc_attr( $name_prefix ); ?>[title]"
+					value="<?php echo esc_attr( (string) ( $entry['title'] ?? '' ) ); ?>"
+					placeholder="<?php esc_attr_e( 'Brand guardrails', 'pressark' ); ?>"
+					style="width:100%;max-width:none;"
+				>
+			</p>
+
+			<p style="margin:0 0 18px;">
+				<label style="display:block;font-weight:600;color:#0f172a;margin-bottom:6px;" for="<?php echo esc_attr( 'pressark-playbook-body-' . $index ); ?>">
+					<?php esc_html_e( 'Instruction', 'pressark' ); ?>
+				</label>
+				<textarea
+					id="<?php echo esc_attr( 'pressark-playbook-body-' . $index ); ?>"
+					name="<?php echo esc_attr( $name_prefix ); ?>[body]"
+					rows="4"
+					placeholder="<?php esc_attr_e( 'Example: Never change pricing, checkout, or shipping copy without explicit approval from the operator.', 'pressark' ); ?>"
+					style="width:100%;max-width:none;"
+				><?php echo esc_textarea( (string) ( $entry['body'] ?? '' ) ); ?></textarea>
+			</p>
+
+			<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:18px;">
+				<div>
+					<strong style="display:block;color:#0f172a;font-size:13px;margin-bottom:8px;"><?php esc_html_e( 'Task Types', 'pressark' ); ?></strong>
+					<div style="display:flex;flex-wrap:wrap;gap:8px 14px;">
+						<?php foreach ( $task_labels as $task_key => $task_label ) : ?>
+							<label style="display:inline-flex;align-items:center;gap:6px;color:#475569;font-size:13px;">
+								<input
+									type="checkbox"
+									name="<?php echo esc_attr( $name_prefix ); ?>[task_types][]"
+									value="<?php echo esc_attr( $task_key ); ?>"
+									<?php checked( in_array( $task_key, $selected_tasks, true ) ); ?>
+								>
+								<?php echo esc_html( $task_label ); ?>
+							</label>
+						<?php endforeach; ?>
+					</div>
+				</div>
+
+				<div>
+					<strong style="display:block;color:#0f172a;font-size:13px;margin-bottom:8px;"><?php esc_html_e( 'Tool Groups', 'pressark' ); ?></strong>
+					<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:8px 14px;max-height:180px;overflow:auto;padding-right:6px;">
+						<?php foreach ( $group_labels as $group_key => $group_label ) : ?>
+							<label style="display:inline-flex;align-items:center;gap:6px;color:#475569;font-size:13px;">
+								<input
+									type="checkbox"
+									name="<?php echo esc_attr( $name_prefix ); ?>[tool_groups][]"
+									value="<?php echo esc_attr( $group_key ); ?>"
+									<?php checked( in_array( $group_key, $selected_groups, true ) ); ?>
+								>
+								<?php echo esc_html( $group_label ); ?>
+							</label>
+						<?php endforeach; ?>
+					</div>
+				</div>
+			</div>
 		</div>
 		<?php
 	}
@@ -722,6 +1208,16 @@ class PressArk_Admin {
 
 		add_settings_error( 'pressark_license_key', 'license_invalid', $data['error'] ?? __( 'License validation failed.', 'pressark' ), 'error' );
 		return get_option( 'pressark_license_key', '' );
+	}
+
+	/**
+	 * Sanitize the Site Playbook structured setting.
+	 *
+	 * @param mixed $value Raw submitted playbook entries.
+	 * @return array<int,array<string,mixed>>
+	 */
+	public function sanitize_site_playbook( $value ): array {
+		return PressArk_Site_Playbook::sanitize_option( $value );
 	}
 
 	/**
