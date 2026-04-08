@@ -295,10 +295,11 @@ class PressArk_Uninstall_Helper {
 			return true;
 		}
 
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- Uninstall-helper footprint detection intentionally performs a direct existence probe; caching is not relevant.
 		$option_name = $wpdb->get_var( $wpdb->prepare(
 			"SELECT option_name FROM {$wpdb->options} WHERE option_name LIKE %s LIMIT 1",
 			$wpdb->esc_like( 'pressark_' ) . '%'
-		) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery
+		) );
 
 		return ! empty( $option_name );
 	}
@@ -342,6 +343,6 @@ class PressArk_Uninstall_Helper {
 	private static function table_exists( string $table_name ): bool {
 		global $wpdb;
 
-		return $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $table_name ) ) === $table_name;
+		return $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $table_name ) ) === $table_name; // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- Uninstall-helper table existence check intentionally performs a direct schema probe; caching is not relevant.
 	}
 }

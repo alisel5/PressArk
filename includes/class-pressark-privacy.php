@@ -149,19 +149,13 @@ class PressArk_Privacy {
 	 * @return bool True if more rows may exist beyond this page.
 	 */
 	private function export_chats( int $user_id, int $per_page, int $offset, array &$items ): bool {
-		global $wpdb;
-
-		$table = $wpdb->prefix . 'pressark_chats';
-		if ( ! $this->table_exists( $table ) ) {
-			return false;
-		}
-
-		$rows = $wpdb->get_results( $wpdb->prepare(
-			"SELECT id, title, messages, created_at, updated_at FROM {$table} WHERE user_id = %d ORDER BY id ASC LIMIT %d OFFSET %d",
+		$rows = $this->get_export_rows(
+			'pressark_chats',
+			'id, title, messages, created_at, updated_at',
 			$user_id,
 			$per_page,
 			$offset
-		), ARRAY_A );
+		);
 
 		foreach ( $rows as $row ) {
 			$messages_raw = json_decode( $row['messages'] ?? '[]', true );
@@ -191,23 +185,13 @@ class PressArk_Privacy {
 	 * @return bool True if more rows may exist.
 	 */
 	private function export_logs( int $user_id, int $per_page, int $offset, array &$items ): bool {
-		global $wpdb;
-
-		$table = $wpdb->prefix . 'pressark_log';
-		if ( ! $this->table_exists( $table ) ) {
-			return false;
-		}
-
-		$rows = $wpdb->get_results( $wpdb->prepare(
-			"SELECT id, action_type, target_id, target_type, old_value, new_value, created_at, undone
-			 FROM {$table}
-			 WHERE user_id = %d
-			 ORDER BY id ASC
-			 LIMIT %d OFFSET %d",
+		$rows = $this->get_export_rows(
+			'pressark_log',
+			'id, action_type, target_id, target_type, old_value, new_value, created_at, undone',
 			$user_id,
 			$per_page,
 			$offset
-		), ARRAY_A );
+		);
 
 		foreach ( $rows as $row ) {
 			$items[] = array(
@@ -236,24 +220,14 @@ class PressArk_Privacy {
 	 * @return bool True if more rows may exist.
 	 */
 	private function export_runs( int $user_id, int $per_page, int $offset, array &$items ): bool {
-		global $wpdb;
-
-		$table = $wpdb->prefix . 'pressark_runs';
-		if ( ! $this->table_exists( $table ) ) {
-			return false;
-		}
-
-		$rows = $wpdb->get_results( $wpdb->prepare(
-			"SELECT run_id, chat_id, route, status, message, reservation_id, workflow_class, workflow_state,
-			        preview_session_id, pending_actions, result, tier, created_at, updated_at, settled_at
-			 FROM {$table}
-			 WHERE user_id = %d
-			 ORDER BY id ASC
-			 LIMIT %d OFFSET %d",
+		$rows = $this->get_export_rows(
+			'pressark_runs',
+			'run_id, chat_id, route, status, message, reservation_id, workflow_class, workflow_state,
+			        preview_session_id, pending_actions, result, tier, created_at, updated_at, settled_at',
 			$user_id,
 			$per_page,
 			$offset
-		), ARRAY_A );
+		);
 
 		foreach ( $rows as $row ) {
 			$items[] = array(
@@ -290,24 +264,14 @@ class PressArk_Privacy {
 	 * @return bool True if more rows may exist.
 	 */
 	private function export_tasks( int $user_id, int $per_page, int $offset, array &$items ): bool {
-		global $wpdb;
-
-		$table = $wpdb->prefix . 'pressark_tasks';
-		if ( ! $this->table_exists( $table ) ) {
-			return false;
-		}
-
-		$rows = $wpdb->get_results( $wpdb->prepare(
-			"SELECT task_id, message, payload, reservation_id, status, retries, max_retries, fail_reason,
-			        result, created_at, started_at, completed_at, expires_at
-			 FROM {$table}
-			 WHERE user_id = %d
-			 ORDER BY id ASC
-			 LIMIT %d OFFSET %d",
+		$rows = $this->get_export_rows(
+			'pressark_tasks',
+			'task_id, message, payload, reservation_id, status, retries, max_retries, fail_reason,
+			        result, created_at, started_at, completed_at, expires_at',
 			$user_id,
 			$per_page,
 			$offset
-		), ARRAY_A );
+		);
 
 		foreach ( $rows as $row ) {
 			$items[] = array(
@@ -342,26 +306,16 @@ class PressArk_Privacy {
 	 * @return bool True if more rows may exist.
 	 */
 	private function export_automations( int $user_id, int $per_page, int $offset, array &$items ): bool {
-		global $wpdb;
-
-		$table = $wpdb->prefix . 'pressark_automations';
-		if ( ! $this->table_exists( $table ) ) {
-			return false;
-		}
-
-		$rows = $wpdb->get_results( $wpdb->prepare(
-			"SELECT automation_id, name, prompt, timezone, cadence_type, cadence_value, first_run_at, next_run_at,
+		$rows = $this->get_export_rows(
+			'pressark_automations',
+			'automation_id, name, prompt, timezone, cadence_type, cadence_value, first_run_at, next_run_at,
 			        approval_policy, allowed_groups, last_run_id, last_task_id, last_success_at, last_failure_at,
 			        last_error, failure_streak, execution_hints, notification_channel, notification_target,
-			        status, chat_id, claimed_at, claimed_by, created_at, updated_at
-			 FROM {$table}
-			 WHERE user_id = %d
-			 ORDER BY id ASC
-			 LIMIT %d OFFSET %d",
+			        status, chat_id, claimed_at, claimed_by, created_at, updated_at',
 			$user_id,
 			$per_page,
 			$offset
-		), ARRAY_A );
+		);
 
 		foreach ( $rows as $row ) {
 			$items[] = array(
@@ -490,22 +444,13 @@ class PressArk_Privacy {
 				continue;
 			}
 
-			// Count remaining rows to know if we need another pass.
-			$remaining = (int) $wpdb->get_var( $wpdb->prepare(
-				"SELECT COUNT(*) FROM {$table} WHERE user_id = %d",
-				$uid
-			) );
+			$remaining = $this->count_user_rows( $table, $uid );
 
 			if ( $remaining <= 0 ) {
 				continue;
 			}
 
-			// Batched delete to avoid long table locks.
-			$deleted = (int) $wpdb->query( $wpdb->prepare(
-				"DELETE FROM {$table} WHERE user_id = %d ORDER BY id ASC LIMIT %d",
-				$uid,
-				$batch
-			) );
+			$deleted = $this->delete_user_rows_batch( $table, $uid, $batch );
 			$items_removed += $deleted;
 
 			if ( $remaining > $batch ) {
@@ -514,6 +459,7 @@ class PressArk_Privacy {
 		}
 
 		// Per-user options (usage counters, token tracking, token status cache).
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- Privacy erasure must permanently remove per-user plugin options and does not benefit from object caching.
 		$wpdb->query( $wpdb->prepare(
 			"DELETE FROM {$wpdb->options} WHERE option_name LIKE %s OR option_name LIKE %s OR option_name LIKE %s",
 			$wpdb->esc_like( 'pressark_usage_' . $uid . '_' ) . '%',
@@ -526,6 +472,7 @@ class PressArk_Privacy {
 		delete_transient( 'pressark_license_cache_' . $uid );
 
 		// User meta — all pressark keys (wildcard covers current and future keys).
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- Privacy erasure must permanently remove per-user PressArk meta keys and does not benefit from object caching.
 		$wpdb->query( $wpdb->prepare(
 			"DELETE FROM {$wpdb->usermeta} WHERE user_id = %d AND meta_key LIKE %s",
 			$uid,
@@ -558,9 +505,67 @@ class PressArk_Privacy {
 			return $cache[ $table ];
 		}
 
-		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- Request-scoped existence check on a known table name for privacy export/erase paths.
 		$cache[ $table ] = ( $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $table ) ) === $table );
 		return $cache[ $table ];
+	}
+
+	/**
+	 * Fetch one privacy export page from a known PressArk user table.
+	 *
+	 * @return array<int, array<string, mixed>>
+	 */
+	private function get_export_rows( string $table_suffix, string $select_sql, int $user_id, int $per_page, int $offset ): array {
+		global $wpdb;
+
+		$table = $wpdb->prefix . $table_suffix;
+		if ( ! $this->table_exists( $table ) ) {
+			return array();
+		}
+
+		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,WordPress.DB.PreparedSQL.InterpolatedNotPrepared,PluginCheck.Security.DirectDB.UnescapedDBParameter -- Privacy export reads from known internal PressArk tables and fixed column lists chosen inside this class.
+		$rows = $wpdb->get_results( $wpdb->prepare(
+			"SELECT {$select_sql} FROM {$table} WHERE user_id = %d ORDER BY id ASC LIMIT %d OFFSET %d",
+			$user_id,
+			$per_page,
+			$offset
+		), ARRAY_A );
+		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,WordPress.DB.PreparedSQL.InterpolatedNotPrepared,PluginCheck.Security.DirectDB.UnescapedDBParameter
+
+		return is_array( $rows ) ? $rows : array();
+	}
+
+	/**
+	 * Count remaining privacy rows for a user in a known PressArk table.
+	 */
+	private function count_user_rows( string $table, int $user_id ): int {
+		global $wpdb;
+
+		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,WordPress.DB.PreparedSQL.InterpolatedNotPrepared,PluginCheck.Security.DirectDB.UnescapedDBParameter -- Privacy erasure counts rows in known internal PressArk tables before batched deletion.
+		$count = (int) $wpdb->get_var( $wpdb->prepare(
+			"SELECT COUNT(*) FROM {$table} WHERE user_id = %d",
+			$user_id
+		) );
+		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,WordPress.DB.PreparedSQL.InterpolatedNotPrepared,PluginCheck.Security.DirectDB.UnescapedDBParameter
+
+		return $count;
+	}
+
+	/**
+	 * Delete one privacy erase batch from a known PressArk table.
+	 */
+	private function delete_user_rows_batch( string $table, int $user_id, int $batch ): int {
+		global $wpdb;
+
+		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,WordPress.DB.PreparedSQL.InterpolatedNotPrepared,PluginCheck.Security.DirectDB.UnescapedDBParameter -- Privacy erasure deletes from known internal PressArk tables in bounded batches to avoid long locks.
+		$deleted = (int) $wpdb->query( $wpdb->prepare(
+			"DELETE FROM {$table} WHERE user_id = %d ORDER BY id ASC LIMIT %d",
+			$user_id,
+			$batch
+		) );
+		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,WordPress.DB.PreparedSQL.InterpolatedNotPrepared,PluginCheck.Security.DirectDB.UnescapedDBParameter
+
+		return $deleted;
 	}
 
 	/**

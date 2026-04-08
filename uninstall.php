@@ -47,12 +47,13 @@ function pressark_uninstall_site(): void {
 	);
 
 	foreach ( $tables as $table ) {
-		$wpdb->query( "DROP TABLE IF EXISTS {$wpdb->prefix}{$table}" ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery
+		$wpdb->query( "DROP TABLE IF EXISTS {$wpdb->prefix}{$table}" ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,WordPress.DB.DirectDatabaseQuery.SchemaChange,WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- Uninstall-only cleanup for a fixed internal allowlist of plugin-owned tables; caching is not relevant, schema removal is intentional during uninstall, and table suffixes are not user input.
 	}
 
 	// ── Delete all pressark options ───────────────────────────────────
 	// Covers: api keys, license, db_version, byok, model, provider, site profile,
 	// usage counters, token tracking, retention settings, index state, etc.
+	// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- Uninstall-only destructive cleanup of plugin-owned options; caching is not relevant.
 	$wpdb->query( $wpdb->prepare(
 		"DELETE FROM {$wpdb->options} WHERE option_name LIKE %s",
 		$wpdb->esc_like( 'pressark_' ) . '%'
@@ -60,6 +61,7 @@ function pressark_uninstall_site(): void {
 
 	// ── Delete all pressark transients ────────────────────────────────
 	// Standard transients: _transient_{name} and _transient_timeout_{name}.
+	// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- Uninstall-only destructive cleanup of plugin-owned transients; caching is not relevant.
 	$wpdb->query( $wpdb->prepare(
 		"DELETE FROM {$wpdb->options} WHERE option_name LIKE %s OR option_name LIKE %s",
 		$wpdb->esc_like( '_transient_pressark' ) . '%',
@@ -68,6 +70,7 @@ function pressark_uninstall_site(): void {
 
 	// ── Delete all pressark user meta ─────────────────────────────────
 	// Covers: pressark_onboarded, pressark_telegram_chat_id, pressark_group_usage.
+	// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- Uninstall-only destructive cleanup of plugin-owned user meta; caching is not relevant.
 	$wpdb->query( $wpdb->prepare(
 		"DELETE FROM {$wpdb->usermeta} WHERE meta_key LIKE %s",
 		$wpdb->esc_like( 'pressark_' ) . '%'
@@ -108,6 +111,7 @@ if ( is_multisite() ) {
 	global $wpdb;
 
 	// Clean up network-level site transients.
+	// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- Multisite uninstall-only destructive cleanup of plugin-owned site transients; caching is not relevant.
 	$wpdb->query( $wpdb->prepare(
 		"DELETE FROM {$wpdb->sitemeta} WHERE meta_key LIKE %s OR meta_key LIKE %s",
 		$wpdb->esc_like( '_site_transient_pressark' ) . '%',
@@ -115,15 +119,15 @@ if ( is_multisite() ) {
 	) );
 }
 
-$plugin_file   = dirname( __FILE__ ) . '/pressark.php';
-$network_wide  = PressArk_Uninstall_Helper::is_network_uninstall( $plugin_file );
-$site_ids      = PressArk_Uninstall_Helper::site_ids_for_uninstall( $network_wide, $plugin_file );
+$pressark_plugin_file  = dirname( __FILE__ ) . '/pressark.php';
+$pressark_network_wide = PressArk_Uninstall_Helper::is_network_uninstall( $pressark_plugin_file );
+$pressark_site_ids     = PressArk_Uninstall_Helper::site_ids_for_uninstall( $pressark_network_wide, $pressark_plugin_file );
 
-if ( empty( $site_ids ) ) {
+if ( empty( $pressark_site_ids ) ) {
 	pressark_uninstall_site();
 } else {
-	foreach ( $site_ids as $site_id ) {
-		switch_to_blog( $site_id );
+	foreach ( $pressark_site_ids as $pressark_site_id ) {
+		switch_to_blog( $pressark_site_id );
 		pressark_uninstall_site();
 		restore_current_blog();
 	}

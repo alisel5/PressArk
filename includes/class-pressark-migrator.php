@@ -479,7 +479,7 @@ class PressArk_Migrator {
 		self::ensure_unique_index( $tasks_table, 'uniq_idempotency_active', 'idempotency_key, idempotency_active' );
 
 		if ( self::table_has_column( $tasks_table, 'idempotency_active' ) ) {
-			// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- DDL migration on hardcoded prefixed table, no user input.
+			// phpcs:disable PluginCheck.Security.DirectDB.UnescapedDBParameter,WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- One-time migration update on a plugin-owned prefixed table.
 			$wpdb->query(
 				"UPDATE {$tasks_table}
 				 SET idempotency_active = CASE
@@ -488,6 +488,7 @@ class PressArk_Migrator {
 				 	ELSE NULL
 				 END"
 			);
+			// phpcs:enable PluginCheck.Security.DirectDB.UnescapedDBParameter,WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 		}
 
 		return true;
@@ -541,10 +542,12 @@ class PressArk_Migrator {
 			'pressark_custom_model',
 		);
 		$placeholders = implode( ',', array_fill( 0, count( $options ), '%s' ) );
+		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,WordPress.DB.PreparedSQL.InterpolatedNotPrepared,WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare -- Prepared maintenance update on the core options table during a versioned migration.
 		$wpdb->query( $wpdb->prepare(
 			"UPDATE {$wpdb->options} SET autoload = 'no' WHERE option_name IN ($placeholders)",
 			...$options
 		) );
+		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,WordPress.DB.PreparedSQL.InterpolatedNotPrepared,WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare
 		return true;
 	}
 
@@ -579,17 +582,17 @@ class PressArk_Migrator {
 		}
 
 		if ( ! self::table_has_column( $table, 'event_trigger' ) ) {
-			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+			// phpcs:ignore PluginCheck.Security.DirectDB.UnescapedDBParameter,WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,WordPress.DB.DirectDatabaseQuery.SchemaChange,WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- One-time schema migration on a plugin-owned prefixed table.
 			$wpdb->query( "ALTER TABLE {$table} ADD COLUMN event_trigger VARCHAR(64) DEFAULT NULL AFTER cadence_value" );
 		}
 
 		if ( ! self::table_has_column( $table, 'event_trigger_cooldown' ) ) {
-			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+			// phpcs:ignore PluginCheck.Security.DirectDB.UnescapedDBParameter,WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,WordPress.DB.DirectDatabaseQuery.SchemaChange,WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- One-time schema migration on a plugin-owned prefixed table.
 			$wpdb->query( "ALTER TABLE {$table} ADD COLUMN event_trigger_cooldown INT UNSIGNED DEFAULT 3600 AFTER event_trigger" );
 		}
 
 		if ( ! self::table_has_column( $table, 'last_triggered_at' ) ) {
-			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+			// phpcs:ignore PluginCheck.Security.DirectDB.UnescapedDBParameter,WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,WordPress.DB.DirectDatabaseQuery.SchemaChange,WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- One-time schema migration on a plugin-owned prefixed table.
 			$wpdb->query( "ALTER TABLE {$table} ADD COLUMN last_triggered_at DATETIME DEFAULT NULL AFTER event_trigger_cooldown" );
 		}
 
@@ -654,6 +657,7 @@ class PressArk_Migrator {
 		}
 
 		if ( ! self::table_has_index( $table, $index_name ) ) {
+			// phpcs:ignore PluginCheck.Security.DirectDB.UnescapedDBParameter,WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,WordPress.DB.PreparedSQL.InterpolatedNotPrepared,WordPress.DB.DirectDatabaseQuery.SchemaChange -- Index maintenance for a plugin-owned prefixed table.
 			$wpdb->query( "ALTER TABLE {$table} ADD FULLTEXT {$index_name} ({$columns})" );
 		}
 
@@ -671,6 +675,7 @@ class PressArk_Migrator {
 		}
 
 		if ( ! self::table_has_index( $table, $index_name ) ) {
+			// phpcs:ignore PluginCheck.Security.DirectDB.UnescapedDBParameter,WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,WordPress.DB.PreparedSQL.InterpolatedNotPrepared,WordPress.DB.DirectDatabaseQuery.SchemaChange -- Index maintenance for a plugin-owned prefixed table.
 			$wpdb->query( "ALTER TABLE {$table} ADD INDEX {$index_name} ({$columns})" );
 		}
 
@@ -688,6 +693,7 @@ class PressArk_Migrator {
 		}
 
 		if ( ! self::table_has_index( $table, $index_name ) ) {
+			// phpcs:ignore PluginCheck.Security.DirectDB.UnescapedDBParameter,WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,WordPress.DB.PreparedSQL.InterpolatedNotPrepared,WordPress.DB.DirectDatabaseQuery.SchemaChange -- Index maintenance for a plugin-owned prefixed table.
 			$wpdb->query( "ALTER TABLE {$table} ADD UNIQUE INDEX {$index_name} ({$columns})" );
 		}
 
@@ -704,6 +710,7 @@ class PressArk_Migrator {
 			return true;
 		}
 
+		// phpcs:ignore PluginCheck.Security.DirectDB.UnescapedDBParameter,WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,WordPress.DB.PreparedSQL.InterpolatedNotPrepared,WordPress.DB.DirectDatabaseQuery.SchemaChange -- Index maintenance for a plugin-owned prefixed table.
 		$wpdb->query( "ALTER TABLE {$table} DROP INDEX {$index_name}" );
 
 		return ! self::table_has_index( $table, $index_name );
@@ -905,6 +912,7 @@ class PressArk_Migrator {
 	 */
 	private static function table_exists( string $table ): bool {
 		global $wpdb;
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- Migration metadata check against the current database.
 		return $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $table ) ) === $table;
 	}
 
@@ -914,6 +922,7 @@ class PressArk_Migrator {
 	private static function table_has_column( string $table, string $column ): bool {
 		global $wpdb;
 
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- Migration metadata check against INFORMATION_SCHEMA.
 		return $wpdb->get_var( $wpdb->prepare(
 			"SELECT COLUMN_NAME
 			 FROM INFORMATION_SCHEMA.COLUMNS
@@ -932,6 +941,7 @@ class PressArk_Migrator {
 	private static function table_has_index( string $table, string $index_name ): bool {
 		global $wpdb;
 
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- Migration metadata check against INFORMATION_SCHEMA.
 		return $wpdb->get_var( $wpdb->prepare(
 			"SELECT INDEX_NAME
 			 FROM INFORMATION_SCHEMA.STATISTICS
@@ -950,6 +960,7 @@ class PressArk_Migrator {
 	private static function table_index_is_unique( string $table, string $index_name ): bool {
 		global $wpdb;
 
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- Migration metadata check against INFORMATION_SCHEMA.
 		return '0' === (string) $wpdb->get_var( $wpdb->prepare(
 			"SELECT NON_UNIQUE
 			 FROM INFORMATION_SCHEMA.STATISTICS

@@ -120,6 +120,19 @@ class PressArk_Handler_Content extends PressArk_Handler_Base {
 	}
 
 	/**
+	 * Check whether a post has at least one indexed content chunk.
+	 */
+	private function is_post_indexed( int $post_id ): bool {
+		global $wpdb;
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- Reads plugin-owned content index state for one post via a bounded existence probe; caching is not relevant to this per-request status check.
+		return null !== $wpdb->get_var( $wpdb->prepare(
+			"SELECT 1 FROM {$wpdb->prefix}pressark_content_index WHERE post_id = %d LIMIT 1",
+			$post_id
+		) );
+	}
+
+	/**
 	 * Light mode: metadata only, no raw content. ~200 tokens.
 	 *
 	 * @since 2.4.0
@@ -152,11 +165,7 @@ class PressArk_Handler_Content extends PressArk_Handler_Base {
 		}
 
 		// Index status.
-		global $wpdb;
-		$indexed = (bool) $wpdb->get_var( $wpdb->prepare(
-			"SELECT COUNT(*) FROM {$wpdb->prefix}pressark_content_index WHERE post_id = %d",
-			$post_id
-		) );
+		$indexed = $this->is_post_indexed( $post_id );
 
 		return array(
 			'success' => true,
@@ -288,11 +297,7 @@ class PressArk_Handler_Content extends PressArk_Handler_Base {
 		$readability = $fk_grade <= 6 ? 'very easy' : ( $fk_grade <= 10 ? 'easy' : ( $fk_grade <= 14 ? 'moderate' : 'difficult' ) );
 
 		// Index status.
-		global $wpdb;
-		$indexed = (bool) $wpdb->get_var( $wpdb->prepare(
-			"SELECT COUNT(*) FROM {$wpdb->prefix}pressark_content_index WHERE post_id = %d",
-			$post_id
-		) );
+		$indexed = $this->is_post_indexed( $post_id );
 
 		return array(
 			'success' => true,
@@ -389,6 +394,7 @@ class PressArk_Handler_Content extends PressArk_Handler_Base {
 			if ( ! in_array( $compare, array( 'EXISTS', 'NOT EXISTS' ), true ) ) {
 				$meta_clause['value'] = $params['meta_value'] ?? '';
 			}
+			// phpcs:ignore WordPress.DB.SlowDBQuery.slow_db_query_meta_query -- Search tool intentionally exposes bounded WP_Query meta filtering when the caller requests it.
 			$args['meta_query'] = array( $meta_clause );
 		}
 
@@ -1186,6 +1192,7 @@ class PressArk_Handler_Content extends PressArk_Handler_Base {
 		// B2: needs_seo filter — posts missing SEO title.
 		if ( ! empty( $params['needs_seo'] ) ) {
 			$title_key = PressArk_SEO_Resolver::resolve_key( 'meta_title' );
+			// phpcs:ignore WordPress.DB.SlowDBQuery.slow_db_query_meta_query -- Listing posts that still need SEO metadata intentionally uses a NOT EXISTS meta query and remains bounded by the normal list limit.
 			$args['meta_query'] = array(
 				array(
 					'key'     => $title_key,
@@ -1347,6 +1354,7 @@ class PressArk_Handler_Content extends PressArk_Handler_Base {
 		// Exclude IDs (cap at 50 to prevent bloated NOT IN queries).
 		if ( ! empty( $params['exclude_ids'] ) ) {
 			$exclude = is_array( $params['exclude_ids'] ) ? $params['exclude_ids'] : array( $params['exclude_ids'] );
+			// phpcs:ignore WordPressVIPMinimum.Performance.WPQueryParams.PostNotIn_post__not_in -- Random selection optionally excludes a caller-supplied list that is hard-capped at 50 IDs.
 			$args['post__not_in'] = array_map( 'absint', array_slice( $exclude, 0, 50 ) );
 		}
 

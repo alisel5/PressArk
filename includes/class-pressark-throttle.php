@@ -259,10 +259,12 @@ class PressArk_Throttle {
 		if ( ! wp_using_ext_object_cache() ) {
 			global $wpdb;
 			// MySQL advisory lock — 2 second timeout (fail fast under contention).
+			// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- Runtime throttling intentionally uses MySQL advisory locks on DB-backed sites to preserve atomic slot mutations under contention.
 			$got = $wpdb->get_var( $wpdb->prepare(
 				"SELECT GET_LOCK(%s, 2)",
 				$lock_name
 			) );
+			// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching
 			return (int) $got === 1;
 		}
 
@@ -285,6 +287,7 @@ class PressArk_Throttle {
 	private function release_slot_lock( string $lock_name ): void {
 		if ( ! wp_using_ext_object_cache() ) {
 			global $wpdb;
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery -- Runtime throttling intentionally releases the matching MySQL advisory lock on DB-backed sites.
 			$wpdb->query( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $lock_name ) );
 			return;
 		}
@@ -326,6 +329,7 @@ class PressArk_Throttle {
 		$expiration   = time() + $ttl;
 
 		// Try atomic increment first (key already exists).
+		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- Runtime throttling intentionally uses direct SQL on wp_options to keep counter increments atomic on DB-backed sites.
 		$rows = $wpdb->query( $wpdb->prepare(
 			"UPDATE {$wpdb->options}
 			 SET option_value = option_value + 1
@@ -373,7 +377,7 @@ class PressArk_Throttle {
 			) );
 			return (int) $new_val;
 		}
-
+		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching
 		return 1;
 	}
 
@@ -393,6 +397,7 @@ class PressArk_Throttle {
 
 		// Delete transient timeouts that have already expired, and their matching transient values.
 		// Match patterns: _transient_timeout_pressark_burst_*, _transient_timeout_pressark_hourly_*, _transient_timeout_pressark_ip_*
+		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- Housekeeping intentionally scans and removes expired PressArk throttle transients directly from wp_options in bounded batches.
 		$expired = $wpdb->get_col( $wpdb->prepare(
 			"SELECT option_name FROM {$wpdb->options}
 			 WHERE option_name LIKE %s
@@ -408,12 +413,12 @@ class PressArk_Throttle {
 
 		foreach ( $expired as $timeout_name ) {
 			$value_name = str_replace( '_transient_timeout_', '_transient_', $timeout_name );
-			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
 			$wpdb->query( $wpdb->prepare(
 				"DELETE FROM {$wpdb->options} WHERE option_name IN (%s, %s)",
 				$timeout_name,
 				$value_name
 			) );
 		}
+		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching
 	}
 }

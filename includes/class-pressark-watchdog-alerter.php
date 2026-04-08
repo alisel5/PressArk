@@ -146,7 +146,7 @@ class PressArk_Watchdog_Alerter {
 
 		try {
 			// Select only real event rows — exclude cooldown sentinel (object_id = 0).
-			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+			// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,PluginCheck.Security.DirectDB.UnescapedDBParameter,WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- Watchdog batching intentionally reads internal alert-batch rows under a flush lock; table name is internal and caching is not relevant.
 			$rows = $wpdb->get_results( $wpdb->prepare(
 				"SELECT id, object_id, event_data, created_at
 				 FROM {$table}
@@ -154,6 +154,7 @@ class PressArk_Watchdog_Alerter {
 				 ORDER BY created_at ASC",
 				$batch_key
 			) );
+			// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,PluginCheck.Security.DirectDB.UnescapedDBParameter,WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 
 			if ( empty( $rows ) ) {
 				// No batched events — delete cooldown so next event sends immediately.
@@ -166,18 +167,20 @@ class PressArk_Watchdog_Alerter {
 
 			// Delete the claimed rows atomically.
 			$id_placeholders = implode( ',', array_fill( 0, count( $ids ), '%d' ) );
-			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+			// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,PluginCheck.Security.DirectDB.UnescapedDBParameter,WordPress.DB.PreparedSQL.InterpolatedNotPrepared,WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare -- Watchdog batching intentionally deletes claimed internal batch rows using a placeholder list derived from previously selected row IDs.
 			$wpdb->query( $wpdb->prepare(
 				"DELETE FROM {$table} WHERE id IN ({$id_placeholders})",
 				...$ids
 			) );
+			// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,PluginCheck.Security.DirectDB.UnescapedDBParameter,WordPress.DB.PreparedSQL.InterpolatedNotPrepared,WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare
 
 			// Check if any NEW rows arrived during our flush (late appends).
-			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+			// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,PluginCheck.Security.DirectDB.UnescapedDBParameter,WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- Watchdog batching intentionally rechecks for late-arriving internal batch rows before releasing cooldown.
 			$remaining = (int) $wpdb->get_var( $wpdb->prepare(
 				"SELECT COUNT(*) FROM {$table} WHERE batch_key = %s AND object_id > 0",
 				$batch_key
 			) );
+			// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,PluginCheck.Security.DirectDB.UnescapedDBParameter,WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 
 			if ( $remaining > 0 ) {
 				// Late arrivals exist — re-schedule flush, keep cooldown active.
@@ -253,7 +256,7 @@ class PressArk_Watchdog_Alerter {
 		// Per-user thresholds are checked inside flush_batch().
 		$cutoff = gmdate( 'Y-m-d H:i:s', time() - ( 62 * 60 ) );
 
-		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,PluginCheck.Security.DirectDB.UnescapedDBParameter,WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- Watchdog recovery intentionally scans grouped internal alert batches for stale entries.
 		$stale = $wpdb->get_results( $wpdb->prepare(
 			"SELECT batch_key, MIN(created_at) AS oldest
 			 FROM {$table}
@@ -262,6 +265,7 @@ class PressArk_Watchdog_Alerter {
 			 LIMIT 20",
 			$cutoff
 		) );
+		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,PluginCheck.Security.DirectDB.UnescapedDBParameter,WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 
 		if ( empty( $stale ) ) {
 			return;
@@ -307,13 +311,14 @@ class PressArk_Watchdog_Alerter {
 
 		try {
 			// Check for an existing cooldown sentinel (object_id = 0).
-			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+			// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,PluginCheck.Security.DirectDB.UnescapedDBParameter,WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- Cooldown claiming intentionally probes the internal alert-batch table under a lock.
 			$existing = $wpdb->get_var( $wpdb->prepare(
 				"SELECT id FROM {$table}
 				 WHERE batch_key = %s AND object_id = 0
 				 LIMIT 1",
 				$batch_key
 			) );
+			// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,PluginCheck.Security.DirectDB.UnescapedDBParameter,WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 
 			if ( $existing ) {
 				return false; // Cooldown active.
@@ -344,7 +349,7 @@ class PressArk_Watchdog_Alerter {
 		global $wpdb;
 		$table = $wpdb->prefix . 'pressark_alert_batches';
 
-		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- Cooldown cleanup intentionally deletes the internal sentinel row for one batch key.
 		$wpdb->delete( $table, array(
 			'batch_key' => $batch_key,
 			'object_id' => 0,
@@ -413,6 +418,7 @@ class PressArk_Watchdog_Alerter {
 	private static function acquire_lock( string $lock_name ): bool {
 		global $wpdb;
 		// 2 second timeout — fail fast under contention.
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- Watchdog batching intentionally uses MySQL advisory locks to serialize flush and append operations.
 		$got = $wpdb->get_var( $wpdb->prepare(
 			"SELECT GET_LOCK(%s, 2)",
 			$lock_name
@@ -427,6 +433,7 @@ class PressArk_Watchdog_Alerter {
 	 */
 	private static function release_lock( string $lock_name ): void {
 		global $wpdb;
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- Watchdog batching intentionally releases the matching MySQL advisory lock.
 		$wpdb->query( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $lock_name ) );
 	}
 
@@ -476,7 +483,7 @@ class PressArk_Watchdog_Alerter {
 
 		global $wpdb;
 		$table = $wpdb->prefix . 'pressark_alert_batches';
-		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- Table readiness intentionally checks information_schema for the internal alert-batch table.
 		$ready = (bool) $wpdb->get_var( $wpdb->prepare(
 			'SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s',
 			DB_NAME,
@@ -1042,10 +1049,11 @@ class PressArk_Watchdog_Alerter {
 		}
 
 		// Delete anything older than 24 hours — batches should never live this long.
-		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,PluginCheck.Security.DirectDB.UnescapedDBParameter,WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- Housekeeping intentionally performs a bounded delete against the internal alert-batch table.
 		$wpdb->query( $wpdb->prepare(
 			"DELETE FROM {$table} WHERE created_at < %s LIMIT 500",
 			gmdate( 'Y-m-d H:i:s', time() - 86400 )
 		) );
+		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,PluginCheck.Security.DirectDB.UnescapedDBParameter,WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 	}
 }

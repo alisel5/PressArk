@@ -197,6 +197,7 @@ class PressArk_Handler_Media extends PressArk_Handler_Base {
 
 		// Which posts use this as featured image.
 		global $wpdb;
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- Media diagnostics intentionally reads a small capped list of posts using this attachment as a featured image.
 		$used_as_featured = $wpdb->get_col(
 			$wpdb->prepare(
 				"SELECT post_id FROM {$wpdb->postmeta} WHERE meta_key = '_thumbnail_id' AND meta_value = %d LIMIT 10",
@@ -1324,6 +1325,7 @@ class PressArk_Handler_Media extends PressArk_Handler_Base {
 
 				// Check if form is used in any post.
 				global $wpdb;
+				// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- Form diagnostics intentionally counts published posts containing this specific shortcode pattern.
 				$usage = $wpdb->get_var( $wpdb->prepare(
 					"SELECT COUNT(*) FROM {$wpdb->posts}
 					 WHERE post_content LIKE %s AND post_status = 'publish'",
@@ -1385,10 +1387,13 @@ class PressArk_Handler_Media extends PressArk_Handler_Base {
 			$detected[] = 'Fluent Forms';
 			global $wpdb;
 			$ff_table = $wpdb->prefix . 'fluentform_forms';
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- Third-party integration intentionally checks for the Fluent Forms table before reading form metadata.
 			if ( $wpdb->get_var( $wpdb->prepare( "SHOW TABLES LIKE %s", $ff_table ) ) ) {
+				// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,PluginCheck.Security.DirectDB.UnescapedDBParameter,WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- Reads a fixed prefixed Fluent Forms table name for integration metadata; table name is not user input on the plugin's WordPress 6.0 minimum.
 				$ff_forms = $wpdb->get_results( $wpdb->prepare(
 					"SELECT id, title, status FROM {$ff_table} LIMIT %d", 50
 				) );
+				// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,PluginCheck.Security.DirectDB.UnescapedDBParameter,WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 				foreach ( $ff_forms as $ff ) {
 					$forms[] = array(
 						'id'        => $ff->id,

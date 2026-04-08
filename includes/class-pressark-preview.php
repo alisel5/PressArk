@@ -716,10 +716,10 @@ class PressArk_Preview {
 	 * Validate signed URL token. Called in template_redirect hook.
 	 */
 	public static function validate_token(): bool {
-		$session_id = sanitize_text_field( wp_unslash( $_GET['pressark_preview'] ?? '' ) );
-		$user_id    = (int) ( $_GET['pressark_uid'] ?? 0 );
-		$expiry     = (int) ( $_GET['pressark_exp'] ?? 0 );
-		$token      = sanitize_text_field( wp_unslash( $_GET['pressark_token'] ?? '' ) );
+		$session_id = self::request_text_param( 'pressark_preview' );
+		$user_id    = self::request_int_param( 'pressark_uid' );
+		$expiry     = self::request_int_param( 'pressark_exp' );
+		$token      = self::request_text_param( 'pressark_token' );
 
 		if ( ! $session_id || ! $user_id || ! $expiry || ! $token ) {
 			return false;
@@ -742,14 +742,13 @@ class PressArk_Preview {
 	 * Called in template_redirect — before any output.
 	 */
 	public static function activate_for_request(): void {
-		if ( empty( $_GET['pressark_preview'] ) ) {
+		$session_id = self::request_text_param( 'pressark_preview' );
+		if ( '' === $session_id ) {
 			return;
 		}
 		if ( ! self::validate_token() ) {
 			return;
 		}
-
-		$session_id = sanitize_text_field( wp_unslash( $_GET['pressark_preview'] ) );
 		$layer      = null;
 		if ( wp_using_ext_object_cache() ) {
 			try {
@@ -1445,6 +1444,7 @@ class PressArk_Preview {
 	 * and logs cleanup counts for supportability.
 	 */
 	public static function cleanup_expired(): void {
+		// phpcs:disable WordPress.DB.SlowDBQuery.slow_db_query_meta_key,WordPress.DB.SlowDBQuery.slow_db_query_meta_value -- Cron cleanup intentionally targets only PressArk-owned preview draft markers and is capped at 50 stale drafts.
 		$drafts = get_posts( array(
 			'post_status'    => 'auto-draft',
 			'post_type'      => 'any',
@@ -1458,6 +1458,7 @@ class PressArk_Preview {
 				),
 			),
 		) );
+		// phpcs:enable WordPress.DB.SlowDBQuery.slow_db_query_meta_key,WordPress.DB.SlowDBQuery.slow_db_query_meta_value
 
 		$count = 0;
 		foreach ( $drafts as $draft ) {
@@ -1490,6 +1491,7 @@ class PressArk_Preview {
 		if ( ! wp_using_ext_object_cache() ) {
 			global $wpdb;
 			$option_name = '_transient_' . $lock_key;
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- Atomic INSERT IGNORE against wp_options is intentional here to provide a lock when no external object cache is active.
 			$rows = $wpdb->query( $wpdb->prepare(
 				"INSERT IGNORE INTO {$wpdb->options} (option_name, option_value, autoload)
 				 VALUES (%s, %s, 'no')",
@@ -1575,6 +1577,7 @@ class PressArk_Preview {
 
 		// LiteSpeed Cache.
 		if ( class_exists( '\LiteSpeed\Purge' ) ) {
+			// phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- LiteSpeed Cache exposes this third-party purge hook.
 			try { do_action( 'litespeed_purge_all' ); } catch ( \Throwable $e ) { /* non-fatal */ }
 		}
 
@@ -1648,19 +1651,22 @@ class PressArk_Preview {
 	 * @since 4.2.0
 	 */
 	public static function handle_pre_get_posts( \WP_Query $query ): void {
-		if ( ! $query->is_main_query() || empty( $_GET['pressark_preview'] ) ) {
+		$session_id = self::request_text_param( 'pressark_preview' );
+
+		if ( ! $query->is_main_query() || '' === $session_id ) {
 			return;
 		}
 		// Support both ?p=ID (posts/CPTs) and ?page_id=ID (pages).
-		$queried_id = (int) ( $_GET['p'] ?? $_GET['page_id'] ?? 0 );
+		$queried_id = self::request_int_param( 'p' );
+		if ( ! $queried_id ) {
+			$queried_id = self::request_int_param( 'page_id' );
+		}
 		if ( ! $queried_id ) {
 			return;
 		}
 		if ( ! self::validate_token() ) {
 			return;
 		}
-
-		$session_id = sanitize_text_field( wp_unslash( $_GET['pressark_preview'] ) );
 		$layer      = get_transient( self::TRANSIENT_PREFIX . $session_id );
 		if ( ! $layer ) {
 			return;
@@ -1674,6 +1680,40 @@ class PressArk_Preview {
 				break;
 			}
 		}
+	}
+
+	/**
+	 * Read a signed preview request parameter as plain text.
+	 *
+	 * @param string $key Query-string key.
+	 */
+	private static function request_text_param( string $key ): string {
+		// phpcs:disable WordPress.Security.NonceVerification.Recommended -- Signed preview URLs are read-only and validated by HMAC token plus user/expiry checks.
+		if ( ! isset( $_GET[ $key ] ) ) {
+			return '';
+		}
+
+		$value = sanitize_text_field( wp_unslash( (string) $_GET[ $key ] ) );
+		// phpcs:enable WordPress.Security.NonceVerification.Recommended
+
+		return $value;
+	}
+
+	/**
+	 * Read a signed preview request parameter as a positive integer.
+	 *
+	 * @param string $key Query-string key.
+	 */
+	private static function request_int_param( string $key ): int {
+		// phpcs:disable WordPress.Security.NonceVerification.Recommended -- Signed preview URLs are read-only and validated by HMAC token plus user/expiry checks.
+		if ( ! isset( $_GET[ $key ] ) ) {
+			return 0;
+		}
+
+		$value = absint( wp_unslash( (string) $_GET[ $key ] ) );
+		// phpcs:enable WordPress.Security.NonceVerification.Recommended
+
+		return $value;
 	}
 
 	/**

@@ -321,6 +321,7 @@ class PressArk_Handler_SEO extends PressArk_Handler_Base {
 			if ( 'all' === $seo_target || empty( $seo_target ) ) {
 				$title_key = PressArk_SEO_Resolver::resolve_key( 'meta_title' );
 
+				// phpcs:disable WordPress.DB.SlowDBQuery.slow_db_query_meta_query -- Admin preview query intentionally finds published posts/pages missing SEO title meta, returns IDs only, and is capped at 100 results.
 				$seo_pages = get_posts( array(
 					'post_type'             => array( 'post', 'page' ),
 					'post_status'           => 'publish',
@@ -332,6 +333,7 @@ class PressArk_Handler_SEO extends PressArk_Handler_Base {
 					'update_post_meta_cache' => false,
 					'update_post_term_cache' => false,
 				) );
+				// phpcs:enable WordPress.DB.SlowDBQuery.slow_db_query_meta_query
 
 				if ( $seo_pages ) {
 					update_meta_cache( 'post', $seo_pages );
@@ -445,6 +447,7 @@ class PressArk_Handler_SEO extends PressArk_Handler_Base {
 		if ( file_exists( $mu_dir . '/pressark-disable-xmlrpc.php' ) ) {
 			$xmlrpc_blocked = true;
 		}
+		// phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- xmlrpc_enabled is a core WordPress filter.
 		if ( ! $xmlrpc_blocked && apply_filters( 'xmlrpc_enabled', true ) === false ) {
 			$xmlrpc_blocked = true;
 		}

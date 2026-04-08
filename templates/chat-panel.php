@@ -7,23 +7,23 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-$screen     = function_exists( 'get_current_screen' ) ? get_current_screen() : null;
-$page_title = '';
+$pressark_screen     = function_exists( 'get_current_screen' ) ? get_current_screen() : null;
+$pressark_page_title = '';
 
-if ( $screen ) {
-	if ( 'post' === $screen->base ) {
+if ( $pressark_screen ) {
+	if ( 'post' === $pressark_screen->base ) {
 		global $post;
-		$page_title = $post ? $post->post_title : $screen->id;
+		$pressark_page_title = $post ? $post->post_title : $pressark_screen->id;
 	} else {
-		$page_title = $screen->id;
+		$pressark_page_title = $pressark_screen->id;
 	}
 } elseif ( ! is_admin() ) {
 	// Frontend context.
-	$page_title = is_singular() ? get_the_title() : wp_get_document_title();
+	$pressark_page_title = is_singular() ? get_the_title() : wp_get_document_title();
 }
 
-$is_byok     = (bool) get_option( 'pressark_byok_enabled', false );
-$has_api_key = PressArk_AI_Connector::is_proxy_mode() || $is_byok || ! empty( get_option( 'pressark_api_key', '' ) );
+$pressark_is_byok     = (bool) get_option( 'pressark_byok_enabled', false );
+$pressark_has_api_key = PressArk_AI_Connector::is_proxy_mode() || $pressark_is_byok || ! empty( get_option( 'pressark_api_key', '' ) );
 ?>
 
 <!-- Chat Panel -->
@@ -70,7 +70,7 @@ $has_api_key = PressArk_AI_Connector::is_proxy_mode() || $is_byok || ! empty( ge
 			printf(
 				/* translators: %s: current page/screen title */
 				esc_html__( 'Currently viewing: %s', 'pressark' ),
-				esc_html( $page_title )
+				esc_html( $pressark_page_title )
 			);
 			?>
 		</span>
@@ -89,7 +89,7 @@ $has_api_key = PressArk_AI_Connector::is_proxy_mode() || $is_byok || ! empty( ge
 		</div>
 	</div>
 
-	<?php if ( ! $has_api_key ) : ?>
+	<?php if ( ! $pressark_has_api_key ) : ?>
 		<!-- No API key warning -->
 		<div class="pressark-no-key">
 			<p>

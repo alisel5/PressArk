@@ -12,7 +12,7 @@
  * Domain Path: /languages
  * Requires at least: 6.0
  * Requires PHP: 8.0
- * Tested up to: 6.8
+ * Tested up to: 6.9
  */
 
 if ( ! defined( 'ABSPATH' ) ) {
@@ -294,6 +294,53 @@ function pressark_icon( string $name, int $size = 16 ): string {
 	$svg = sprintf( $icons[ $name ], $attrs );
 
 	return '<span class="pw-icon" style="display:inline-flex;align-items:center;vertical-align:middle;">' . $svg . '</span>';
+}
+
+/**
+ * Allowed HTML for inline PressArk SVG icons.
+ *
+ * @return array<string, array<string, bool>>
+ */
+function pressark_icon_allowed_html(): array {
+	return array(
+		'span'   => array(
+			'class' => true,
+			'style' => true,
+		),
+		'svg'    => array(
+			'xmlns'           => true,
+			'viewbox'         => true,
+			'viewBox'         => true,
+			'width'           => true,
+			'height'          => true,
+			'fill'            => true,
+			'stroke'          => true,
+			'stroke-width'    => true,
+			'stroke-linecap'  => true,
+			'stroke-linejoin' => true,
+		),
+		'path'   => array(
+			'd'      => true,
+			'fill'   => true,
+			'stroke' => true,
+		),
+		'circle' => array(
+			'cx'     => true,
+			'cy'     => true,
+			'r'      => true,
+			'fill'   => true,
+			'stroke' => true,
+		),
+		'rect'   => array(
+			'x'      => true,
+			'y'      => true,
+			'width'  => true,
+			'height' => true,
+			'rx'     => true,
+			'fill'   => true,
+			'stroke' => true,
+		),
+	);
 }
 
 /**
@@ -911,11 +958,13 @@ function pressark_init(): void {
 	} );
 	add_action( 'upgrader_process_complete', static function (): void {
 		global $wpdb;
+		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- Upgrade-time transient invalidation removes plugin-owned schema cache rows by prefix; caching is not relevant.
 		$wpdb->query( $wpdb->prepare(
 			"DELETE FROM {$wpdb->options} WHERE option_name LIKE %s OR option_name LIKE %s",
 			$wpdb->esc_like( '_transient_pressark_widget_schemas_' ) . '%',
 			$wpdb->esc_like( '_transient_timeout_pressark_widget_schemas_' ) . '%'
 		) );
+		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching
 	} );
 
 	PressArk::get_instance();

@@ -1976,6 +1976,7 @@ class PressArk_Operation_Registry {
 					'type'        => 'string',
 					'description' => 'Published-before bound (strtotime-compatible).',
 				),
+				// phpcs:disable WordPress.DB.SlowDBQuery.slow_db_query_meta_key,WordPress.DB.SlowDBQuery.slow_db_query_meta_value -- These are parameter-contract property names, not query arguments.
 				'meta_key'     => array(
 					'type'        => 'string',
 					'description' => 'Meta key to filter on.',
@@ -1987,6 +1988,7 @@ class PressArk_Operation_Registry {
 						'type' => array( 'string', 'integer', 'number' ),
 					),
 				),
+				// phpcs:enable WordPress.DB.SlowDBQuery.slow_db_query_meta_key,WordPress.DB.SlowDBQuery.slow_db_query_meta_value
 				'meta_compare' => array(
 					'type'        => 'string',
 					'description' => 'Meta comparison operator.',
@@ -2133,6 +2135,7 @@ class PressArk_Operation_Registry {
 					'description'   => 'Meta keys and values to update in one write.',
 					'minProperties' => 1,
 				),
+				// phpcs:disable WordPress.DB.SlowDBQuery.slow_db_query_meta_key,WordPress.DB.SlowDBQuery.slow_db_query_meta_value -- These are parameter-contract property names, not query arguments.
 				'meta_key'   => array(
 					'type'        => 'string',
 					'description' => 'Single meta key to update.',
@@ -2141,6 +2144,7 @@ class PressArk_Operation_Registry {
 					'type'        => 'string',
 					'description' => 'Single meta value to write.',
 				),
+				// phpcs:enable WordPress.DB.SlowDBQuery.slow_db_query_meta_key,WordPress.DB.SlowDBQuery.slow_db_query_meta_value
 			),
 			'required'   => array( 'post_id' ),
 			'one_of'     => array(

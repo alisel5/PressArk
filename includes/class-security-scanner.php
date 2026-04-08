@@ -362,6 +362,7 @@ class PressArk_Security_Scanner {
 		// 9. XML-RPC Status (5 pts, low severity).
 		$max_score += 5;
 		$xmlrpc_file_exists = file_exists( ABSPATH . 'xmlrpc.php' );
+		// phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- xmlrpc_enabled is a core WordPress filter.
 		$xmlrpc_disabled    = apply_filters( 'xmlrpc_enabled', true ) === false;
 
 		if ( ! $xmlrpc_file_exists || $xmlrpc_disabled ) {

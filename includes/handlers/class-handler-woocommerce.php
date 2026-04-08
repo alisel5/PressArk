@@ -813,6 +813,7 @@ class PressArk_Handler_WooCommerce extends PressArk_Handler_Base {
 
 		// Duplicate SKUs (data integrity issue).
 		global $wpdb;
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- Read-only duplicate-SKU diagnostic on a core WooCommerce table for an on-demand admin report.
 		$dup_skus_raw = $wpdb->get_results( $wpdb->prepare(
 			"SELECT meta_value as sku, COUNT(*) as count
 			 FROM {$wpdb->postmeta}
@@ -827,6 +828,7 @@ class PressArk_Handler_WooCommerce extends PressArk_Handler_Base {
 		), $dup_skus_raw );
 
 		// Lookup table desync (prices differ between postmeta and lookup table).
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- Read-only lookup consistency diagnostic on core WooCommerce tables for an on-demand admin report.
 		$desync = $wpdb->get_results( $wpdb->prepare(
 			"SELECT p.ID, p.post_title,
 					pm.meta_value as meta_price,
@@ -992,7 +994,7 @@ class PressArk_Handler_WooCommerce extends PressArk_Handler_Base {
 			// High value order.
 			$total = (float) $order->get_total();
 			if ( $total > 200 ) {
-				$flags[] = 'high_value: ' . strip_tags( wc_price( $total ) );
+				$flags[] = 'high_value: ' . wp_strip_all_tags( wc_price( $total ) );
 			}
 
 			// Pending refund.
@@ -1562,6 +1564,7 @@ class PressArk_Handler_WooCommerce extends PressArk_Handler_Base {
 		}
 
 		// Single query — all aggregates at once via WC Analytics table.
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- Read-only aggregate analytics on WooCommerce lookup tables for an on-demand admin report.
 		$stats = $wpdb->get_row( $wpdb->prepare(
 			"SELECT
 				COUNT(*) as total_orders,
@@ -1580,6 +1583,7 @@ class PressArk_Handler_WooCommerce extends PressArk_Handler_Base {
 		) );
 
 		// Status breakdown.
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- Read-only aggregate analytics on WooCommerce lookup tables for an on-demand admin report.
 		$by_status = $wpdb->get_results( $wpdb->prepare(
 			"SELECT status, COUNT(*) as count, SUM( total_sales ) as revenue
 			 FROM {$wpdb->prefix}wc_order_stats
@@ -1621,92 +1625,18 @@ class PressArk_Handler_WooCommerce extends PressArk_Handler_Base {
 			return array( 'success' => false, 'message' => __( 'You do not have permission to view customer data.', 'pressark' ) );
 		}
 
-		global $wpdb;
-
 		$limit   = min( absint( $params['limit'] ?? 20 ), 100 );
 		$offset  = absint( $params['offset'] ?? 0 );
 		$search  = sanitize_text_field( $params['search'] ?? '' );
-		$orderby = sanitize_text_field( $params['orderby'] ?? 'total_spent' );
-
-		// Map orderby to SQL.
-		$orderby_map = array(
-			'total_spent'     => 'total_spent DESC',
-			'order_count'     => 'order_count DESC',
-			'date_registered' => 'cl.date_registered DESC',
-		);
-		$order_sql = $orderby_map[ $orderby ] ?? 'total_spent DESC';
-
-		// Build WHERE clause for search.
-		$where = '';
-		$where_args = array();
-		if ( $search ) {
-			$like   = '%' . $wpdb->esc_like( $search ) . '%';
-			$where  = 'WHERE (cl.first_name LIKE %s OR cl.last_name LIKE %s OR cl.email LIKE %s)';
-			$where_args = array( $like, $like, $like );
+		$orderby = sanitize_key( $params['orderby'] ?? 'total_spent' );
+		if ( ! in_array( $orderby, array( 'total_spent', 'order_count', 'date_registered' ), true ) ) {
+			$orderby = 'total_spent';
 		}
 
 		// wc_customer_lookup includes both registered and guest customers
 		// and doesn't require N+1 WC_Customer instantiation.
-		if ( $search ) {
-			// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- Dynamic ORDER BY comes from a sanitized whitelist.
-			$customers = $wpdb->get_results( $wpdb->prepare(
-				"SELECT
-					cl.customer_id, cl.user_id, cl.email,
-					cl.first_name, cl.last_name,
-					cl.city, cl.state, cl.country,
-					cl.date_registered, cl.date_last_active,
-					COUNT( os.order_id ) as order_count,
-					SUM( os.total_sales ) as total_spent
-				 FROM {$wpdb->prefix}wc_customer_lookup cl
-				 LEFT JOIN {$wpdb->prefix}wc_order_stats os
-					ON cl.customer_id = os.customer_id
-					AND os.status IN ( 'wc-completed', 'wc-processing' )
-				 WHERE (cl.first_name LIKE %s OR cl.last_name LIKE %s OR cl.email LIKE %s)
-				 GROUP BY cl.customer_id
-				 ORDER BY {$order_sql}
-				 LIMIT %d OFFSET %d",
-				$where_args[0],
-				$where_args[1],
-				$where_args[2],
-				$limit,
-				$offset
-			) );
-		} else {
-			// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- Dynamic ORDER BY comes from a sanitized whitelist.
-			$customers = $wpdb->get_results( $wpdb->prepare(
-				"SELECT
-					cl.customer_id, cl.user_id, cl.email,
-					cl.first_name, cl.last_name,
-					cl.city, cl.state, cl.country,
-					cl.date_registered, cl.date_last_active,
-					COUNT( os.order_id ) as order_count,
-					SUM( os.total_sales ) as total_spent
-				 FROM {$wpdb->prefix}wc_customer_lookup cl
-				 LEFT JOIN {$wpdb->prefix}wc_order_stats os
-					ON cl.customer_id = os.customer_id
-					AND os.status IN ( 'wc-completed', 'wc-processing' )
-				 GROUP BY cl.customer_id
-				 ORDER BY {$order_sql}
-				 LIMIT %d OFFSET %d",
-				$limit,
-				$offset
-			) );
-		}
-
-		// Total count (with search filter).
-		if ( $search ) {
-			$like = '%' . $wpdb->esc_like( $search ) . '%';
-			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.PreparedSQL.InterpolatedNotPrepared
-			$total = (int) $wpdb->get_var( $wpdb->prepare(
-				"SELECT COUNT(*) FROM {$wpdb->prefix}wc_customer_lookup cl WHERE cl.first_name LIKE %s OR cl.last_name LIKE %s OR cl.email LIKE %s",
-				$like, $like, $like
-			) );
-		} else {
-			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- Read-only count on WC core table, no user input.
-			$total = (int) $wpdb->get_var(
-				"SELECT COUNT(*) FROM {$wpdb->prefix}wc_customer_lookup"
-			);
-		}
+		$customers = $this->query_customer_lookup_rows( $orderby, $search, $limit, $offset );
+		$total     = $this->count_customer_lookup_rows( $search );
 
 		$list = array();
 		foreach ( $customers as $c ) {
@@ -1721,10 +1651,10 @@ class PressArk_Handler_WooCommerce extends PressArk_Handler_Base {
 				'order_count' => (int) $c->order_count,
 				'total_spent' => wc_price( (float) $c->total_spent ),
 				'last_active' => $c->date_last_active
-					? date( 'Y-m-d', strtotime( $c->date_last_active ) )
+					? gmdate( 'Y-m-d', strtotime( $c->date_last_active ) )
 					: null,
 				'registered'  => $c->date_registered
-					? date( 'Y-m-d', strtotime( $c->date_registered ) )
+					? gmdate( 'Y-m-d', strtotime( $c->date_registered ) )
 					: null,
 			);
 		}
@@ -1739,6 +1669,184 @@ class PressArk_Handler_WooCommerce extends PressArk_Handler_Base {
 				'has_more' => ( $offset + $limit ) < $total,
 			),
 		);
+	}
+
+	/**
+	 * Query WooCommerce customer lookup rows with fixed sort branches.
+	 *
+	 * @return array<int, object>
+	 */
+	private function query_customer_lookup_rows( string $orderby, string $search, int $limit, int $offset ): array {
+		global $wpdb;
+
+		$rows = array();
+		$like = '%' . $wpdb->esc_like( $search ) . '%';
+
+		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- Read-only customer analytics on WooCommerce lookup tables for an on-demand admin report.
+		if ( '' !== $search ) {
+			switch ( $orderby ) {
+				case 'order_count':
+					$rows = $wpdb->get_results( $wpdb->prepare(
+						"SELECT
+							cl.customer_id, cl.user_id, cl.email,
+							cl.first_name, cl.last_name,
+							cl.city, cl.state, cl.country,
+							cl.date_registered, cl.date_last_active,
+							COUNT( os.order_id ) as order_count,
+							SUM( os.total_sales ) as total_spent
+						 FROM {$wpdb->prefix}wc_customer_lookup cl
+						 LEFT JOIN {$wpdb->prefix}wc_order_stats os
+							ON cl.customer_id = os.customer_id
+							AND os.status IN ( 'wc-completed', 'wc-processing' )
+						 WHERE (cl.first_name LIKE %s OR cl.last_name LIKE %s OR cl.email LIKE %s)
+						 GROUP BY cl.customer_id
+						 ORDER BY order_count DESC
+						 LIMIT %d OFFSET %d",
+						$like,
+						$like,
+						$like,
+						$limit,
+						$offset
+					) );
+					break;
+				case 'date_registered':
+					$rows = $wpdb->get_results( $wpdb->prepare(
+						"SELECT
+							cl.customer_id, cl.user_id, cl.email,
+							cl.first_name, cl.last_name,
+							cl.city, cl.state, cl.country,
+							cl.date_registered, cl.date_last_active,
+							COUNT( os.order_id ) as order_count,
+							SUM( os.total_sales ) as total_spent
+						 FROM {$wpdb->prefix}wc_customer_lookup cl
+						 LEFT JOIN {$wpdb->prefix}wc_order_stats os
+							ON cl.customer_id = os.customer_id
+							AND os.status IN ( 'wc-completed', 'wc-processing' )
+						 WHERE (cl.first_name LIKE %s OR cl.last_name LIKE %s OR cl.email LIKE %s)
+						 GROUP BY cl.customer_id
+						 ORDER BY cl.date_registered DESC
+						 LIMIT %d OFFSET %d",
+						$like,
+						$like,
+						$like,
+						$limit,
+						$offset
+					) );
+					break;
+				default:
+					$rows = $wpdb->get_results( $wpdb->prepare(
+						"SELECT
+							cl.customer_id, cl.user_id, cl.email,
+							cl.first_name, cl.last_name,
+							cl.city, cl.state, cl.country,
+							cl.date_registered, cl.date_last_active,
+							COUNT( os.order_id ) as order_count,
+							SUM( os.total_sales ) as total_spent
+						 FROM {$wpdb->prefix}wc_customer_lookup cl
+						 LEFT JOIN {$wpdb->prefix}wc_order_stats os
+							ON cl.customer_id = os.customer_id
+							AND os.status IN ( 'wc-completed', 'wc-processing' )
+						 WHERE (cl.first_name LIKE %s OR cl.last_name LIKE %s OR cl.email LIKE %s)
+						 GROUP BY cl.customer_id
+						 ORDER BY total_spent DESC
+						 LIMIT %d OFFSET %d",
+						$like,
+						$like,
+						$like,
+						$limit,
+						$offset
+					) );
+					break;
+			}
+		} else {
+			switch ( $orderby ) {
+				case 'order_count':
+					$rows = $wpdb->get_results( $wpdb->prepare(
+						"SELECT
+							cl.customer_id, cl.user_id, cl.email,
+							cl.first_name, cl.last_name,
+							cl.city, cl.state, cl.country,
+							cl.date_registered, cl.date_last_active,
+							COUNT( os.order_id ) as order_count,
+							SUM( os.total_sales ) as total_spent
+						 FROM {$wpdb->prefix}wc_customer_lookup cl
+						 LEFT JOIN {$wpdb->prefix}wc_order_stats os
+							ON cl.customer_id = os.customer_id
+							AND os.status IN ( 'wc-completed', 'wc-processing' )
+						 GROUP BY cl.customer_id
+						 ORDER BY order_count DESC
+						 LIMIT %d OFFSET %d",
+						$limit,
+						$offset
+					) );
+					break;
+				case 'date_registered':
+					$rows = $wpdb->get_results( $wpdb->prepare(
+						"SELECT
+							cl.customer_id, cl.user_id, cl.email,
+							cl.first_name, cl.last_name,
+							cl.city, cl.state, cl.country,
+							cl.date_registered, cl.date_last_active,
+							COUNT( os.order_id ) as order_count,
+							SUM( os.total_sales ) as total_spent
+						 FROM {$wpdb->prefix}wc_customer_lookup cl
+						 LEFT JOIN {$wpdb->prefix}wc_order_stats os
+							ON cl.customer_id = os.customer_id
+							AND os.status IN ( 'wc-completed', 'wc-processing' )
+						 GROUP BY cl.customer_id
+						 ORDER BY cl.date_registered DESC
+						 LIMIT %d OFFSET %d",
+						$limit,
+						$offset
+					) );
+					break;
+				default:
+					$rows = $wpdb->get_results( $wpdb->prepare(
+						"SELECT
+							cl.customer_id, cl.user_id, cl.email,
+							cl.first_name, cl.last_name,
+							cl.city, cl.state, cl.country,
+							cl.date_registered, cl.date_last_active,
+							COUNT( os.order_id ) as order_count,
+							SUM( os.total_sales ) as total_spent
+						 FROM {$wpdb->prefix}wc_customer_lookup cl
+						 LEFT JOIN {$wpdb->prefix}wc_order_stats os
+							ON cl.customer_id = os.customer_id
+							AND os.status IN ( 'wc-completed', 'wc-processing' )
+						 GROUP BY cl.customer_id
+						 ORDER BY total_spent DESC
+						 LIMIT %d OFFSET %d",
+						$limit,
+						$offset
+					) );
+					break;
+			}
+		}
+		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+
+		return is_array( $rows ) ? $rows : array();
+	}
+
+	/**
+	 * Count customer lookup rows for pagination.
+	 */
+	private function count_customer_lookup_rows( string $search ): int {
+		global $wpdb;
+
+		if ( '' === $search ) {
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- Read-only customer count on a WooCommerce core lookup table for admin pagination.
+			return (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$wpdb->prefix}wc_customer_lookup" );
+		}
+
+		$like = '%' . $wpdb->esc_like( $search ) . '%';
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- Read-only customer count on a WooCommerce core lookup table for admin pagination.
+		return (int) $wpdb->get_var( $wpdb->prepare(
+			"SELECT COUNT(*) FROM {$wpdb->prefix}wc_customer_lookup cl WHERE cl.first_name LIKE %s OR cl.last_name LIKE %s OR cl.email LIKE %s",
+			$like,
+			$like,
+			$like
+		) );
 	}
 
 
@@ -1967,7 +2075,7 @@ class PressArk_Handler_WooCommerce extends PressArk_Handler_Base {
 
 		if ( $tax_enabled ) {
 			global $wpdb;
-			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- Read-only analytics on WC core table, no user input.
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- Read-only analytics on a WooCommerce core table for an on-demand admin report.
 			$rates = $wpdb->get_results( $wpdb->prepare( "SELECT * FROM {$wpdb->prefix}woocommerce_tax_rates ORDER BY tax_rate_order LIMIT %d", 50 ) );
 			$data['rates'] = array_map( function ( $rate ) {
 				return array(
@@ -2326,6 +2434,7 @@ class PressArk_Handler_WooCommerce extends PressArk_Handler_Base {
 		}
 
 		if ( ! empty( $params['rating'] ) ) {
+			// phpcs:ignore WordPress.DB.SlowDBQuery.slow_db_query_meta_query -- WooCommerce stores review ratings in comment meta, so this bounded admin filter intentionally uses meta_query.
 			$args['meta_query'] = array(
 				array( 'key' => 'rating', 'value' => intval( $params['rating'] ), 'compare' => '=' ),
 			);
@@ -3012,6 +3121,7 @@ class PressArk_Handler_WooCommerce extends PressArk_Handler_Base {
 		$limit = min( intval( $params['limit'] ?? 10 ), 50 );
 
 		// Single query via WC Analytics lookup tables — no object hydration.
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- Read-only aggregate analytics on WooCommerce lookup tables for an on-demand admin report.
 		$results = $wpdb->get_results( $wpdb->prepare(
 			"SELECT
 				opl.product_id,
@@ -3334,38 +3444,11 @@ class PressArk_Handler_WooCommerce extends PressArk_Handler_Base {
 		$err = $this->require_wc();
 		if ( $err ) return $err;
 
-		global $wpdb;
 		$limit     = min( absint( $params['limit'] ?? 30 ), 100 );
 		$status    = sanitize_text_field( $params['status'] ?? 'all' );
 		$threshold = (int) get_option( 'woocommerce_notify_low_stock_amount', 2 );
 
-		// Use wc_product_meta_lookup — HPOS-safe, always populated
-		$where = match( $status ) {
-			'outofstock' => "WHERE lk.stock_status = 'outofstock'",
-			'lowstock'   => $wpdb->prepare(
-				"WHERE lk.stock_status = 'instock' AND lk.stock_quantity IS NOT NULL AND lk.stock_quantity <= %d",
-				$threshold
-			),
-			'instock'    => "WHERE lk.stock_status = 'instock'",
-			default      => "WHERE lk.stock_status IN ('outofstock', 'instock', 'onbackorder')",
-		};
-
-		$products = $wpdb->get_results( $wpdb->prepare(
-			"SELECT
-				lk.product_id,
-				p.post_title as name,
-				lk.sku,
-				lk.stock_quantity,
-				lk.stock_status,
-				lk.min_price as price
-			 FROM {$wpdb->prefix}wc_product_meta_lookup lk
-			 JOIN {$wpdb->posts} p ON lk.product_id = p.ID
-			 {$where}
-			   AND p.post_status = 'publish'
-			 ORDER BY lk.stock_quantity ASC
-			 LIMIT %d",
-			$limit
-		) );
+		$products = $this->get_stock_report_products( $status, $threshold, $limit );
 
 		// Group by status
 		$grouped = array( 'outofstock' => array(), 'lowstock' => array(), 'instock' => array(), 'onbackorder' => array() );
@@ -3385,8 +3468,10 @@ class PressArk_Handler_WooCommerce extends PressArk_Handler_Base {
 			);
 		}
 
+		global $wpdb;
+
 		// Inventory valuation — total stock value
-		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- Read-only analytics on WC core tables, no user input.
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- Read-only analytics on WooCommerce core tables for an on-demand admin report.
 		$valuation = $wpdb->get_var(
 			"SELECT SUM( lk.stock_quantity * lk.min_price )
 			 FROM {$wpdb->prefix}wc_product_meta_lookup lk
@@ -3397,7 +3482,7 @@ class PressArk_Handler_WooCommerce extends PressArk_Handler_Base {
 		);
 
 		// Summary counts
-		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- Read-only analytics on WC core tables, no user input.
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- Read-only analytics on WooCommerce core tables for an on-demand admin report.
 		$counts = $wpdb->get_results(
 			"SELECT lk.stock_status, COUNT(*) as count
 			 FROM {$wpdb->prefix}wc_product_meta_lookup lk
@@ -3422,6 +3507,99 @@ class PressArk_Handler_WooCommerce extends PressArk_Handler_Base {
 			'products'        => $grouped,
 			'filter'          => $status,
 		);
+	}
+
+	/**
+	 * Load stock report rows with fixed SQL branches instead of an interpolated WHERE fragment.
+	 *
+	 * @return array<int, object>
+	 */
+	private function get_stock_report_products( string $status, int $threshold, int $limit ): array {
+		global $wpdb;
+
+		$products = array();
+
+		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- Read-only stock analytics on WooCommerce lookup tables for an on-demand admin report.
+		switch ( $status ) {
+			case 'outofstock':
+				$products = $wpdb->get_results( $wpdb->prepare(
+					"SELECT
+						lk.product_id,
+						p.post_title as name,
+						lk.sku,
+						lk.stock_quantity,
+						lk.stock_status,
+						lk.min_price as price
+					 FROM {$wpdb->prefix}wc_product_meta_lookup lk
+					 JOIN {$wpdb->posts} p ON lk.product_id = p.ID
+					 WHERE lk.stock_status = 'outofstock'
+					   AND p.post_status = 'publish'
+					 ORDER BY lk.stock_quantity ASC
+					 LIMIT %d",
+					$limit
+				) );
+				break;
+			case 'lowstock':
+				$products = $wpdb->get_results( $wpdb->prepare(
+					"SELECT
+						lk.product_id,
+						p.post_title as name,
+						lk.sku,
+						lk.stock_quantity,
+						lk.stock_status,
+						lk.min_price as price
+					 FROM {$wpdb->prefix}wc_product_meta_lookup lk
+					 JOIN {$wpdb->posts} p ON lk.product_id = p.ID
+					 WHERE lk.stock_status = 'instock'
+					   AND lk.stock_quantity IS NOT NULL
+					   AND lk.stock_quantity <= %d
+					   AND p.post_status = 'publish'
+					 ORDER BY lk.stock_quantity ASC
+					 LIMIT %d",
+					$threshold,
+					$limit
+				) );
+				break;
+			case 'instock':
+				$products = $wpdb->get_results( $wpdb->prepare(
+					"SELECT
+						lk.product_id,
+						p.post_title as name,
+						lk.sku,
+						lk.stock_quantity,
+						lk.stock_status,
+						lk.min_price as price
+					 FROM {$wpdb->prefix}wc_product_meta_lookup lk
+					 JOIN {$wpdb->posts} p ON lk.product_id = p.ID
+					 WHERE lk.stock_status = 'instock'
+					   AND p.post_status = 'publish'
+					 ORDER BY lk.stock_quantity ASC
+					 LIMIT %d",
+					$limit
+				) );
+				break;
+			default:
+				$products = $wpdb->get_results( $wpdb->prepare(
+					"SELECT
+						lk.product_id,
+						p.post_title as name,
+						lk.sku,
+						lk.stock_quantity,
+						lk.stock_status,
+						lk.min_price as price
+					 FROM {$wpdb->prefix}wc_product_meta_lookup lk
+					 JOIN {$wpdb->posts} p ON lk.product_id = p.ID
+					 WHERE lk.stock_status IN ('outofstock', 'instock', 'onbackorder')
+					   AND p.post_status = 'publish'
+					 ORDER BY lk.stock_quantity ASC
+					 LIMIT %d",
+					$limit
+				) );
+				break;
+		}
+		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+
+		return is_array( $products ) ? $products : array();
 	}
 
 
@@ -3759,12 +3937,13 @@ class PressArk_Handler_WooCommerce extends PressArk_Handler_Base {
 
 		// Check if wc_customer_lookup table exists (WC 4.0+).
 		$table = $wpdb->prefix . 'wc_customer_lookup';
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- Read-only existence check on a WooCommerce analytics table for a guarded admin report.
 		if ( ! $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $table ) ) ) {
 			return array( 'error' => __( 'WC Analytics tables not found. Run WooCommerce → Status → Tools → Update database.', 'pressark' ) );
 		}
 
 		// RFM segmentation — single query.
-		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- Read-only analytics on WC core tables, no user input.
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- Read-only analytics on WooCommerce core tables for an on-demand admin report.
 		$customers = $wpdb->get_results(
 			"SELECT
 				cl.customer_id,

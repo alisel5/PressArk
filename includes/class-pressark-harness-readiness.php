@@ -534,6 +534,7 @@ class PressArk_Harness_Readiness {
 		$table       = PressArk_Task_Store::table_name();
 		$queued      = (int) ( $counts['queued'] ?? 0 );
 		$running     = (int) ( $counts['running'] ?? 0 );
+		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- Readiness diagnostics intentionally probe the internal task-store table for overdue and stale work; table name is internal and caching is not relevant to live health signals.
 		$overdue     = (int) $wpdb->get_var(
 			"SELECT COUNT(*) FROM {$table}
 			 WHERE status = 'queued'
@@ -547,6 +548,7 @@ class PressArk_Harness_Readiness {
 				PressArk_Task_Store::STALE_TIMEOUT_MINUTES
 			)
 		);
+		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 
 		$action_scheduler = self::get_action_scheduler_stats();
 		$scheduled_hooks  = array(
@@ -712,6 +714,7 @@ class PressArk_Harness_Readiness {
 
 		global $wpdb;
 		$table = $wpdb->prefix . 'actionscheduler_actions';
+		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,PluginCheck.Security.DirectDB.UnescapedDBParameter,WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- Readiness diagnostics intentionally inspect the known Action Scheduler table for pending PressArk work; table name is internal and caching is not relevant to live scheduler health.
 		if ( $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $table ) ) !== $table ) {
 			return array(
 				'enabled'                 => false,
@@ -739,6 +742,7 @@ class PressArk_Harness_Readiness {
 				'pending'
 			)
 		);
+		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,PluginCheck.Security.DirectDB.UnescapedDBParameter,WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 
 		return array(
 			'enabled'                 => true,

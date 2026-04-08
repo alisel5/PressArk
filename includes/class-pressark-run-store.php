@@ -31,6 +31,123 @@ class PressArk_Run_Store {
 	}
 
 	/**
+	 * Get the run-store table name as a quoted SQL identifier.
+	 */
+	private static function table_sql(): string {
+		return '`' . str_replace( '`', '``', self::table_name() ) . '`';
+	}
+
+	/**
+	 * Read a single scalar from the internal run table without caching.
+	 *
+	 * Run state changes frequently, so these internal lookups should reflect the
+	 * current database row instead of an object-cache snapshot.
+	 *
+	 * @return mixed
+	 */
+	private function read_var( string $sql, array $args = array() ) {
+		global $wpdb;
+
+		// phpcs:disable WordPress.DB.PreparedSQL.NotPrepared -- Helper accepts only internal SQL templates and prepares placeholders before execution.
+		$query = empty( $args ) ? $sql : $wpdb->prepare( $sql, ...$args );
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,PluginCheck.Security.DirectDB.UnescapedDBParameter -- Internal run-store reads must reflect live execution state from the custom table.
+		$value = $wpdb->get_var( $query );
+		// phpcs:enable WordPress.DB.PreparedSQL.NotPrepared
+
+		return $value;
+	}
+
+	/**
+	 * Read rows from the internal run table without caching.
+	 *
+	 * @return array<int,array<string,mixed>>
+	 */
+	private function read_results( string $sql, array $args = array() ): array {
+		global $wpdb;
+
+		// phpcs:disable WordPress.DB.PreparedSQL.NotPrepared -- Helper accepts only internal SQL templates and prepares placeholders before execution.
+		$query = empty( $args ) ? $sql : $wpdb->prepare( $sql, ...$args );
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,PluginCheck.Security.DirectDB.UnescapedDBParameter -- Internal run-store reads must reflect live execution state from the custom table.
+		$rows = $wpdb->get_results( $query, ARRAY_A );
+		// phpcs:enable WordPress.DB.PreparedSQL.NotPrepared
+
+		return is_array( $rows ) ? $rows : array();
+	}
+
+	/**
+	 * Read a single row from the internal run table without caching.
+	 *
+	 * @return array<string,mixed>|null
+	 */
+	private function read_row( string $sql, array $args = array() ): ?array {
+		global $wpdb;
+
+		// phpcs:disable WordPress.DB.PreparedSQL.NotPrepared -- Helper accepts only internal SQL templates and prepares placeholders before execution.
+		$query = empty( $args ) ? $sql : $wpdb->prepare( $sql, ...$args );
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,PluginCheck.Security.DirectDB.UnescapedDBParameter -- Internal run-store reads must reflect live execution state from the custom table.
+		$row = $wpdb->get_row( $query, ARRAY_A );
+		// phpcs:enable WordPress.DB.PreparedSQL.NotPrepared
+
+		return is_array( $row ) ? $row : null;
+	}
+
+	/**
+	 * Read a single column from the internal run table without caching.
+	 *
+	 * @return array<int,string>
+	 */
+	private function read_col( string $sql, array $args = array() ): array {
+		global $wpdb;
+
+		// phpcs:disable WordPress.DB.PreparedSQL.NotPrepared -- Helper accepts only internal SQL templates and prepares placeholders before execution.
+		$query = empty( $args ) ? $sql : $wpdb->prepare( $sql, ...$args );
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,PluginCheck.Security.DirectDB.UnescapedDBParameter -- Internal run-store reads must reflect live execution state from the custom table.
+		$values = $wpdb->get_col( $query );
+		// phpcs:enable WordPress.DB.PreparedSQL.NotPrepared
+
+		return array_map( 'strval', is_array( $values ) ? $values : array() );
+	}
+
+	/**
+	 * Run a prepared write query against the internal run table.
+	 *
+	 * @return int|false
+	 */
+	private function write_query( string $sql, array $args = array() ) {
+		global $wpdb;
+
+		// phpcs:disable WordPress.DB.PreparedSQL.NotPrepared -- Helper accepts only internal SQL templates and prepares placeholders before execution.
+		$query = empty( $args ) ? $sql : $wpdb->prepare( $sql, ...$args );
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,PluginCheck.Security.DirectDB.UnescapedDBParameter -- Internal run-store writes must execute immediately against the custom table for durable state transitions.
+		$result = $wpdb->query( $query );
+		// phpcs:enable WordPress.DB.PreparedSQL.NotPrepared
+
+		return $result;
+	}
+
+	/**
+	 * Update internal run rows without caching.
+	 *
+	 * @return int|false
+	 */
+	private function update_run( array $data, array $where, array $formats, array $where_formats ) {
+		global $wpdb;
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- Internal run-store writes must execute immediately against the custom table for durable state transitions.
+		return $wpdb->update( self::table_name(), $data, $where, $formats, $where_formats );
+	}
+
+	/**
+	 * Insert an internal run row without caching.
+	 */
+	private function insert_run( array $data, array $formats ): bool {
+		global $wpdb;
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery -- Internal run-store writes must execute immediately against the custom table for durable state transitions.
+		return false !== $wpdb->insert( self::table_name(), $data, $formats );
+	}
+
+	/**
 	 * DDL for dbDelta (called from pressark_activate and upgrade migration).
 	 */
 	public static function get_schema(): string {
@@ -84,8 +201,6 @@ class PressArk_Run_Store {
 	 * @return string The run_id.
 	 */
 	public function create( array $data ): string {
-		global $wpdb;
-
 		$run_id         = $data['run_id'] ?? wp_generate_uuid4();
 		$parent_run_id  = sanitize_text_field( (string) ( $data['parent_run_id'] ?? '' ) );
 		$root_run_id    = sanitize_text_field( (string) ( $data['root_run_id'] ?? '' ) );
@@ -100,8 +215,7 @@ class PressArk_Run_Store {
 			$root_run_id = '' !== $parent_run_id ? $parent_run_id : $run_id;
 		}
 
-		$wpdb->insert(
-			self::table_name(),
+		$this->insert_run(
 			array(
 				'run_id'         => $run_id,
 				'parent_run_id'  => $parent_run_id,
@@ -193,15 +307,9 @@ class PressArk_Run_Store {
 	 * @return array|null The run row, or null if not found.
 	 */
 	public function get( string $run_id ): ?array {
-		global $wpdb;
-		$table = self::table_name();
-
-		$row = $wpdb->get_row(
-			$wpdb->prepare(
-				"SELECT * FROM {$table} WHERE run_id = %s",
-				$run_id
-			),
-			ARRAY_A
+		$row = $this->read_row(
+			'SELECT * FROM ' . self::table_sql() . ' WHERE run_id = %s',
+			array( $run_id )
 		);
 
 		if ( ! $row ) {
@@ -220,14 +328,9 @@ class PressArk_Run_Store {
 	 * @return string|null Current status, or null if the run is missing.
 	 */
 	public function get_status( string $run_id ): ?string {
-		global $wpdb;
-		$table = self::table_name();
-
-		$status = $wpdb->get_var(
-			$wpdb->prepare(
-				"SELECT status FROM {$table} WHERE run_id = %s",
-				$run_id
-			)
+		$status = $this->read_var(
+			'SELECT status FROM ' . self::table_sql() . ' WHERE run_id = %s',
+			array( $run_id )
 		);
 
 		return is_string( $status ) && '' !== $status ? $status : null;
@@ -246,29 +349,25 @@ class PressArk_Run_Store {
 	 * @return string|null Matching run ID, or null when none exists.
 	 */
 	public function find_latest_cancellable_run_id( int $user_id, int $chat_id = 0 ): ?string {
-		global $wpdb;
-		$table = self::table_name();
-
 		if ( $chat_id > 0 ) {
-			$run_id = $wpdb->get_var( $wpdb->prepare(
-				"SELECT run_id FROM {$table}
+			$run_id = $this->read_var(
+				'SELECT run_id FROM ' . self::table_sql() . "
 				 WHERE user_id = %d
 				 AND chat_id = %d
 				 AND status IN ('running', 'awaiting_preview', 'awaiting_confirm', 'partially_confirmed')
 				 ORDER BY created_at DESC
 				 LIMIT 1",
-				$user_id,
-				$chat_id
-			) );
+				array( $user_id, $chat_id )
+			);
 		} else {
-			$run_id = $wpdb->get_var( $wpdb->prepare(
-				"SELECT run_id FROM {$table}
+			$run_id = $this->read_var(
+				'SELECT run_id FROM ' . self::table_sql() . "
 				 WHERE user_id = %d
 				 AND status IN ('running', 'awaiting_preview', 'awaiting_confirm', 'partially_confirmed')
 				 ORDER BY created_at DESC
 				 LIMIT 1",
-				$user_id
-			) );
+				array( $user_id )
+			);
 		}
 
 		return is_string( $run_id ) && '' !== $run_id ? $run_id : null;
@@ -284,15 +383,9 @@ class PressArk_Run_Store {
 	 * @return array|null The run row, or null if not found.
 	 */
 	public function get_by_preview_session( string $session_id ): ?array {
-		global $wpdb;
-		$table = self::table_name();
-
-		$row = $wpdb->get_row(
-			$wpdb->prepare(
-				"SELECT * FROM {$table} WHERE preview_session_id = %s AND status = 'awaiting_preview'",
-				$session_id
-			),
-			ARRAY_A
+		$row = $this->read_row(
+			'SELECT * FROM ' . self::table_sql() . " WHERE preview_session_id = %s AND status = 'awaiting_preview'",
+			array( $session_id )
 		);
 
 		if ( ! $row ) {
@@ -319,19 +412,15 @@ class PressArk_Run_Store {
 			return null;
 		}
 
-		global $wpdb;
-		$table = self::table_name();
-
-		$json = $wpdb->get_var( $wpdb->prepare(
-			"SELECT pending_actions FROM {$table}
+		$json = $this->read_var(
+			'SELECT pending_actions FROM ' . self::table_sql() . "
 			 WHERE user_id = %d
 			 AND chat_id = %d
 			 AND status IN ('awaiting_confirm', 'partially_confirmed')
 			 ORDER BY created_at DESC
 			 LIMIT 1",
-			$user_id,
-			$chat_id
-		) );
+			array( $user_id, $chat_id )
+		);
 
 		if ( ! is_string( $json ) || '' === $json ) {
 			return null;
@@ -395,8 +484,6 @@ class PressArk_Run_Store {
 	 * @return bool True when a row was updated.
 	 */
 	public function persist_detail_snapshot( string $run_id, ?array $workflow_state = null, ?array $result = null ): bool {
-		global $wpdb;
-
 		$run_id = sanitize_text_field( $run_id );
 		if ( '' === $run_id ) {
 			return false;
@@ -417,13 +504,7 @@ class PressArk_Run_Store {
 			$formats[]      = '%s';
 		}
 
-		$rows = $wpdb->update(
-			self::table_name(),
-			$data,
-			array( 'run_id' => $run_id ),
-			$formats,
-			array( '%s' )
-		);
+		$rows = $this->update_run( $data, array( 'run_id' => $run_id ), $formats, array( '%s' ) );
 
 		return $rows >= 1;
 	}
@@ -448,8 +529,6 @@ class PressArk_Run_Store {
 		?array  $pause_state = null,
 		?string $legacy_workflow_class = null
 	): bool {
-		global $wpdb;
-
 		$data    = array(
 			'status'             => 'awaiting_preview',
 			'preview_session_id' => $preview_session_id,
@@ -466,8 +545,7 @@ class PressArk_Run_Store {
 			$formats[]              = '%s';
 		}
 
-		$rows = $wpdb->update(
-			self::table_name(),
+		$rows = $this->update_run(
 			$data,
 			array( 'run_id' => $run_id, 'status' => 'running' ),
 			$formats,
@@ -511,8 +589,6 @@ class PressArk_Run_Store {
 		?array  $pause_state = null,
 		?string $legacy_workflow_class = null
 	): bool {
-		global $wpdb;
-
 		$data    = array(
 			'status'          => 'awaiting_confirm',
 			'pending_actions' => wp_json_encode( $pending_actions ),
@@ -530,8 +606,7 @@ class PressArk_Run_Store {
 		}
 
 		// v3.7.2: Require status = 'running' (same guard as pause_for_preview).
-		$rows = $wpdb->update(
-			self::table_name(),
+		$rows = $this->update_run(
 			$data,
 			array( 'run_id' => $run_id, 'status' => 'running' ),
 			$formats,
@@ -569,10 +644,7 @@ class PressArk_Run_Store {
 	 * @return bool True if the update succeeded.
 	 */
 	public function update_pending( string $run_id, array $pending, string $status = 'partially_confirmed' ): bool {
-		global $wpdb;
-
-		$rows = $wpdb->update(
-			self::table_name(),
+		$rows = $this->update_run(
 			array(
 				'pending_actions' => wp_json_encode( $pending ),
 				'status'          => $status,
@@ -616,32 +688,25 @@ class PressArk_Run_Store {
 	 * @return bool True if transition succeeded.
 	 */
 	public function settle( string $run_id, ?array $result = null ): bool {
-		global $wpdb;
-		$table = self::table_name();
-		$now   = current_time( 'mysql', true );
+		$now    = current_time( 'mysql', true );
 		$result = $this->normalize_terminal_result( $result );
 
 		if ( $result !== null ) {
-			$rows = $wpdb->query( $wpdb->prepare(
-				"UPDATE {$table}
+			$rows = $this->write_query(
+				'UPDATE ' . self::table_sql() . "
 				 SET status = 'settled', updated_at = %s, settled_at = %s, result = %s
 				 WHERE run_id = %s
 				 AND status IN ('running', 'awaiting_preview', 'awaiting_confirm', 'partially_confirmed')",
-				$now,
-				$now,
-				wp_json_encode( $result ),
-				$run_id
-			) );
+				array( $now, $now, wp_json_encode( $result ), $run_id )
+			);
 		} else {
-			$rows = $wpdb->query( $wpdb->prepare(
-				"UPDATE {$table}
+			$rows = $this->write_query(
+				'UPDATE ' . self::table_sql() . "
 				 SET status = 'settled', updated_at = %s, settled_at = %s
 				 WHERE run_id = %s
 				 AND status IN ('running', 'awaiting_preview', 'awaiting_confirm', 'partially_confirmed')",
-				$now,
-				$now,
-				$run_id
-			) );
+				array( $now, $now, $run_id )
+			);
 		}
 
 		if ( (int) $rows >= 1 ) {
@@ -681,9 +746,6 @@ class PressArk_Run_Store {
 	 * @return bool True if transition succeeded.
 	 */
 	public function fail( string $run_id, string $reason = '', ?array $result = null ): bool {
-		global $wpdb;
-		$table = self::table_name();
-
 		// Truncate reason for the indexed summary column.
 		$summary = mb_substr( $reason, 0, 255 );
 		$result  = $this->normalize_terminal_result( $result );
@@ -693,16 +755,13 @@ class PressArk_Run_Store {
 			$result['fail_reason'] = $reason;
 		}
 
-		$rows = $wpdb->query( $wpdb->prepare(
-			"UPDATE {$table}
+		$rows = $this->write_query(
+			'UPDATE ' . self::table_sql() . "
 			 SET status = 'failed', result = %s, error_summary = %s, updated_at = %s
 			 WHERE run_id = %s
 			 AND status IN ('running', 'awaiting_preview', 'awaiting_confirm', 'partially_confirmed')",
-			wp_json_encode( $result ),
-			$summary,
-			current_time( 'mysql', true ),
-			$run_id
-		) );
+			array( wp_json_encode( $result ), $summary, current_time( 'mysql', true ), $run_id )
+		);
 
 		if ( (int) $rows >= 1 ) {
 			$outcome = $this->result_approval_outcome( $result );
@@ -740,10 +799,7 @@ class PressArk_Run_Store {
 	 * @return bool
 	 */
 	public function link_task( string $run_id, string $task_id ): bool {
-		global $wpdb;
-
-		$rows = $wpdb->update(
-			self::table_name(),
+		$rows = $this->update_run(
 			array( 'task_id' => $task_id, 'updated_at' => current_time( 'mysql', true ) ),
 			array( 'run_id' => $run_id ),
 			array( '%s', '%s' ),
@@ -761,26 +817,22 @@ class PressArk_Run_Store {
 	 * @return array<int,array<string,mixed>>
 	 */
 	public function get_family( string $root_run_id, int $limit = 20 ): array {
-		global $wpdb;
-		$table = self::table_name();
-
 		if ( '' === $root_run_id ) {
 			return array();
 		}
 
-		$rows = $wpdb->get_results(
-			$wpdb->prepare(
-				"SELECT run_id, parent_run_id, root_run_id, task_id, route, status, message,
-				        created_at, updated_at, settled_at
-				 FROM {$table}
-				 WHERE root_run_id = %s OR run_id = %s
-				 ORDER BY created_at ASC
-				 LIMIT %d",
+		$rows = $this->read_results(
+			'SELECT run_id, parent_run_id, root_run_id, task_id, route, status, message,
+			        created_at, updated_at, settled_at
+			 FROM ' . self::table_sql() . '
+			 WHERE root_run_id = %s OR run_id = %s
+			 ORDER BY created_at ASC
+			 LIMIT %d',
+			array(
 				$root_run_id,
 				$root_run_id,
-				max( 1, $limit )
-			),
-			ARRAY_A
+				max( 1, $limit ),
+			)
 		);
 
 		if ( ! $rows ) {
@@ -818,41 +870,50 @@ class PressArk_Run_Store {
 		int    $offset = 0,
 		string $status_filter = ''
 	): array {
-		global $wpdb;
-		$table = self::table_name();
+		$status_filter = sanitize_key( $status_filter );
+		$limit         = max( 1, min( 100, $limit ) );
+		$offset        = max( 0, $offset );
+		$select_sql    = 'SELECT run_id, user_id, chat_id, task_id, route, status, message,
+			        error_summary, tier, created_at, updated_at, settled_at
+			 FROM ' . self::table_sql();
 
-		$where = array();
-		$args  = array();
-
-		if ( $user_id > 0 ) {
-			$where[] = 'user_id = %d';
-			$args[]  = $user_id;
+		if ( $user_id > 0 && '' !== $status_filter ) {
+			$rows = $this->read_results(
+				$select_sql . "
+			 WHERE user_id = %d
+			   AND status = %s
+			   AND route <> 'handoff'
+			 ORDER BY created_at DESC
+			 LIMIT %d OFFSET %d",
+				array( $user_id, $status_filter, $limit, $offset )
+			);
+		} elseif ( $user_id > 0 ) {
+			$rows = $this->read_results(
+				$select_sql . "
+			 WHERE user_id = %d
+			   AND route <> 'handoff'
+			 ORDER BY created_at DESC
+			 LIMIT %d OFFSET %d",
+				array( $user_id, $limit, $offset )
+			);
+		} elseif ( '' !== $status_filter ) {
+			$rows = $this->read_results(
+				$select_sql . "
+			 WHERE status = %s
+			   AND route <> 'handoff'
+			 ORDER BY created_at DESC
+			 LIMIT %d OFFSET %d",
+				array( $status_filter, $limit, $offset )
+			);
+		} else {
+			$rows = $this->read_results(
+				$select_sql . "
+			 WHERE route <> 'handoff'
+			 ORDER BY created_at DESC
+			 LIMIT %d OFFSET %d",
+				array( $limit, $offset )
+			);
 		}
-
-		if ( '' !== $status_filter ) {
-			$where[] = 'status = %s';
-			$args[]  = sanitize_key( $status_filter );
-		}
-
-		$where[] = "route <> 'handoff'";
-
-		$where_sql = ! empty( $where ) ? 'WHERE ' . implode( ' AND ', $where ) : '';
-
-		$args[] = max( 1, min( 100, $limit ) );
-		$args[] = max( 0, $offset );
-
-		$rows = $wpdb->get_results(
-			$wpdb->prepare(
-				"SELECT run_id, user_id, chat_id, task_id, route, status, message,
-				        error_summary, tier, created_at, updated_at, settled_at
-				 FROM {$table}
-				 {$where_sql}
-				 ORDER BY created_at DESC
-				 LIMIT %d OFFSET %d",
-				...$args
-			),
-			ARRAY_A
-		);
 
 		if ( ! $rows ) {
 			return array();
@@ -871,35 +932,41 @@ class PressArk_Run_Store {
 	 * @since 4.2.0
 	 */
 	public function count_activity( int $user_id = 0, string $status_filter = '' ): int {
-		global $wpdb;
-		$table = self::table_name();
+		$status_filter = sanitize_key( $status_filter );
+		$count_sql     = 'SELECT COUNT(*) FROM ' . self::table_sql();
 
-		$where = array();
-		$args  = array();
+		if ( $user_id > 0 && '' !== $status_filter ) {
+			return (int) $this->read_var(
+				$count_sql . "
+			 WHERE user_id = %d
+			   AND status = %s
+			   AND route <> 'handoff'",
+				array( $user_id, $status_filter )
+			);
+		}
 
 		if ( $user_id > 0 ) {
-			$where[] = 'user_id = %d';
-			$args[]  = $user_id;
+			return (int) $this->read_var(
+				$count_sql . "
+			 WHERE user_id = %d
+			   AND route <> 'handoff'",
+				array( $user_id )
+			);
 		}
 
 		if ( '' !== $status_filter ) {
-			$where[] = 'status = %s';
-			$args[]  = sanitize_key( $status_filter );
+			return (int) $this->read_var(
+				$count_sql . "
+			 WHERE status = %s
+			   AND route <> 'handoff'",
+				array( $status_filter )
+			);
 		}
 
-		$where[] = "route <> 'handoff'";
-
-		$where_sql = ! empty( $where ) ? 'WHERE ' . implode( ' AND ', $where ) : '';
-
-		if ( ! empty( $args ) ) {
-			return (int) $wpdb->get_var( $wpdb->prepare(
-				"SELECT COUNT(*) FROM {$table} {$where_sql}",
-				...$args
-			) );
-		}
-
-		// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- $table is a hardcoded prefixed table name.
-		return (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$table} {$where_sql}" );
+		return (int) $this->read_var(
+			$count_sql . "
+		 WHERE route <> 'handoff'"
+		);
 	}
 
 	/**
@@ -908,20 +975,21 @@ class PressArk_Run_Store {
 	 * @since 4.2.0
 	 */
 	public function status_counts( int $user_id = 0 ): array {
-		global $wpdb;
-		$table = self::table_name();
-
-		$where_parts = array( "route <> 'handoff'" );
 		if ( $user_id > 0 ) {
-			$where_parts[] = $wpdb->prepare( 'user_id = %d', $user_id );
+			$rows = $this->read_results(
+				'SELECT status, COUNT(*) as cnt FROM ' . self::table_sql() . "
+				 WHERE route <> 'handoff'
+				   AND user_id = %d
+				 GROUP BY status",
+				array( $user_id )
+			);
+		} else {
+			$rows = $this->read_results(
+				'SELECT status, COUNT(*) as cnt FROM ' . self::table_sql() . "
+				 WHERE route <> 'handoff'
+				 GROUP BY status"
+			);
 		}
-		$where = 'WHERE ' . implode( ' AND ', $where_parts );
-
-		// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- $table is a hardcoded prefixed table name, $where is either empty or already prepared.
-		$rows = $wpdb->get_results(
-			"SELECT status, COUNT(*) as cnt FROM {$table} {$where} GROUP BY status",
-			ARRAY_A
-		);
 
 		$counts = array();
 		foreach ( $rows ?: array() as $row ) {
@@ -942,31 +1010,26 @@ class PressArk_Run_Store {
 	 * @return int Number of rows deleted.
 	 */
 	public function cleanup_expired(): int {
-		global $wpdb;
-		$table   = self::table_name();
 		$deleted = 0;
 
 		// Settled runs older than 14 days.
-		// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- $table is a hardcoded prefixed table name, status is a hardcoded constant.
-		$deleted += (int) $wpdb->query(
-			"DELETE FROM {$table}
+		$deleted += (int) $this->write_query(
+			'DELETE FROM ' . self::table_sql() . "
 			 WHERE status = 'settled'
 			 AND settled_at < DATE_SUB( UTC_TIMESTAMP(), INTERVAL 14 DAY )"
 		);
 
 		// Failed runs older than 30 days.
-		// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- $table is a hardcoded prefixed table name, status is a hardcoded constant.
-		$deleted += (int) $wpdb->query(
-			"DELETE FROM {$table}
+		$deleted += (int) $this->write_query(
+			'DELETE FROM ' . self::table_sql() . "
 			 WHERE status = 'failed'
 			 AND updated_at < DATE_SUB( UTC_TIMESTAMP(), INTERVAL 30 DAY )"
 		);
 
 		// Stale awaiting runs older than 2 hours — fail them individually so the
 		// stored result and activity trace preserve a typed expired outcome.
-		$expired_run_ids = $wpdb->get_col(
-			// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- $table is a hardcoded prefixed table name, all values are hardcoded constants.
-			"SELECT run_id FROM {$table}
+		$expired_run_ids = $this->read_col(
+			'SELECT run_id FROM ' . self::table_sql() . "
 			 WHERE status IN ('awaiting_preview', 'awaiting_confirm', 'partially_confirmed')
 			 AND updated_at < DATE_SUB( UTC_TIMESTAMP(), INTERVAL 2 HOUR )"
 		);

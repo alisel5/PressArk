@@ -638,11 +638,12 @@ class PressArk_SEO_Resolver {
 		global $wpdb;
 		$table = $wpdb->prefix . 'aioseo_posts';
 
-		// phpcs:ignore WordPress.DB.DirectDatabaseQuery
+		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,WordPress.DB.PreparedSQL.InterpolatedNotPrepared,PluginCheck.Security.DirectDB.UnescapedDBParameter -- Reads an internal prefixed AIOSEO table name; on the plugin's WordPress 6.0 minimum we cannot rely on %i identifier placeholders.
 		$row = $wpdb->get_row( $wpdb->prepare(
 			"SELECT * FROM {$table} WHERE post_id = %d LIMIT 1",
 			$post_id
 		) );
+		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,WordPress.DB.PreparedSQL.InterpolatedNotPrepared,PluginCheck.Security.DirectDB.UnescapedDBParameter
 
 		self::$aioseo_row_cache[ $post_id ] = $row ?: null;
 		return self::$aioseo_row_cache[ $post_id ];

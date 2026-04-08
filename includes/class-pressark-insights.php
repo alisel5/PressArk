@@ -51,6 +51,57 @@ class PressArk_Insights {
 		return 'icu' === $metric ? __( 'ICU', 'pressark' ) : __( 'Tokens', 'pressark' );
 	}
 
+	/**
+	 * Run a read-only ledger query that returns one row.
+	 *
+	 * @return array<string, mixed>|null
+	 */
+	private function ledger_get_row( string $query_sql, string $since ): ?array {
+		global $wpdb;
+
+		$query = str_replace( '{table}', PressArk_Cost_Ledger::table_name(), $query_sql );
+
+		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,WordPress.DB.PreparedSQL.NotPrepared,PluginCheck.Security.DirectDB.UnescapedDBParameter -- Read-only insights queries target the plugin's own cost ledger table with fixed SQL defined in this class.
+		$row = $wpdb->get_row( $wpdb->prepare( $query, $since ), ARRAY_A );
+		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,WordPress.DB.PreparedSQL.NotPrepared,PluginCheck.Security.DirectDB.UnescapedDBParameter
+
+		return is_array( $row ) ? $row : null;
+	}
+
+	/**
+	 * Run a read-only ledger query that returns many rows.
+	 *
+	 * @return array<int, array<string, mixed>>
+	 */
+	private function ledger_get_results( string $query_sql, string $since ): array {
+		global $wpdb;
+
+		$query = str_replace( '{table}', PressArk_Cost_Ledger::table_name(), $query_sql );
+
+		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,WordPress.DB.PreparedSQL.NotPrepared,PluginCheck.Security.DirectDB.UnescapedDBParameter -- Read-only insights queries target the plugin's own cost ledger table with fixed SQL defined in this class.
+		$rows = $wpdb->get_results( $wpdb->prepare( $query, $since ), ARRAY_A );
+		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,WordPress.DB.PreparedSQL.NotPrepared,PluginCheck.Security.DirectDB.UnescapedDBParameter
+
+		return is_array( $rows ) ? $rows : array();
+	}
+
+	/**
+	 * Run a read-only ledger query that returns one scalar value.
+	 *
+	 * @return string|null
+	 */
+	private function ledger_get_var( string $query_sql, string $since ): ?string {
+		global $wpdb;
+
+		$query = str_replace( '{table}', PressArk_Cost_Ledger::table_name(), $query_sql );
+
+		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,WordPress.DB.PreparedSQL.NotPrepared,PluginCheck.Security.DirectDB.UnescapedDBParameter -- Read-only insights queries target the plugin's own cost ledger table with fixed SQL defined in this class.
+		$value = $wpdb->get_var( $wpdb->prepare( $query, $since ) );
+		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,WordPress.DB.PreparedSQL.NotPrepared,PluginCheck.Security.DirectDB.UnescapedDBParameter
+
+		return null !== $value ? (string) $value : null;
+	}
+
 	// ── Query Methods ────────────────────────────────────────────────
 
 	/**
@@ -60,11 +111,8 @@ class PressArk_Insights {
 	 *               total_output: int, total_cache_read: int, failed_count: int}
 	 */
 	public function summary( string $since, string $metric = 'tokens' ): array {
-		global $wpdb;
-		$table = PressArk_Cost_Ledger::table_name();
-
 		if ( 'icu' === $metric ) {
-			$row = $wpdb->get_row( $wpdb->prepare(
+			$row = $this->ledger_get_row(
 				"SELECT
 					COUNT(*) AS total_requests,
 					COALESCE(SUM(settled_icus), 0) AS total_metric,
@@ -72,12 +120,12 @@ class PressArk_Insights {
 					COALESCE(SUM(output_tokens), 0) AS total_output,
 					COALESCE(SUM(cache_read_tokens), 0) AS total_cache_read,
 					SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed_count
-				 FROM {$table}
+				 FROM {table}
 				 WHERE created_at >= %s",
 				$since
-			), ARRAY_A );
+			);
 		} else {
-			$row = $wpdb->get_row( $wpdb->prepare(
+			$row = $this->ledger_get_row(
 				"SELECT
 					COUNT(*) AS total_requests,
 					COALESCE(SUM(settled_tokens), 0) AS total_metric,
@@ -85,10 +133,10 @@ class PressArk_Insights {
 					COALESCE(SUM(output_tokens), 0) AS total_output,
 					COALESCE(SUM(cache_read_tokens), 0) AS total_cache_read,
 					SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed_count
-				 FROM {$table}
+				 FROM {table}
 				 WHERE created_at >= %s",
 				$since
-			), ARRAY_A );
+			);
 		}
 
 		return $row ? array_map( 'intval', $row ) : array(
@@ -107,34 +155,31 @@ class PressArk_Insights {
 	 * @return array<array{provider: string, total_metric: int, request_count: int}>
 	 */
 	public function by_provider( string $since, string $metric = 'tokens' ): array {
-		global $wpdb;
-		$table = PressArk_Cost_Ledger::table_name();
-
 		if ( 'icu' === $metric ) {
-			return $wpdb->get_results( $wpdb->prepare(
+			return $this->ledger_get_results(
 				"SELECT
 					provider,
 					COALESCE(SUM(settled_icus), 0) AS total_metric,
 					COUNT(*) AS request_count
-				 FROM {$table}
+				 FROM {table}
 				 WHERE status = 'settled' AND created_at >= %s
 				 GROUP BY provider
 				 ORDER BY total_metric DESC",
 				$since
-			), ARRAY_A ) ?: array();
+			);
 		}
 
-		return $wpdb->get_results( $wpdb->prepare(
+		return $this->ledger_get_results(
 			"SELECT
 				provider,
 				COALESCE(SUM(settled_tokens), 0) AS total_metric,
 				COUNT(*) AS request_count
-			 FROM {$table}
+			 FROM {table}
 			 WHERE status = 'settled' AND created_at >= %s
 			 GROUP BY provider
 			 ORDER BY total_metric DESC",
 			$since
-		), ARRAY_A ) ?: array();
+		);
 	}
 
 	/**
@@ -143,34 +188,31 @@ class PressArk_Insights {
 	 * @return array<array{model: string, total_metric: int, request_count: int}>
 	 */
 	public function by_model( string $since, string $metric = 'tokens' ): array {
-		global $wpdb;
-		$table = PressArk_Cost_Ledger::table_name();
-
 		if ( 'icu' === $metric ) {
-			return $wpdb->get_results( $wpdb->prepare(
+			return $this->ledger_get_results(
 				"SELECT
 					model,
 					COALESCE(SUM(settled_icus), 0) AS total_metric,
 					COUNT(*) AS request_count
-				 FROM {$table}
+				 FROM {table}
 				 WHERE status = 'settled' AND created_at >= %s
 				 GROUP BY model
 				 ORDER BY total_metric DESC",
 				$since
-			), ARRAY_A ) ?: array();
+			);
 		}
 
-		return $wpdb->get_results( $wpdb->prepare(
+		return $this->ledger_get_results(
 			"SELECT
 				model,
 				COALESCE(SUM(settled_tokens), 0) AS total_metric,
 				COUNT(*) AS request_count
-			 FROM {$table}
+			 FROM {table}
 			 WHERE status = 'settled' AND created_at >= %s
 			 GROUP BY model
 			 ORDER BY total_metric DESC",
 			$since
-		), ARRAY_A ) ?: array();
+		);
 	}
 
 	/**
@@ -179,17 +221,14 @@ class PressArk_Insights {
 	 * @return float 0.0–1.0
 	 */
 	public function cache_hit_rate( string $since ): float {
-		global $wpdb;
-		$table = PressArk_Cost_Ledger::table_name();
-
-		$row = $wpdb->get_row( $wpdb->prepare(
+		$row = $this->ledger_get_row(
 			"SELECT
 				COALESCE(SUM(cache_read_tokens), 0) AS cache_read,
 				COALESCE(SUM(input_tokens), 0) AS input_total
-			 FROM {$table}
+			 FROM {table}
 			 WHERE status = 'settled' AND created_at >= %s",
 			$since
-		), ARRAY_A );
+		);
 
 		if ( ! $row ) {
 			return 0.0;
@@ -208,34 +247,31 @@ class PressArk_Insights {
 	 * @return array<array{route: string, total_metric: int, request_count: int}>
 	 */
 	public function by_route( string $since, string $metric = 'tokens' ): array {
-		global $wpdb;
-		$table = PressArk_Cost_Ledger::table_name();
-
 		if ( 'icu' === $metric ) {
-			return $wpdb->get_results( $wpdb->prepare(
+			return $this->ledger_get_results(
 				"SELECT
 					route,
 					COALESCE(SUM(settled_icus), 0) AS total_metric,
 					COUNT(*) AS request_count
-				 FROM {$table}
+				 FROM {table}
 				 WHERE status = 'settled' AND created_at >= %s
 				 GROUP BY route
 				 ORDER BY total_metric DESC",
 				$since
-			), ARRAY_A ) ?: array();
+			);
 		}
 
-		return $wpdb->get_results( $wpdb->prepare(
+		return $this->ledger_get_results(
 			"SELECT
 				route,
 				COALESCE(SUM(settled_tokens), 0) AS total_metric,
 				COUNT(*) AS request_count
-			 FROM {$table}
+			 FROM {table}
 			 WHERE status = 'settled' AND created_at >= %s
 			 GROUP BY route
 			 ORDER BY total_metric DESC",
 			$since
-		), ARRAY_A ) ?: array();
+		);
 	}
 
 	/**
@@ -244,15 +280,12 @@ class PressArk_Insights {
 	 * @return float
 	 */
 	public function avg_agent_rounds( string $since ): float {
-		global $wpdb;
-		$table = PressArk_Cost_Ledger::table_name();
-
-		$avg = $wpdb->get_var( $wpdb->prepare(
+		$avg = $this->ledger_get_var(
 			"SELECT AVG(agent_rounds)
-			 FROM {$table}
+			 FROM {table}
 			 WHERE route = 'agent' AND agent_rounds > 0 AND status = 'settled' AND created_at >= %s",
 			$since
-		) );
+		);
 
 		return $avg !== null ? round( (float) $avg, 1 ) : 0.0;
 	}
@@ -263,20 +296,17 @@ class PressArk_Insights {
 	 * @return array<array{fail_reason: string, count: int}>
 	 */
 	public function top_failures( string $since ): array {
-		global $wpdb;
-		$table = PressArk_Cost_Ledger::table_name();
-
-		return $wpdb->get_results( $wpdb->prepare(
+		return $this->ledger_get_results(
 			"SELECT
 				COALESCE(fail_reason, 'Unknown') AS fail_reason,
 				COUNT(*) AS cnt
-			 FROM {$table}
+			 FROM {table}
 			 WHERE status = 'failed' AND created_at >= %s
 			 GROUP BY fail_reason
 			 ORDER BY cnt DESC
 			 LIMIT 10",
 			$since
-		), ARRAY_A ) ?: array();
+		);
 	}
 
 	/**
@@ -285,21 +315,18 @@ class PressArk_Insights {
 	 * @return array<array{day: string, total: int, settled: int, failed: int}>
 	 */
 	public function daily_volume( string $since ): array {
-		global $wpdb;
-		$table = PressArk_Cost_Ledger::table_name();
-
-		return $wpdb->get_results( $wpdb->prepare(
+		return $this->ledger_get_results(
 			"SELECT
 				DATE(created_at) AS day,
 				COUNT(*) AS total,
 				SUM(CASE WHEN status = 'settled' THEN 1 ELSE 0 END) AS settled,
 				SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed
-			 FROM {$table}
+			 FROM {table}
 			 WHERE created_at >= %s
 			 GROUP BY day
 			 ORDER BY day ASC",
 			$since
-		), ARRAY_A ) ?: array();
+		);
 	}
 
 	// ── Render ───────────────────────────────────────────────────────
@@ -312,12 +339,14 @@ class PressArk_Insights {
 			return;
 		}
 
-		$range = isset( $_GET['range'] ) ? absint( $_GET['range'] ) : 30;
+		// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Read-only analytics filter from the current admin URL.
+		$range = isset( $_GET['range'] ) ? absint( wp_unslash( $_GET['range'] ) ) : 30;
 		if ( ! in_array( $range, array( 7, 30, 90 ), true ) ) {
 			$range = 30;
 		}
 
-		$metric = isset( $_GET['metric'] ) ? sanitize_key( $_GET['metric'] ) : 'tokens';
+		// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Read-only analytics filter from the current admin URL.
+		$metric = isset( $_GET['metric'] ) ? sanitize_key( wp_unslash( $_GET['metric'] ) ) : 'tokens';
 		if ( ! in_array( $metric, array( 'tokens', 'icu' ), true ) ) {
 			$metric = 'tokens';
 		}

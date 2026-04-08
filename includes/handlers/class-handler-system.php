@@ -43,6 +43,16 @@ class PressArk_Handler_System extends PressArk_Handler_Base {
 	 */
 	public const READONLY_SETTINGS = array( 'siteurl', 'home', 'admin_email' );
 
+	/**
+	 * Cache group for short-lived system diagnostics.
+	 */
+	private const DIAGNOSTIC_CACHE_GROUP = 'pressark_system';
+
+	/**
+	 * Diagnostics may be briefly stale, but should refresh quickly after maintenance.
+	 */
+	private const DIAGNOSTIC_CACHE_TTL = MINUTE_IN_SECONDS;
+
 	// ── Site Settings ────────────────────────────────────────────────────
 
 	/**
@@ -1081,10 +1091,169 @@ class PressArk_Handler_System extends PressArk_Handler_Base {
 	}
 
 	private function get_db_size(): string {
+		$size = $this->get_cached_database_size_bytes();
+		return $size > 0 ? size_format( $size ) : __( 'Unknown', 'pressark' );
+	}
+
+	/**
+	 * Read and cache the current database size from information_schema.
+	 */
+	private function get_cached_database_size_bytes(): int {
+		$cache_key = 'db_size_bytes';
+		$cached    = wp_cache_get( $cache_key, self::DIAGNOSTIC_CACHE_GROUP );
+		if ( false !== $cached ) {
+			return (int) $cached;
+		}
+
+		$cached = get_transient( 'pressark_' . $cache_key );
+		if ( false !== $cached ) {
+			wp_cache_set( $cache_key, (int) $cached, self::DIAGNOSTIC_CACHE_GROUP, self::DIAGNOSTIC_CACHE_TTL );
+			return (int) $cached;
+		}
+
 		global $wpdb;
-		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- information_schema query, no user-controllable parameters.
-		$size = $wpdb->get_var( "SELECT SUM(data_length + index_length) FROM information_schema.TABLES WHERE table_schema = DATABASE()" );
-		return $size ? size_format( (int) $size ) : __( 'Unknown', 'pressark' );
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery -- Cached read-only information_schema query for diagnostics.
+		$size = (int) $wpdb->get_var( $wpdb->prepare(
+			'SELECT SUM(data_length + index_length) FROM information_schema.TABLES WHERE table_schema = %s',
+			DB_NAME
+		) );
+
+		wp_cache_set( $cache_key, $size, self::DIAGNOSTIC_CACHE_GROUP, self::DIAGNOSTIC_CACHE_TTL );
+		set_transient( 'pressark_' . $cache_key, $size, self::DIAGNOSTIC_CACHE_TTL );
+
+		return $size;
+	}
+
+	/**
+	 * Read and cache information_schema table statistics for database diagnostics.
+	 *
+	 * @return array<int,\stdClass>
+	 */
+	private function get_cached_database_tables(): array {
+		$cache_key = 'db_tables';
+		$cached    = wp_cache_get( $cache_key, self::DIAGNOSTIC_CACHE_GROUP );
+		if ( false !== $cached && is_array( $cached ) ) {
+			return $cached;
+		}
+
+		$cached = get_transient( 'pressark_' . $cache_key );
+		if ( false !== $cached && is_array( $cached ) ) {
+			wp_cache_set( $cache_key, $cached, self::DIAGNOSTIC_CACHE_GROUP, self::DIAGNOSTIC_CACHE_TTL );
+			return $cached;
+		}
+
+		global $wpdb;
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery -- Cached read-only information_schema query for diagnostics.
+		$tables = $wpdb->get_results( $wpdb->prepare(
+			'SELECT TABLE_NAME AS tbl_name, TABLE_ROWS AS tbl_rows, ROUND(data_length/1024/1024, 2) AS data_mb, ROUND(index_length/1024/1024, 2) AS index_mb FROM information_schema.TABLES WHERE table_schema = %s ORDER BY data_length DESC',
+			DB_NAME
+		) );
+
+		$tables = is_array( $tables ) ? $tables : array();
+
+		wp_cache_set( $cache_key, $tables, self::DIAGNOSTIC_CACHE_GROUP, self::DIAGNOSTIC_CACHE_TTL );
+		set_transient( 'pressark_' . $cache_key, $tables, self::DIAGNOSTIC_CACHE_TTL );
+
+		return $tables;
+	}
+
+	/**
+	 * Read and cache exact cleanup candidate counts used by database diagnostics.
+	 *
+	 * @return array<string,int>
+	 */
+	private function get_cached_database_cleanup_candidates(): array {
+		$cache_key = 'db_cleanup_candidates';
+		$cached    = wp_cache_get( $cache_key, self::DIAGNOSTIC_CACHE_GROUP );
+		if ( false !== $cached && is_array( $cached ) ) {
+			return $cached;
+		}
+
+		$cached = get_transient( 'pressark_' . $cache_key );
+		if ( false !== $cached && is_array( $cached ) ) {
+			wp_cache_set( $cache_key, $cached, self::DIAGNOSTIC_CACHE_GROUP, self::DIAGNOSTIC_CACHE_TTL );
+			return $cached;
+		}
+
+		global $wpdb;
+		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery -- Cached read-only maintenance counts intentionally use exact SQL totals across core tables.
+		$revisions   = (int) $wpdb->get_var( $wpdb->prepare(
+			"SELECT COUNT(*) FROM {$wpdb->posts} WHERE post_type = %s",
+			'revision'
+		) );
+		$auto_drafts = (int) $wpdb->get_var( $wpdb->prepare(
+			"SELECT COUNT(*) FROM {$wpdb->posts} WHERE post_status = %s",
+			'auto-draft'
+		) );
+		$trashed     = (int) $wpdb->get_var( $wpdb->prepare(
+			"SELECT COUNT(*) FROM {$wpdb->posts} WHERE post_status = %s",
+			'trash'
+		) );
+		$spam        = (int) $wpdb->get_var( $wpdb->prepare(
+			"SELECT COUNT(*) FROM {$wpdb->comments} WHERE comment_approved = %s",
+			'spam'
+		) );
+		$transients  = (int) $wpdb->get_var( $wpdb->prepare(
+			"SELECT COUNT(*) FROM {$wpdb->options} WHERE option_name LIKE %s AND option_value < UNIX_TIMESTAMP()",
+			$wpdb->esc_like( '_transient_timeout_' ) . '%'
+		) );
+		$pressark_checkpoints = (int) $wpdb->get_var( $wpdb->prepare(
+			"SELECT COUNT(*) FROM {$wpdb->postmeta} WHERE meta_key = %s",
+			'_pressark_checkpoint'
+		) );
+		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery
+
+		$candidates = array(
+			'revisions'            => $revisions,
+			'auto_drafts'          => $auto_drafts,
+			'trashed'              => $trashed,
+			'spam'                 => $spam,
+			'transients'           => $transients,
+			'pressark_checkpoints' => $pressark_checkpoints,
+		);
+
+		wp_cache_set( $cache_key, $candidates, self::DIAGNOSTIC_CACHE_GROUP, self::DIAGNOSTIC_CACHE_TTL );
+		set_transient( 'pressark_' . $cache_key, $candidates, self::DIAGNOSTIC_CACHE_TTL );
+
+		return $candidates;
+	}
+
+	/**
+	 * Read and cache orphaned postmeta rows for read-only previews.
+	 */
+	private function get_cached_orphaned_postmeta_count(): int {
+		$cache_key = 'db_orphaned_postmeta_count';
+		$cached    = wp_cache_get( $cache_key, self::DIAGNOSTIC_CACHE_GROUP );
+		if ( false !== $cached ) {
+			return (int) $cached;
+		}
+
+		$cached = get_transient( 'pressark_' . $cache_key );
+		if ( false !== $cached ) {
+			wp_cache_set( $cache_key, (int) $cached, self::DIAGNOSTIC_CACHE_GROUP, self::DIAGNOSTIC_CACHE_TTL );
+			return (int) $cached;
+		}
+
+		global $wpdb;
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- Cached read-only orphaned-meta count across core tables; no user input.
+		$count = (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$wpdb->postmeta} pm LEFT JOIN {$wpdb->posts} p ON pm.post_id = p.ID WHERE p.ID IS NULL" );
+
+		wp_cache_set( $cache_key, $count, self::DIAGNOSTIC_CACHE_GROUP, self::DIAGNOSTIC_CACHE_TTL );
+		set_transient( 'pressark_' . $cache_key, $count, self::DIAGNOSTIC_CACHE_TTL );
+
+		return $count;
+	}
+
+	/**
+	 * Count all rows for a post type using WordPress core post counts.
+	 */
+	private function count_all_post_type_rows( string $post_type ): int {
+		$counts = wp_count_posts( $post_type );
+		if ( ! is_object( $counts ) ) {
+			return 0;
+		}
+
+		return array_sum( array_map( 'intval', get_object_vars( $counts ) ) );
 	}
 
 	// ── Scheduled Tasks ──────────────────────────────────────────────────
@@ -1203,6 +1372,7 @@ class PressArk_Handler_System extends PressArk_Handler_Base {
 		}
 
 		if ( 'run' === $task_action ) {
+			// phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.DynamicHooknameFound -- This intentionally runs a selected WordPress cron hook by name.
 			do_action( $hook );
 			/* translators: %s: scheduled task hook name. */
 			return array( 'success' => true, 'message' => sprintf( __( 'Executed scheduled task "%s" immediately.', 'pressark' ), $hook ) );
@@ -1460,6 +1630,7 @@ class PressArk_Handler_System extends PressArk_Handler_Base {
 
 			$this->bootstrap_customizer_manager( $wp_customize );
 			$this->prime_customizer_support_loaders( $wp_customize );
+			// phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- Core Customizer registrations are attached to this WordPress hook.
 			do_action( 'customize_register', $wp_customize );
 
 			$panels = array();
@@ -1655,11 +1826,7 @@ class PressArk_Handler_System extends PressArk_Handler_Base {
 	// ── Database Maintenance ─────────────────────────────────────────────
 
 	public function database_stats( array $params ): array {
-		global $wpdb;
-		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- information_schema query, no user-controllable parameters.
-		$tables = $wpdb->get_results(
-			"SELECT TABLE_NAME AS tbl_name, TABLE_ROWS AS tbl_rows, ROUND(data_length/1024/1024, 2) AS data_mb, ROUND(index_length/1024/1024, 2) AS index_mb FROM information_schema.TABLES WHERE table_schema = DATABASE() ORDER BY data_length DESC"
-		);
+		$tables = $this->get_cached_database_tables();
 
 		$total_size = 0;
 		$formatted  = array();
@@ -1674,29 +1841,17 @@ class PressArk_Handler_System extends PressArk_Handler_Base {
 		}
 
 		// Cleanup candidates.
-		$revisions   = (int) $wpdb->get_var( $wpdb->prepare(
-			"SELECT COUNT(*) FROM {$wpdb->posts} WHERE post_type = %s", 'revision'
-		) );
-		$auto_drafts = (int) $wpdb->get_var( $wpdb->prepare(
-			"SELECT COUNT(*) FROM {$wpdb->posts} WHERE post_status = %s", 'auto-draft'
-		) );
-		$trashed     = (int) $wpdb->get_var( $wpdb->prepare(
-			"SELECT COUNT(*) FROM {$wpdb->posts} WHERE post_status = %s", 'trash'
-		) );
-		$spam        = (int) $wpdb->get_var( $wpdb->prepare(
-			"SELECT COUNT(*) FROM {$wpdb->comments} WHERE comment_approved = %s", 'spam'
-		) );
-		$transients = (int) $wpdb->get_var( $wpdb->prepare(
-			"SELECT COUNT(*) FROM {$wpdb->options} WHERE option_name LIKE %s AND option_value < UNIX_TIMESTAMP()",
-			$wpdb->esc_like( '_transient_timeout_' ) . '%'
-		) );
+		$cleanup_candidates = $this->get_cached_database_cleanup_candidates();
+		$revisions          = (int) ( $cleanup_candidates['revisions'] ?? 0 );
+		$auto_drafts        = (int) ( $cleanup_candidates['auto_drafts'] ?? 0 );
+		$trashed            = (int) ( $cleanup_candidates['trashed'] ?? 0 );
+		$spam               = (int) ( $cleanup_candidates['spam'] ?? 0 );
+		$transients         = (int) ( $cleanup_candidates['transients'] ?? 0 );
 
 		// Revision intelligence — check limits and PressArk checkpoints.
 		$sample_post   = get_posts( array( 'numberposts' => 1, 'post_type' => 'post', 'post_status' => 'publish', 'fields' => 'ids' ) );
 		$rev_limit     = $sample_post ? wp_revisions_to_keep( get_post( $sample_post[0] ) ) : -1;
-		$pw_checkpoints = (int) $wpdb->get_var( $wpdb->prepare(
-			"SELECT COUNT(*) FROM {$wpdb->postmeta} WHERE meta_key = %s", '_pressark_checkpoint'
-		) );
+		$pw_checkpoints = (int) ( $cleanup_candidates['pressark_checkpoints'] ?? 0 );
 
 		$revision_info = array(
 			'total'            => $revisions,
@@ -1746,18 +1901,25 @@ class PressArk_Handler_System extends PressArk_Handler_Base {
 		$cleaned = array();
 
 		if ( in_array( 'revisions', $items, true ) ) {
-			$revision_ids = $wpdb->get_col( $wpdb->prepare(
-				"SELECT ID FROM {$wpdb->posts} WHERE post_type = %s LIMIT 500", 'revision'
-			) );
+			$revision_ids = get_posts(
+				array(
+					'post_type'              => 'revision',
+					'post_status'            => 'inherit',
+					'numberposts'            => 500,
+					'fields'                 => 'ids',
+					'orderby'                => 'ID',
+					'order'                  => 'ASC',
+					'update_post_meta_cache' => false,
+					'update_post_term_cache' => false,
+				)
+			);
 			$deleted = 0;
 			foreach ( $revision_ids as $rev_id ) {
 				if ( wp_delete_post_revision( (int) $rev_id ) ) {
 					$deleted++;
 				}
 			}
-			$remaining = (int) $wpdb->get_var( $wpdb->prepare(
-				"SELECT COUNT(*) FROM {$wpdb->posts} WHERE post_type = %s", 'revision'
-			) );
+			$remaining = $this->count_all_post_type_rows( 'revision' );
 			$cleaned[] = array(
 				'item'      => 'revisions',
 				'deleted'   => $deleted,
@@ -1772,6 +1934,7 @@ class PressArk_Handler_System extends PressArk_Handler_Base {
 			);
 		}
 		if ( in_array( 'auto_drafts', $items, true ) ) {
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- Exact post-status sweep across all post types is intentional for this destructive cleanup batch.
 			$auto_draft_ids = $wpdb->get_col( $wpdb->prepare(
 				"SELECT ID FROM {$wpdb->posts} WHERE post_status = %s LIMIT 500",
 				'auto-draft'
@@ -1785,6 +1948,7 @@ class PressArk_Handler_System extends PressArk_Handler_Base {
 			$cleaned[] = array( 'item' => 'auto_drafts', 'deleted' => $deleted );
 		}
 		if ( in_array( 'trashed', $items, true ) ) {
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- Exact post-status sweep across all post types is intentional for this destructive cleanup batch.
 			$trashed_ids = $wpdb->get_col( $wpdb->prepare(
 				"SELECT ID FROM {$wpdb->posts} WHERE post_status = %s LIMIT 500",
 				'trash'
@@ -1795,6 +1959,7 @@ class PressArk_Handler_System extends PressArk_Handler_Base {
 					$deleted++;
 				}
 			}
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- Remaining trash count must be read live immediately after this destructive batch.
 			$remaining = (int) $wpdb->get_var( $wpdb->prepare(
 				"SELECT COUNT(*) FROM {$wpdb->posts} WHERE post_status = %s", 'trash'
 			) );
@@ -1808,6 +1973,7 @@ class PressArk_Handler_System extends PressArk_Handler_Base {
 			);
 		}
 		if ( in_array( 'spam_comments', $items, true ) ) {
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- One-shot spam purge intentionally deletes exact matching rows without a stale cache layer.
 			$count = $wpdb->query( $wpdb->prepare( "DELETE FROM {$wpdb->comments} WHERE comment_approved = %s", 'spam' ) );
 			if ( false === $count || $wpdb->last_error ) {
 				$cleaned[] = array( 'item' => 'spam_comments', 'error' => $wpdb->last_error ?: __( 'Query returned false', 'pressark' ) );
@@ -1816,6 +1982,7 @@ class PressArk_Handler_System extends PressArk_Handler_Base {
 			}
 		}
 		if ( in_array( 'expired_transients', $items, true ) ) {
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- Exact pre-delete transient count is gathered live immediately before delete_expired_transients().
 			$count_before = (int) $wpdb->get_var( $wpdb->prepare(
 				"SELECT COUNT(*) FROM {$wpdb->options}
 				 WHERE option_name LIKE %s
@@ -1831,7 +1998,7 @@ class PressArk_Handler_System extends PressArk_Handler_Base {
 			);
 		}
 		if ( in_array( 'orphaned_meta', $items, true ) ) {
-			// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- JOIN on core tables, no user-controllable parameters.
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- JOIN delete on core tables is intentional maintenance and must run live.
 			$count = $wpdb->query( "DELETE pm FROM {$wpdb->postmeta} pm LEFT JOIN {$wpdb->posts} p ON pm.post_id = p.ID WHERE p.ID IS NULL" );
 			if ( false === $count || $wpdb->last_error ) {
 				$cleaned[] = array( 'item' => 'orphaned_meta', 'error' => $wpdb->last_error ?: __( 'Query returned false', 'pressark' ) );
@@ -1871,6 +2038,7 @@ class PressArk_Handler_System extends PressArk_Handler_Base {
 	public function optimize_database( array $params ): array {
 		global $wpdb;
 
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- Live information_schema stats are required immediately before table maintenance.
 		$table_engines = $wpdb->get_results( $wpdb->prepare(
 			"SELECT TABLE_NAME, ENGINE, DATA_LENGTH, INDEX_LENGTH, DATA_FREE
 			 FROM information_schema.TABLES
@@ -1887,11 +2055,11 @@ class PressArk_Handler_System extends PressArk_Handler_Base {
 			$engine = strtolower( $info->ENGINE ?? '' );
 
 			if ( $engine === 'myisam' ) {
-				// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- DDL on esc_sql'd identifier.
+				// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- DDL maintenance on an escaped table identifier must run live.
 				$wpdb->query( "OPTIMIZE TABLE `{$tname}`" );
 				$action = 'optimized';
 			} else {
-				// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- DDL on esc_sql'd identifier.
+				// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- DDL maintenance on an escaped table identifier must run live.
 				$wpdb->query( "ANALYZE TABLE `{$tname}`" );
 				$action = 'analyzed';
 			}
@@ -2175,24 +2343,24 @@ class PressArk_Handler_System extends PressArk_Handler_Base {
 	 */
 	public function preview_cleanup_database( array $params, array $action ): array {
 		$db_items_raw = $params['items'] ?? ( $action['items'] ?? array( 'revisions', 'auto_drafts', 'trashed', 'spam_comments', 'expired_transients', 'orphaned_meta' ) );
-		$db_items = array();
+		$db_items     = array();
 		foreach ( $db_items_raw as $k => $v ) {
 			$db_items[] = is_string( $k ) ? $k : $v;
 		}
 
-		global $wpdb;
+		$cleanup_candidates = $this->get_cached_database_cleanup_candidates();
+		$orphaned_meta      = $this->get_cached_orphaned_postmeta_count();
 		$cleanup_counts = array(
-			'revisions'          => array( 'label' => __( 'Post Revisions', 'pressark' ), 'count' => (int) $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM {$wpdb->posts} WHERE post_type = %s", 'revision' ) ), 'unit' => __( 'revisions', 'pressark' ) ),
-			'auto_drafts'        => array( 'label' => __( 'Auto-Drafts', 'pressark' ), 'count' => (int) $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM {$wpdb->posts} WHERE post_status = %s", 'auto-draft' ) ), 'unit' => __( 'auto-drafts', 'pressark' ) ),
-			'trashed'            => array( 'label' => __( 'Trashed Posts', 'pressark' ), 'count' => (int) $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM {$wpdb->posts} WHERE post_status = %s", 'trash' ) ), 'unit' => __( 'trashed posts', 'pressark' ) ),
-			'spam_comments'      => array( 'label' => __( 'Spam Comments', 'pressark' ), 'count' => (int) $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM {$wpdb->comments} WHERE comment_approved = %s", 'spam' ) ), 'unit' => __( 'spam comments', 'pressark' ) ),
+			'revisions'          => array( 'label' => __( 'Post Revisions', 'pressark' ), 'count' => (int) ( $cleanup_candidates['revisions'] ?? 0 ), 'unit' => __( 'revisions', 'pressark' ) ),
+			'auto_drafts'        => array( 'label' => __( 'Auto-Drafts', 'pressark' ), 'count' => (int) ( $cleanup_candidates['auto_drafts'] ?? 0 ), 'unit' => __( 'auto-drafts', 'pressark' ) ),
+			'trashed'            => array( 'label' => __( 'Trashed Posts', 'pressark' ), 'count' => (int) ( $cleanup_candidates['trashed'] ?? 0 ), 'unit' => __( 'trashed posts', 'pressark' ) ),
+			'spam_comments'      => array( 'label' => __( 'Spam Comments', 'pressark' ), 'count' => (int) ( $cleanup_candidates['spam'] ?? 0 ), 'unit' => __( 'spam comments', 'pressark' ) ),
 			'expired_transients' => array(
 				'label' => __( 'Expired Transients', 'pressark' ),
-				'count' => (int) $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM {$wpdb->options} WHERE option_name LIKE %s AND CAST(option_value AS UNSIGNED) < UNIX_TIMESTAMP()", $wpdb->esc_like( '_transient_timeout_' ) . '%' ) ),
+				'count' => (int) ( $cleanup_candidates['transients'] ?? 0 ),
 				'unit'  => __( 'expired transients', 'pressark' ),
 			),
-			// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- JOIN on core tables, no user-controllable parameters.
-			'orphaned_meta'      => array( 'label' => __( 'Orphaned Post Meta', 'pressark' ), 'count' => (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$wpdb->postmeta} pm LEFT JOIN {$wpdb->posts} p ON pm.post_id = p.ID WHERE p.ID IS NULL" ), 'unit' => __( 'orphaned meta rows', 'pressark' ) ),
+			'orphaned_meta'      => array( 'label' => __( 'Orphaned Post Meta', 'pressark' ), 'count' => $orphaned_meta, 'unit' => __( 'orphaned meta rows', 'pressark' ) ),
 		);
 
 		$changes = array();

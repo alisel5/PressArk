@@ -335,7 +335,7 @@ class PressArk_Handler_Diagnostics extends PressArk_Handler_Base {
 				$reasons[] = __( 'Matches a moderation keyword (Settings → Discussion)', 'pressark' );
 			}
 		}
-		if ( ! get_option( 'comment_whitelist' ) && ! $would_approve ) {
+		if ( ! get_option( 'comment_previously_approved' ) && ! $would_approve ) {
 			$reasons[] = __( 'Comment author has no previously approved comments', 'pressark' );
 		}
 		if ( empty( $reasons ) && ! $would_approve ) {

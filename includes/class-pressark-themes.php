@@ -131,7 +131,8 @@ class PressArk_Themes {
 		$warnings = array();
 
 		$current_menus    = get_nav_menu_locations();
-		$current_sidebars = wp_get_sidebars_widgets();
+		$current_sidebars = get_option( 'sidebars_widgets', array() );
+		unset( $current_sidebars['array_version'] );
 		$has_menus        = ! empty( array_filter( $current_menus ) );
 		$has_widgets      = ! empty( array_filter( $current_sidebars, fn( $w ) => ! empty( $w ) ) );
 

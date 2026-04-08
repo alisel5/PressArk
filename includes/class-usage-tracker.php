@@ -184,6 +184,7 @@ class PressArk_Usage_Tracker {
 		$key = $this->get_option_key();
 
 		// Atomic increment — avoids race condition between concurrent requests.
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery -- Intentional atomic INSERT ... ON DUPLICATE KEY UPDATE against wp_options; update_option() would not provide the same concurrency safety here.
 		$wpdb->query( $wpdb->prepare(
 			"INSERT INTO {$wpdb->options} (option_name, option_value, autoload)
 			 VALUES (%s, 1, 'no')
@@ -279,46 +280,52 @@ class PressArk_Usage_Tracker {
 	}
 
 	/**
+	 * Count current-month log rows for one user, optionally filtered by action type.
+	 */
+	private function count_monthly_log_actions( int $user_id, string $month_start, string $action_type = '' ): int {
+		global $wpdb;
+
+		$table = $wpdb->prefix . 'pressark_log';
+
+		if ( '' === $action_type ) {
+			// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,PluginCheck.Security.DirectDB.UnescapedDBParameter,WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- Reads a plugin-owned prefixed log table for bounded per-user monthly stats; table name is internal and caching is not relevant to these live counters.
+			$count = $wpdb->get_var(
+				$wpdb->prepare(
+					"SELECT COUNT(*) FROM {$table} WHERE user_id = %d AND created_at >= %s",
+					$user_id,
+					$month_start
+				)
+			);
+			// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,PluginCheck.Security.DirectDB.UnescapedDBParameter,WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+		} else {
+			// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,PluginCheck.Security.DirectDB.UnescapedDBParameter,WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- Reads a plugin-owned prefixed log table for bounded per-user monthly stats; table name is internal and caching is not relevant to these live counters.
+			$count = $wpdb->get_var(
+				$wpdb->prepare(
+					"SELECT COUNT(*) FROM {$table} WHERE user_id = %d AND created_at >= %s AND action_type = %s",
+					$user_id,
+					$month_start,
+					$action_type
+				)
+			);
+			// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,PluginCheck.Security.DirectDB.UnescapedDBParameter,WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+		}
+
+		return (int) $count;
+	}
+
+	/**
 	 * Get usage stats for settings page.
 	 *
 	 * v3.5.1: edits_used reports from entitlement model (group-based) not
 	 * the legacy flat counter, so settings page matches real gating.
 	 */
 	public function get_monthly_stats(): array {
-		global $wpdb;
-
 		$user_id     = get_current_user_id();
-		$table       = $wpdb->prefix . 'pressark_log';
 		$month_start = gmdate( 'Y-m-01 00:00:00' );
 
-		// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- $table is a hardcoded prefixed table name.
-		$total_actions = (int) $wpdb->get_var(
-			$wpdb->prepare(
-				"SELECT COUNT(*) FROM {$table} WHERE user_id = %d AND created_at >= %s",
-				$user_id,
-				$month_start
-			)
-		);
-
-		// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- $table is a hardcoded prefixed table name.
-		$seo_scans = (int) $wpdb->get_var(
-			$wpdb->prepare(
-				"SELECT COUNT(*) FROM {$table} WHERE user_id = %d AND created_at >= %s AND action_type = %s",
-				$user_id,
-				$month_start,
-				'analyze_seo'
-			)
-		);
-
-		// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- $table is a hardcoded prefixed table name.
-		$security_scans = (int) $wpdb->get_var(
-			$wpdb->prepare(
-				"SELECT COUNT(*) FROM {$table} WHERE user_id = %d AND created_at >= %s AND action_type = %s",
-				$user_id,
-				$month_start,
-				'scan_security'
-			)
-		);
+		$total_actions  = $this->count_monthly_log_actions( $user_id, $month_start );
+		$seo_scans      = $this->count_monthly_log_actions( $user_id, $month_start, 'analyze_seo' );
+		$security_scans = $this->count_monthly_log_actions( $user_id, $month_start, 'scan_security' );
 
 		$tier   = ( new PressArk_License() )->get_tier();
 		$is_pro = PressArk_Entitlements::is_paid_tier( $tier );

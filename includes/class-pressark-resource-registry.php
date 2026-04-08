@@ -775,6 +775,7 @@ class PressArk_Resource_Registry {
 		// Build schema via Customizer API (expensive — requires full manager init).
 		require_once ABSPATH . WPINC . '/class-wp-customize-manager.php';
 		$wp_customize = new WP_Customize_Manager();
+		// phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- Core Customizer registrations are attached to this WordPress hook.
 		do_action( 'customize_register', $wp_customize );
 
 		$schema = array();

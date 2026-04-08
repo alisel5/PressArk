@@ -605,19 +605,19 @@ class PressArk_Onboarding {
 
 					<div class="pw-ob-quick-actions">
 						<button type="button" data-message="<?php esc_attr_e( 'Run a security check on my site and fix any issues', 'pressark' ); ?>">
-							<?php echo pressark_icon( 'shield' ); ?> <?php esc_html_e( 'Security Scan', 'pressark' ); ?>
+							<?php echo wp_kses( pressark_icon( 'shield' ), pressark_icon_allowed_html() ); ?> <?php esc_html_e( 'Security Scan', 'pressark' ); ?>
 						</button>
 						<button type="button" data-message="<?php esc_attr_e( "Scan my site's SEO and suggest improvements", 'pressark' ); ?>">
-							<?php echo pressark_icon( 'barChart' ); ?> <?php esc_html_e( 'SEO Audit', 'pressark' ); ?>
+							<?php echo wp_kses( pressark_icon( 'barChart' ), pressark_icon_allowed_html() ); ?> <?php esc_html_e( 'SEO Audit', 'pressark' ); ?>
 						</button>
 						<button type="button" data-message="<?php esc_attr_e( "Write a new blog post that matches my site's tone and style", 'pressark' ); ?>">
-							<?php echo pressark_icon( 'pen' ); ?> <?php esc_html_e( 'Write a Blog Post', 'pressark' ); ?>
+							<?php echo wp_kses( pressark_icon( 'pen' ), pressark_icon_allowed_html() ); ?> <?php esc_html_e( 'Write a Blog Post', 'pressark' ); ?>
 						</button>
 						<button type="button" data-message="<?php esc_attr_e( 'Rewrite my homepage content to be more engaging', 'pressark' ); ?>">
-							<?php echo pressark_icon( 'house' ); ?> <?php esc_html_e( 'Update Homepage', 'pressark' ); ?>
+							<?php echo wp_kses( pressark_icon( 'house' ), pressark_icon_allowed_html() ); ?> <?php esc_html_e( 'Update Homepage', 'pressark' ); ?>
 						</button>
 						<button type="button" data-message="<?php esc_attr_e( "Check my site's performance and loading speed", 'pressark' ); ?>">
-							<?php echo pressark_icon( 'zap' ); ?> <?php esc_html_e( 'Check Speed', 'pressark' ); ?>
+							<?php echo wp_kses( pressark_icon( 'zap' ), pressark_icon_allowed_html() ); ?> <?php esc_html_e( 'Check Speed', 'pressark' ); ?>
 						</button>
 					</div>
 

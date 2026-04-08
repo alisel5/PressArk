@@ -606,7 +606,7 @@ PROMPT;
 		?>
 		<div class="notice notice-info is-dismissible pressark-watchdog-nudge" style="border-left-color:#2563EB;padding:16px 20px;position:relative;">
 			<div style="display:flex;align-items:flex-start;gap:16px;">
-				<div style="font-size:32px;line-height:1;"><?php echo pressark_icon( 'shield', 32 ); ?></div>
+				<div style="font-size:32px;line-height:1;"><?php echo wp_kses( pressark_icon( 'shield', 32 ), pressark_icon_allowed_html() ); ?></div>
 				<div style="flex:1;">
 					<h3 style="margin:0 0 6px;font-size:15px;color:#0F172A;">
 						<?php esc_html_e( 'Your WooCommerce store has a new AI watchdog', 'pressark' ); ?>
@@ -617,7 +617,7 @@ PROMPT;
 					<ul style="margin:0 0 12px;padding:0;list-style:none;">
 						<?php foreach ( $features as $feature ) : ?>
 							<li style="padding:2px 0;font-size:13px;color:#334155;">
-								<?php echo pressark_icon( 'checkCircle' ); ?> <?php echo esc_html( $feature ); ?>
+								<?php echo wp_kses( pressark_icon( 'checkCircle' ), pressark_icon_allowed_html() ); ?> <?php echo esc_html( $feature ); ?>
 							</li>
 						<?php endforeach; ?>
 					</ul>

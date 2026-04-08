@@ -360,6 +360,7 @@ class PressArk_Handler_Elementor extends PressArk_Handler_Base {
 
 		// v3.8.0: Snapshot _elementor_data for each affected page before mutating,
 		// so the action logger has old values for undo/rollback.
+		// phpcs:disable WordPress.DB.SlowDBQuery.slow_db_query_meta_key,WordPress.DB.SlowDBQuery.slow_db_query_meta_value -- Elementor snapshot discovery intentionally filters on Elementor-owned meta and only returns IDs for bounded admin-side snapshotting.
 		$snapshot_args = array(
 			'post_type'      => array( 'page', 'post', 'elementor_library' ),
 			'post_status'    => array( 'publish', 'draft', 'private' ),
@@ -368,6 +369,7 @@ class PressArk_Handler_Elementor extends PressArk_Handler_Base {
 			'meta_value'     => 'builder',
 			'fields'         => 'ids',
 		);
+		// phpcs:enable WordPress.DB.SlowDBQuery.slow_db_query_meta_key,WordPress.DB.SlowDBQuery.slow_db_query_meta_value
 		if ( $post_id ) {
 			$snapshot_args['post__in'] = array( $post_id );
 		}
@@ -1011,6 +1013,7 @@ class PressArk_Handler_Elementor extends PressArk_Handler_Base {
 	 * List all Elementor Pro popups with trigger and condition configuration.
 	 */
 	public function elementor_list_popups( array $params ): array {
+		// phpcs:disable WordPress.DB.SlowDBQuery.slow_db_query_meta_key,WordPress.DB.SlowDBQuery.slow_db_query_meta_value -- Popup discovery intentionally filters on Elementor-owned template meta and is capped at 50 published templates.
 		$popups = get_posts( array(
 			'post_type'      => 'elementor_library',
 			'post_status'    => 'publish',
@@ -1018,6 +1021,7 @@ class PressArk_Handler_Elementor extends PressArk_Handler_Base {
 			'meta_key'       => '_elementor_template_type',
 			'meta_value'     => 'popup',
 		) );
+		// phpcs:enable WordPress.DB.SlowDBQuery.slow_db_query_meta_key,WordPress.DB.SlowDBQuery.slow_db_query_meta_value
 
 		if ( empty( $popups ) ) {
 			return array(

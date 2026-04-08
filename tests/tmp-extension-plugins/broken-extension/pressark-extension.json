@@ -1,7 +1,0 @@
-{
-    "schema_version": "2.0",
-    "trust": {
-        "class": "dangerous",
-        "prompt_injection_class": "bad"
-    }
-}

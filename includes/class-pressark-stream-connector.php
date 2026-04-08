@@ -1,10 +1,12 @@
 <?php
 /**
- * Streaming variant of AI provider calls using raw cURL with CURLOPT_WRITEFUNCTION.
+ * Streaming variant of AI provider calls.
  *
  * Reuses PressArk_AI_Connector for all non-streaming logic (model resolution,
- * system prompt building, message formatting, response extraction). Only replaces
- * the HTTP transport with a streaming cURL call.
+ * system prompt building, message formatting, response extraction). Streaming
+ * transport is handled via the WordPress HTTP API, attaching a cURL write
+ * callback through http_api_curl when the cURL transport is active so SSE
+ * tokens can be emitted progressively.
  *
  * Returns the same array shape as send_message_raw() for agent loop compatibility.
  *
@@ -18,7 +20,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 class PressArk_Stream_Connector {
 
 	private PressArk_AI_Connector $ai;
-	private PressArk_SSE_Emitter  $emitter;
+	private PressArk_SSE_Emitter $emitter;
 	private $cancel_check;
 
 	public function __construct( PressArk_AI_Connector $ai, PressArk_SSE_Emitter $emitter, ?callable $cancel_check = null ) {
@@ -37,13 +39,13 @@ class PressArk_Stream_Connector {
 	 * @param array  $tools         OpenAI function schemas.
 	 * @param string $system_prompt Full system prompt (dynamic part).
 	 * @param bool   $deep_mode     Whether deep mode is active.
-	 * @return array { raw: array, provider: string, model: string, cache_metrics: array, request_made: bool }
+	 * @return array{raw:array,provider:string,model:string,cache_metrics:array,request_made:bool}
 	 */
 	public function send_streaming(
-		array  $messages,
-		array  $tools        = array(),
+		array $messages,
+		array $tools = array(),
 		string $system_prompt = '',
-		bool   $deep_mode    = false
+		bool $deep_mode = false
 	): array {
 		$do_work = function () use ( $messages, $tools, $system_prompt, $deep_mode ) {
 			$provider = $this->ai->get_provider();
@@ -103,65 +105,60 @@ class PressArk_Stream_Connector {
 		$request = $this->ai->prepare_streaming_request( $messages, $tools, $system_prompt );
 
 		$request['body']['stream']         = true;
-		$request['body']['stream_options']  = array( 'include_usage' => true );
+		$request['body']['stream_options'] = array( 'include_usage' => true );
 
-		// Accumulated state — built incrementally from SSE chunks.
 		$accumulated = array(
-			'content'      => '',
-			'tool_calls'   => array(),
+			'content'       => '',
+			'tool_calls'    => array(),
 			'finish_reason' => null,
-			'usage'        => array(),
-			'model'        => $request['body']['model'] ?? '',
+			'usage'         => array(),
+			'model'         => $request['body']['model'] ?? '',
 		);
 
-		$line_buffer = '';
-		$stream_aborted = false;
+		$line_buffer   = '';
+		$consume_chunk = function ( string $data ) use ( &$accumulated, &$line_buffer ): void {
+			$this->consume_sse_chunk(
+				$data,
+				$line_buffer,
+				function ( string $line ) use ( &$accumulated ): void {
+					if ( ! str_starts_with( $line, 'data: ' ) ) {
+						return;
+					}
 
-		// Raw cURL required for CURLOPT_WRITEFUNCTION (SSE streaming).
-		// WordPress's WP_Http API does not support streaming write callbacks.
-		$ch = curl_init( $request['endpoint'] );
-		curl_setopt_array( $ch, array(
-			CURLOPT_POST           => true,
-			CURLOPT_HTTPHEADER     => $request['headers'],
-			CURLOPT_POSTFIELDS     => wp_json_encode( $request['body'] ),
-			CURLOPT_RETURNTRANSFER => false,
-			CURLOPT_TIMEOUT        => 120,
-			CURLOPT_WRITEFUNCTION  => function ( $ch, $data ) use ( &$accumulated, &$line_buffer, &$stream_aborted ) {
-				if ( connection_aborted() || ! $this->emitter->is_connected() || $this->cancellation_requested() ) {
-					$stream_aborted = true;
-					return 0; // Abort cURL.
+					$payload = substr( $line, 6 );
+					if ( '[DONE]' === $payload ) {
+						return;
+					}
+
+					$this->parse_openai_chunk( $payload, $accumulated );
+				}
+			);
+		};
+
+		$transport = $this->perform_streaming_http_request(
+			$request['endpoint'],
+			(array) $request['headers'],
+			(string) wp_json_encode( $request['body'] ),
+			$consume_chunk
+		);
+
+		$this->flush_sse_buffer(
+			$line_buffer,
+			function ( string $line ) use ( &$accumulated ): void {
+				if ( ! str_starts_with( $line, 'data: ' ) ) {
+					return;
 				}
 
-				$line_buffer .= $data;
-				$lines = explode( "\n", $line_buffer );
-				$line_buffer = array_pop( $lines ); // Keep incomplete line.
-
-				foreach ( $lines as $line ) {
-					$line = trim( $line );
-					if ( '' === $line ) {
-						continue;
-					}
-					if ( str_starts_with( $line, 'data: ' ) ) {
-						$payload = substr( $line, 6 );
-						if ( '[DONE]' === $payload ) {
-							continue;
-						}
-						$this->parse_openai_chunk( $payload, $accumulated );
-					}
+				$payload = substr( $line, 6 );
+				if ( '[DONE]' === $payload ) {
+					return;
 				}
 
-				return strlen( $data );
-			},
-		) );
+				$this->parse_openai_chunk( $payload, $accumulated );
+			}
+		);
 
-		$this->apply_wp_proxy( $ch );
-
-		curl_exec( $ch );
-		$curl_error = curl_error( $ch );
-		$http_code  = (int) curl_getinfo( $ch, CURLINFO_HTTP_CODE );
-		curl_close( $ch );
-
-		if ( $stream_aborted ) {
+		if ( $transport['stream_aborted'] ) {
 			return array(
 				'__pressark_cancelled' => true,
 				'usage'                => $accumulated['usage'],
@@ -169,18 +166,25 @@ class PressArk_Stream_Connector {
 			);
 		}
 
-		if ( ! empty( $curl_error ) ) {
-			if ( str_contains( $curl_error, 'timed out' ) || str_contains( $curl_error, 'Operation timed out' ) ) {
+		$response    = $transport['response'];
+		$has_content = ! empty( $accumulated['content'] ) || ! empty( $accumulated['tool_calls'] );
+
+		if ( is_wp_error( $response ) ) {
+			$http_error = $response->get_error_message();
+			if ( $has_content ) {
+				$http_error = '';
+			} elseif ( str_contains( $http_error, 'timed out' ) || str_contains( $http_error, 'Operation timed out' ) ) {
 				return array( 'error' => 'The AI provider took too long to respond. Try again or simplify your request.' );
+			} elseif ( '' !== $http_error ) {
+				return array( 'error' => 'Connection error: ' . $http_error );
 			}
-			return array( 'error' => 'Connection error: ' . $curl_error );
 		}
 
-		if ( $http_code !== 200 && empty( $accumulated['content'] ) && empty( $accumulated['tool_calls'] ) ) {
+		$http_code = is_wp_error( $response ) ? 0 : (int) wp_remote_retrieve_response_code( $response );
+		if ( 200 !== $http_code && empty( $accumulated['content'] ) && empty( $accumulated['tool_calls'] ) ) {
 			return array( 'error' => sprintf( 'API error (%d): Streaming request failed.', $http_code ) );
 		}
 
-		// Reconstruct into the standard OpenAI response shape.
 		$message = array(
 			'role'    => 'assistant',
 			'content' => $accumulated['content'] ?: null,
@@ -214,7 +218,6 @@ class PressArk_Stream_Connector {
 
 		$request['body']['stream'] = true;
 
-		// Accumulated state.
 		$accumulated = array(
 			'content'     => array(),
 			'stop_reason' => null,
@@ -222,57 +225,55 @@ class PressArk_Stream_Connector {
 			'model'       => $request['body']['model'] ?? '',
 		);
 
-		$line_buffer  = '';
-		$event_type   = '';
-		$stream_aborted = false;
-
-		// Raw cURL required for CURLOPT_WRITEFUNCTION (SSE streaming).
-		// WordPress's WP_Http API does not support streaming write callbacks.
-		$ch = curl_init( $request['endpoint'] );
-		curl_setopt_array( $ch, array(
-			CURLOPT_POST           => true,
-			CURLOPT_HTTPHEADER     => $request['headers'],
-			CURLOPT_POSTFIELDS     => wp_json_encode( $request['body'] ),
-			CURLOPT_RETURNTRANSFER => false,
-			CURLOPT_TIMEOUT        => 120,
-			CURLOPT_WRITEFUNCTION  => function ( $ch, $data ) use ( &$accumulated, &$line_buffer, &$event_type, &$stream_aborted ) {
-				if ( connection_aborted() || ! $this->emitter->is_connected() || $this->cancellation_requested() ) {
-					$stream_aborted = true;
-					return 0;
-				}
-
-				$line_buffer .= $data;
-				$lines = explode( "\n", $line_buffer );
-				$line_buffer = array_pop( $lines );
-
-				foreach ( $lines as $line ) {
-					$line = trim( $line );
-					if ( '' === $line ) {
-						continue;
-					}
+		$line_buffer   = '';
+		$event_type    = '';
+		$consume_chunk = function ( string $data ) use ( &$accumulated, &$line_buffer, &$event_type ): void {
+			$this->consume_sse_chunk(
+				$data,
+				$line_buffer,
+				function ( string $line ) use ( &$accumulated, &$event_type ): void {
 					if ( str_starts_with( $line, 'event: ' ) ) {
 						$event_type = substr( $line, 7 );
-						continue;
+						return;
 					}
-					if ( str_starts_with( $line, 'data: ' ) ) {
-						$payload = substr( $line, 6 );
-						$this->parse_anthropic_chunk( $event_type, $payload, $accumulated );
-						$event_type = '';
+
+					if ( ! str_starts_with( $line, 'data: ' ) ) {
+						return;
 					}
+
+					$payload = substr( $line, 6 );
+					$this->parse_anthropic_chunk( $event_type, $payload, $accumulated );
+					$event_type = '';
+				}
+			);
+		};
+
+		$transport = $this->perform_streaming_http_request(
+			$request['endpoint'],
+			(array) $request['headers'],
+			(string) wp_json_encode( $request['body'] ),
+			$consume_chunk
+		);
+
+		$this->flush_sse_buffer(
+			$line_buffer,
+			function ( string $line ) use ( &$accumulated, &$event_type ): void {
+				if ( str_starts_with( $line, 'event: ' ) ) {
+					$event_type = substr( $line, 7 );
+					return;
 				}
 
-				return strlen( $data );
-			},
-		) );
+				if ( ! str_starts_with( $line, 'data: ' ) ) {
+					return;
+				}
 
-		$this->apply_wp_proxy( $ch );
+				$payload = substr( $line, 6 );
+				$this->parse_anthropic_chunk( $event_type, $payload, $accumulated );
+				$event_type = '';
+			}
+		);
 
-		curl_exec( $ch );
-		$curl_error = curl_error( $ch );
-		$http_code  = (int) curl_getinfo( $ch, CURLINFO_HTTP_CODE );
-		curl_close( $ch );
-
-		if ( $stream_aborted ) {
+		if ( $transport['stream_aborted'] ) {
 			return array(
 				'__pressark_cancelled' => true,
 				'usage'                => $accumulated['usage'],
@@ -280,18 +281,25 @@ class PressArk_Stream_Connector {
 			);
 		}
 
-		if ( ! empty( $curl_error ) ) {
-			if ( str_contains( $curl_error, 'timed out' ) || str_contains( $curl_error, 'Operation timed out' ) ) {
+		$response    = $transport['response'];
+		$has_content = ! empty( $accumulated['content'] );
+
+		if ( is_wp_error( $response ) ) {
+			$http_error = $response->get_error_message();
+			if ( $has_content ) {
+				$http_error = '';
+			} elseif ( str_contains( $http_error, 'timed out' ) || str_contains( $http_error, 'Operation timed out' ) ) {
 				return array( 'error' => 'The AI provider took too long to respond. Try again or simplify your request.' );
+			} elseif ( '' !== $http_error ) {
+				return array( 'error' => 'Connection error: ' . $http_error );
 			}
-			return array( 'error' => 'Connection error: ' . $curl_error );
 		}
 
-		if ( $http_code !== 200 && empty( $accumulated['content'] ) ) {
+		$http_code = is_wp_error( $response ) ? 0 : (int) wp_remote_retrieve_response_code( $response );
+		if ( 200 !== $http_code && empty( $accumulated['content'] ) ) {
 			return array( 'error' => sprintf( 'API error (%d): Streaming request failed.', $http_code ) );
 		}
 
-		// Reconstruct into the standard Anthropic response shape.
 		return array(
 			'id'          => 'stream_' . wp_generate_uuid4(),
 			'type'        => 'message',
@@ -308,7 +316,7 @@ class PressArk_Stream_Connector {
 	 *
 	 * The bank holds the real API key, reserves credits, forwards to the
 	 * provider, and streams SSE events back. The SSE format is identical
-	 * to a direct OpenRouter call — parse_openai_chunk() handles it.
+	 * to a direct OpenRouter call, so parse_openai_chunk() handles it.
 	 *
 	 * @since 5.0.0
 	 * @return array Accumulated raw response in the same shape as a non-streaming call.
@@ -316,47 +324,41 @@ class PressArk_Stream_Connector {
 	private function stream_via_bank( array $messages, array $tools, string $system_prompt ): array {
 		$provider = $this->ai->get_provider();
 
-		// Build the provider-format request body using the same fresh runtime
-		// contract as the direct transport path.
 		$request = $this->ai->prepare_streaming_request( $messages, $tools, $system_prompt );
 
-		$request['body']['stream']        = true;
+		$request['body']['stream']         = true;
 		$request['body']['stream_options'] = array( 'include_usage' => true );
 
-		$bank_url    = defined( 'PRESSARK_TOKEN_BANK_URL' )
+		$bank_url = defined( 'PRESSARK_TOKEN_BANK_URL' )
 			? PRESSARK_TOKEN_BANK_URL
 			: get_option( 'pressark_token_bank_url', 'https://tokens.pressark.com' );
 
-		// Ensure we have a site_token before streaming.
-		// IMPORTANT: Read site_token AFTER handshake — on fresh installs the token
-		// is empty until handshake completes, so reading before would send an empty
-		// header causing a 401 "Bank proxy error (HTTP 401)" from the bank.
 		$bank = new PressArk_Token_Bank();
 		$bank->ensure_handshaked();
-		$site_token  = (string) get_option( 'pressark_site_token', '' );
+		$site_token = (string) get_option( 'pressark_site_token', '' );
 
-		// v5.2.0: Return error if no token available (prevents 401 from bank).
 		if ( '' === $site_token ) {
-			return array( 'error' => 'PressArk is still setting up your account. This usually takes a few seconds — please try again.' );
+			return array( 'error' => 'PressArk is still setting up your account. This usually takes a few seconds. Please try again.' );
 		}
 
 		$tier  = method_exists( $this->ai, 'get_tier' ) ? $this->ai->get_tier() : 'free';
 		$model = $this->ai->get_model();
 
-		$proxy_body = wp_json_encode( array(
-			'site_domain'       => PressArk_Token_Bank::current_site_identity(),
-			'installation_uuid' => PressArk_Token_Bank::ensure_installation_uuid(),
-			'user_id'           => get_current_user_id(),
-			'tier'              => $tier,
-			'model'             => $model,
-			'provider'          => $provider,
-			'stream'            => true,
-			'estimated_icus'    => 5000,
-			'icu_budget'        => PressArk_Entitlements::icu_budget( $tier ),
-			'request_body'      => $request['body'],
-		) );
+		$proxy_body = (string) wp_json_encode(
+			array(
+				'site_domain'       => PressArk_Token_Bank::current_site_identity(),
+				'installation_uuid' => PressArk_Token_Bank::ensure_installation_uuid(),
+				'user_id'           => get_current_user_id(),
+				'tier'              => $tier,
+				'model'             => $model,
+				'provider'          => $provider,
+				'stream'            => true,
+				'estimated_icus'    => 5000,
+				'icu_budget'        => PressArk_Entitlements::icu_budget( $tier ),
+				'request_body'      => $request['body'],
+			)
+		);
 
-		// Accumulated state — same shape as stream_openai().
 		$accumulated = array(
 			'content'       => '',
 			'tool_calls'    => array(),
@@ -365,61 +367,59 @@ class PressArk_Stream_Connector {
 			'model'         => $model,
 		);
 
-		$line_buffer    = '';
-		$error_buffer   = '';
-		$stream_aborted = false;
+		$line_buffer   = '';
+		$error_buffer  = '';
+		$consume_chunk = function ( string $data ) use ( &$accumulated, &$line_buffer, &$error_buffer ): void {
+			if ( strlen( $error_buffer ) < 16384 ) {
+				$remaining     = 16384 - strlen( $error_buffer );
+				$error_buffer .= substr( $data, 0, $remaining );
+			}
 
-		$ch = curl_init( trailingslashit( $bank_url ) . 'v1/chat' );
-		curl_setopt_array( $ch, array(
-			CURLOPT_POST           => true,
-			CURLOPT_HTTPHEADER     => array(
+			$this->consume_sse_chunk(
+				$data,
+				$line_buffer,
+				function ( string $line ) use ( &$accumulated ): void {
+					if ( ! str_starts_with( $line, 'data: ' ) ) {
+						return;
+					}
+
+					$payload = substr( $line, 6 );
+					if ( '[DONE]' === $payload ) {
+						return;
+					}
+
+					$this->parse_openai_chunk( $payload, $accumulated );
+				}
+			);
+		};
+
+		$transport = $this->perform_streaming_http_request(
+			trailingslashit( $bank_url ) . 'v1/chat',
+			array(
 				'Content-Type: application/json',
 				'x-pressark-token: ' . $site_token,
 			),
-			CURLOPT_POSTFIELDS     => $proxy_body,
-			CURLOPT_RETURNTRANSFER => false,
-			CURLOPT_TIMEOUT        => 120,
-			CURLOPT_WRITEFUNCTION  => function ( $ch, $data ) use ( &$accumulated, &$line_buffer, &$error_buffer, &$stream_aborted ) {
-				if ( connection_aborted() || ! $this->emitter->is_connected() || $this->cancellation_requested() ) {
-					$stream_aborted = true;
-					return 0;
+			$proxy_body,
+			$consume_chunk
+		);
+
+		$this->flush_sse_buffer(
+			$line_buffer,
+			function ( string $line ) use ( &$accumulated ): void {
+				if ( ! str_starts_with( $line, 'data: ' ) ) {
+					return;
 				}
 
-				if ( strlen( $error_buffer ) < 16384 ) {
-					$remaining     = 16384 - strlen( $error_buffer );
-					$error_buffer .= substr( $data, 0, $remaining );
+				$payload = substr( $line, 6 );
+				if ( '[DONE]' === $payload ) {
+					return;
 				}
 
-				$line_buffer .= $data;
-				$lines = explode( "\n", $line_buffer );
-				$line_buffer = array_pop( $lines );
+				$this->parse_openai_chunk( $payload, $accumulated );
+			}
+		);
 
-				foreach ( $lines as $line ) {
-					$line = trim( $line );
-					if ( '' === $line ) {
-						continue;
-					}
-					if ( str_starts_with( $line, 'data: ' ) ) {
-						$payload = substr( $line, 6 );
-						if ( '[DONE]' === $payload ) {
-							continue;
-						}
-						$this->parse_openai_chunk( $payload, $accumulated );
-					}
-				}
-
-				return strlen( $data );
-			},
-		) );
-
-		$this->apply_wp_proxy( $ch );
-
-		curl_exec( $ch );
-		$curl_error = curl_error( $ch );
-		$http_code  = (int) curl_getinfo( $ch, CURLINFO_HTTP_CODE );
-		curl_close( $ch );
-
-		if ( $stream_aborted ) {
+		if ( $transport['stream_aborted'] ) {
 			return array(
 				'__pressark_cancelled' => true,
 				'usage'                => $accumulated['usage'],
@@ -427,25 +427,26 @@ class PressArk_Stream_Connector {
 			);
 		}
 
-		if ( ! empty( $curl_error ) ) {
-			// OpenSSL 3.x reports "unexpected eof" when the server closes the
-			// connection after streaming completes. If we already accumulated
-			// content, the stream succeeded — ignore the benign SSL EOF.
-			$has_content = ! empty( $accumulated['content'] ) || ! empty( $accumulated['tool_calls'] );
+		$response    = $transport['response'];
+		$has_content = ! empty( $accumulated['content'] ) || ! empty( $accumulated['tool_calls'] );
+
+		if ( is_wp_error( $response ) ) {
+			$http_error = $response->get_error_message();
 			if ( $has_content ) {
-				// Stream completed despite the SSL EOF — proceed normally.
-			} elseif ( str_contains( $curl_error, 'timed out' ) || str_contains( $curl_error, 'Operation timed out' ) ) {
+				$http_error = '';
+			} elseif ( str_contains( $http_error, 'timed out' ) || str_contains( $http_error, 'Operation timed out' ) ) {
 				return array( 'error' => 'The AI provider took too long to respond. Try again or simplify your request.' );
-			} else {
-				return array( 'error' => 'Bank proxy connection error: ' . $curl_error );
+			} elseif ( '' !== $http_error ) {
+				return array( 'error' => 'Bank proxy connection error: ' . $http_error );
 			}
 		}
 
-		// Non-200 with no streamed content = bank returned a JSON error.
+		$http_code = is_wp_error( $response ) ? 0 : (int) wp_remote_retrieve_response_code( $response );
+
 		if ( 200 !== $http_code && empty( $accumulated['content'] ) && empty( $accumulated['tool_calls'] ) ) {
 			$error_body = trim( $error_buffer );
 			if ( '' === $error_body ) {
-				$error_body = trim( $line_buffer );
+				$error_body = is_wp_error( $response ) ? trim( $line_buffer ) : trim( (string) wp_remote_retrieve_body( $response ) );
 			}
 
 			$decoded_error = json_decode( $error_body, true );
@@ -477,7 +478,6 @@ class PressArk_Stream_Connector {
 			return array( 'error' => sprintf( 'Bank proxy error (HTTP %d): Streaming request failed.', $http_code ) );
 		}
 
-		// Reconstruct into the standard OpenAI response shape.
 		$message = array(
 			'role'    => 'assistant',
 			'content' => $accumulated['content'] ?: null,
@@ -502,6 +502,154 @@ class PressArk_Stream_Connector {
 	}
 
 	/**
+	 * Execute a streaming HTTP request via the WordPress HTTP API.
+	 *
+	 * When the cURL transport is active, attach a write callback through
+	 * http_api_curl so SSE chunks can be consumed progressively. If another
+	 * transport is selected, fall back to parsing the buffered response body.
+	 *
+	 * @param string   $endpoint      Request endpoint.
+	 * @param array    $headers       Header lines or key/value pairs.
+	 * @param string   $body          JSON request body.
+	 * @param callable $consume_chunk Callback that processes raw response chunks.
+	 * @return array{response:array|\WP_Error,used_curl_transport:bool,stream_aborted:bool}
+	 */
+	private function perform_streaming_http_request( string $endpoint, array $headers, string $body, callable $consume_chunk ): array {
+		$used_curl_transport = false;
+		$stream_aborted      = false;
+
+		$configure_curl = function ( $handle, array $parsed_args, string $url = '' ) use ( $endpoint, $consume_chunk, &$used_curl_transport, &$stream_aborted ): void {
+			unset( $parsed_args );
+
+			if ( $endpoint !== $url ) {
+				return;
+			}
+
+			$used_curl_transport = true;
+
+			// phpcs:ignore WordPress.WP.AlternativeFunctions.curl_curl_setopt -- The WordPress HTTP API only exposes progressive SSE callbacks through http_api_curl.
+			curl_setopt(
+				$handle,
+				CURLOPT_WRITEFUNCTION,
+				function ( $curl_handle, $data ) use ( $consume_chunk, &$stream_aborted ) {
+					unset( $curl_handle );
+
+					$data = (string) $data;
+
+					if ( connection_aborted() || ! $this->emitter->is_connected() || $this->cancellation_requested() ) {
+						$stream_aborted = true;
+						return 0;
+					}
+
+					$consume_chunk( $data );
+					return strlen( $data );
+				}
+			);
+		};
+
+		add_action( 'http_api_curl', $configure_curl, 10, 3 );
+
+		try {
+			$response = wp_remote_post(
+				$endpoint,
+				array(
+					'headers'     => $this->build_wp_remote_headers( $headers ),
+					'body'        => $body,
+					'timeout'     => 120,
+					'httpversion' => '1.1',
+					'redirection' => 0,
+					'blocking'    => true,
+				)
+			);
+		} finally {
+			remove_action( 'http_api_curl', $configure_curl, 10 );
+		}
+
+		if ( ! is_wp_error( $response ) && ! $used_curl_transport ) {
+			$fallback_body = (string) wp_remote_retrieve_body( $response );
+			if ( '' !== $fallback_body ) {
+				$consume_chunk( $fallback_body );
+			}
+		}
+
+		return array(
+			'response'            => $response,
+			'used_curl_transport' => $used_curl_transport,
+			'stream_aborted'      => $stream_aborted,
+		);
+	}
+
+	/**
+	 * Normalize headers for wp_remote_post().
+	 *
+	 * @param array $headers Header lines or key/value pairs.
+	 * @return array<string,string>
+	 */
+	private function build_wp_remote_headers( array $headers ): array {
+		$normalized = array();
+
+		foreach ( $headers as $key => $value ) {
+			if ( is_string( $key ) && '' !== trim( $key ) ) {
+				$normalized[ trim( $key ) ] = trim( (string) $value );
+				continue;
+			}
+
+			if ( ! is_string( $value ) || false === strpos( $value, ':' ) ) {
+				continue;
+			}
+
+			$parts       = explode( ':', $value, 2 );
+			$header_name = trim( (string) ( $parts[0] ?? '' ) );
+			$header_body = trim( (string) ( $parts[1] ?? '' ) );
+
+			if ( '' === $header_name ) {
+				continue;
+			}
+
+			$normalized[ $header_name ] = $header_body;
+		}
+
+		return $normalized;
+	}
+
+	/**
+	 * Consume raw SSE bytes, emitting complete logical lines.
+	 *
+	 * @param string   $data         Raw response chunk.
+	 * @param string   $line_buffer  Trailing partial line buffer.
+	 * @param callable $line_handler Callback for complete lines.
+	 */
+	private function consume_sse_chunk( string $data, string &$line_buffer, callable $line_handler ): void {
+		$line_buffer .= $data;
+		$lines        = explode( "\n", $line_buffer );
+		$line_buffer  = (string) array_pop( $lines );
+
+		foreach ( $lines as $line ) {
+			$line = trim( $line );
+			if ( '' === $line ) {
+				continue;
+			}
+
+			$line_handler( $line );
+		}
+	}
+
+	/**
+	 * Flush any buffered SSE line after the transport completes.
+	 *
+	 * @param string   $line_buffer  Trailing partial line buffer.
+	 * @param callable $line_handler Callback for complete lines.
+	 */
+	private function flush_sse_buffer( string &$line_buffer, callable $line_handler ): void {
+		$line = trim( $line_buffer );
+		if ( '' !== $line ) {
+			$line_handler( $line );
+		}
+
+		$line_buffer = '';
+	}
+
+	/**
 	 * Parse an OpenAI SSE chunk and emit tokens.
 	 *
 	 * OpenAI streaming format:
@@ -514,25 +662,22 @@ class PressArk_Stream_Connector {
 			return;
 		}
 
-		// Usage info (sent with stream_options.include_usage).
 		if ( isset( $chunk['usage'] ) ) {
 			$accumulated['usage'] = $chunk['usage'];
 		}
 
-		$delta = $chunk['choices'][0]['delta'] ?? array();
+		$delta  = $chunk['choices'][0]['delta'] ?? array();
 		$finish = $chunk['choices'][0]['finish_reason'] ?? null;
 
 		if ( null !== $finish ) {
 			$accumulated['finish_reason'] = $finish;
 		}
 
-		// Text content delta.
 		if ( isset( $delta['content'] ) && '' !== $delta['content'] ) {
 			$accumulated['content'] .= $delta['content'];
 			$this->emitter->emit( 'token', array( 'text' => $delta['content'] ) );
 		}
 
-		// Tool call deltas — accumulate incrementally.
 		if ( ! empty( $delta['tool_calls'] ) ) {
 			foreach ( $delta['tool_calls'] as $tc_delta ) {
 				$idx = $tc_delta['index'] ?? 0;
@@ -565,11 +710,11 @@ class PressArk_Stream_Connector {
 	 * Parse an Anthropic SSE event and emit tokens.
 	 *
 	 * Anthropic streaming format:
-	 *   event: content_block_start → new text or tool_use block
-	 *   event: content_block_delta → incremental text or tool input
-	 *   event: content_block_stop  → block finished
-	 *   event: message_delta       → stop_reason, usage
-	 *   event: message_start       → initial usage
+	 *   event: content_block_start -> new text or tool_use block
+	 *   event: content_block_delta -> incremental text or tool input
+	 *   event: content_block_stop  -> block finished
+	 *   event: message_delta       -> stop_reason, usage
+	 *   event: message_start       -> initial usage
 	 */
 	private function parse_anthropic_chunk( string $event_type, string $payload, array &$accumulated ): void {
 		$data = json_decode( $payload, true );
@@ -598,11 +743,11 @@ class PressArk_Stream_Connector {
 					);
 				} elseif ( 'tool_use' === ( $block['type'] ?? '' ) ) {
 					$accumulated['content'][ $index ] = array(
-						'type'  => 'tool_use',
-						'id'    => $block['id'] ?? '',
-						'name'  => $block['name'] ?? '',
-						'input' => array(),
-						'_input_json' => '', // Accumulate raw JSON string.
+						'type'        => 'tool_use',
+						'id'          => $block['id'] ?? '',
+						'name'        => $block['name'] ?? '',
+						'input'       => array(),
+						'_input_json' => '',
 					);
 				}
 				break;
@@ -627,8 +772,8 @@ class PressArk_Stream_Connector {
 
 			case 'content_block_stop':
 				$index = $data['index'] ?? 0;
-				// Finalize tool_use input from accumulated JSON.
-				if ( isset( $accumulated['content'][ $index ] )
+				if (
+					isset( $accumulated['content'][ $index ] )
 					&& 'tool_use' === $accumulated['content'][ $index ]['type']
 					&& ! empty( $accumulated['content'][ $index ]['_input_json'] )
 				) {
@@ -638,7 +783,7 @@ class PressArk_Stream_Connector {
 					}
 					unset( $accumulated['content'][ $index ]['_input_json'] );
 				}
-				// Clean up _input_json for text blocks.
+
 				if ( isset( $accumulated['content'][ $index ]['_input_json'] ) ) {
 					unset( $accumulated['content'][ $index ]['_input_json'] );
 				}
@@ -657,30 +802,6 @@ class PressArk_Stream_Connector {
 	}
 
 	/**
-	 * Apply WordPress proxy configuration to a cURL handle.
-	 *
-	 * Raw cURL bypasses WP_Http, so WP_PROXY_* constants must be
-	 * forwarded manually — matches wp-includes/Requests/Transport/cURL.php.
-	 */
-	private function apply_wp_proxy( $ch ): void {
-		if ( defined( 'WP_PROXY_HOST' ) && WP_PROXY_HOST ) {
-			$proxy = WP_PROXY_HOST;
-			if ( defined( 'WP_PROXY_PORT' ) && WP_PROXY_PORT ) {
-				$proxy .= ':' . WP_PROXY_PORT;
-			}
-			curl_setopt( $ch, CURLOPT_PROXY, $proxy );
-
-			if ( defined( 'WP_PROXY_USERNAME' ) && WP_PROXY_USERNAME ) {
-				$proxy_auth = WP_PROXY_USERNAME;
-				if ( defined( 'WP_PROXY_PASSWORD' ) && WP_PROXY_PASSWORD ) {
-					$proxy_auth .= ':' . WP_PROXY_PASSWORD;
-				}
-				curl_setopt( $ch, CURLOPT_PROXYUSERPWD, $proxy_auth );
-			}
-		}
-	}
-
-	/**
 	 * Extract cache metrics from a raw streamed response.
 	 */
 	private function extract_cache_metrics( array $raw, string $provider ): array {
@@ -693,7 +814,6 @@ class PressArk_Stream_Connector {
 			);
 		}
 
-		// OpenAI / OpenRouter.
 		$details = $usage['prompt_tokens_details'] ?? array();
 
 		return array(

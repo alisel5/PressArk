@@ -275,6 +275,7 @@ class PressArk_Preflight {
 			if ( in_array( $key, $dangerous_keys, true ) ) {
 				return self::block(
 					sprintf(
+						/* translators: %s: Elementor meta key. */
 						__( 'Cannot write raw "%s" meta — this would bypass Elementor\'s internal consistency checks and may corrupt the page.', 'pressark' ),
 						$key
 					),
@@ -339,10 +340,12 @@ class PressArk_Preflight {
 			$target_tool,
 			$new_params,
 			sprintf(
+				/* translators: %s: WooCommerce post type slug. */
 				__( 'This is a WooCommerce %s. Using edit_content would bypass WooCommerce hooks, breaking price lookups and stock caches.', 'pressark' ),
 				$post_type
 			),
 			sprintf(
+				/* translators: %s: Safe WooCommerce tool name. */
 				__( 'Rerouted to %s which maintains all WooCommerce state sync.', 'pressark' ),
 				$target_tool
 			)
@@ -429,10 +432,12 @@ class PressArk_Preflight {
 					$target_tool,
 					$new_params,
 					sprintf(
+						/* translators: %s: WooCommerce product meta key. */
 						__( 'Cannot update "%s" via raw meta on a WooCommerce product — it bypasses WC\'s price lookup tables, stock caches, and inventory hooks.', 'pressark' ),
 						$key
 					),
 					sprintf(
+						/* translators: %s: Safe WooCommerce tool name. */
 						__( 'Rerouted to %s which keeps all WooCommerce state in sync.', 'pressark' ),
 						$target_tool
 					)
@@ -469,10 +474,12 @@ class PressArk_Preflight {
 
 			return self::block(
 				sprintf(
+					/* translators: %s: Tool name. */
 					__( '"%s" requires a block (FSE) theme but this site uses a classic theme.', 'pressark' ),
 					$tool
 				),
 				sprintf(
+					/* translators: %s: Recommended tool name for classic themes. */
 					__( 'Use %s instead for classic theme design settings.', 'pressark' ),
 					$hint_tool
 				)
@@ -482,6 +489,7 @@ class PressArk_Preflight {
 		if ( in_array( $tool, $classic_only_tools, true ) && $is_block_theme ) {
 			return self::block(
 				sprintf(
+					/* translators: %s: Tool name. */
 					__( '"%s" is for classic themes but this site uses a block (FSE) theme.', 'pressark' ),
 					$tool
 				),

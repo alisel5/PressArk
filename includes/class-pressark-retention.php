@@ -108,6 +108,7 @@ class PressArk_Retention {
 		$cutoff = gmdate( 'Y-m-d H:i:s', time() - ( $days * DAY_IN_SECONDS ) );
 		$total  = 0;
 
+		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,PluginCheck.Security.DirectDB.UnescapedDBParameter,WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- Retention cleanup intentionally performs bounded batch deletes against an internal plugin-owned log table; table name is internal and caching is not relevant.
 		do {
 			$deleted = (int) $wpdb->query( $wpdb->prepare(
 				"DELETE FROM {$table} WHERE created_at < %s ORDER BY created_at ASC LIMIT %d",
@@ -116,6 +117,7 @@ class PressArk_Retention {
 			) );
 			$total += $deleted;
 		} while ( $deleted >= self::BATCH_SIZE );
+		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,PluginCheck.Security.DirectDB.UnescapedDBParameter,WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 
 		return $total;
 	}
@@ -135,6 +137,7 @@ class PressArk_Retention {
 		$cutoff = gmdate( 'Y-m-d H:i:s', time() - ( $days * DAY_IN_SECONDS ) );
 		$total  = 0;
 
+		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,PluginCheck.Security.DirectDB.UnescapedDBParameter,WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- Retention cleanup intentionally performs bounded batch deletes against an internal plugin-owned chats table; table name is internal and caching is not relevant.
 		do {
 			$deleted = (int) $wpdb->query( $wpdb->prepare(
 				"DELETE FROM {$table} WHERE updated_at < %s ORDER BY updated_at ASC LIMIT %d",
@@ -143,6 +146,7 @@ class PressArk_Retention {
 			) );
 			$total += $deleted;
 		} while ( $deleted >= self::BATCH_SIZE );
+		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,PluginCheck.Security.DirectDB.UnescapedDBParameter,WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 
 		return $total;
 	}
@@ -162,6 +166,7 @@ class PressArk_Retention {
 		$cutoff = gmdate( 'Y-m-d H:i:s', time() - ( $days * DAY_IN_SECONDS ) );
 		$total  = 0;
 
+		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,PluginCheck.Security.DirectDB.UnescapedDBParameter,WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- Retention cleanup intentionally performs bounded batch deletes against an internal plugin-owned cost ledger; table name is internal and caching is not relevant.
 		do {
 			$deleted = (int) $wpdb->query( $wpdb->prepare(
 				"DELETE FROM {$table}
@@ -174,6 +179,7 @@ class PressArk_Retention {
 			) );
 			$total += $deleted;
 		} while ( $deleted >= self::BATCH_SIZE );
+		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,PluginCheck.Security.DirectDB.UnescapedDBParameter,WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 
 		return $total;
 	}
@@ -199,6 +205,7 @@ class PressArk_Retention {
 		$cutoff = gmdate( 'Y-m-d H:i:s', time() - ( $days * DAY_IN_SECONDS ) );
 		$total  = 0;
 
+		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,PluginCheck.Security.DirectDB.UnescapedDBParameter,WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- Retention cleanup intentionally performs bounded batch deletes against an internal plugin-owned runs table; table name is internal and caching is not relevant.
 		do {
 			$deleted = (int) $wpdb->query( $wpdb->prepare(
 				"DELETE FROM {$table}
@@ -215,6 +222,7 @@ class PressArk_Retention {
 			) );
 			$total += $deleted;
 		} while ( $deleted >= self::BATCH_SIZE );
+		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,PluginCheck.Security.DirectDB.UnescapedDBParameter,WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 
 		return $total;
 	}
@@ -237,6 +245,7 @@ class PressArk_Retention {
 		$cutoff = gmdate( 'Y-m-d H:i:s', time() - ( $days * DAY_IN_SECONDS ) );
 		$total  = 0;
 
+		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,PluginCheck.Security.DirectDB.UnescapedDBParameter,WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- Retention cleanup intentionally performs bounded batch deletes against an internal plugin-owned tasks table; table name is internal and caching is not relevant.
 		do {
 			$deleted = (int) $wpdb->query( $wpdb->prepare(
 				"DELETE FROM {$table}
@@ -253,6 +262,7 @@ class PressArk_Retention {
 			) );
 			$total += $deleted;
 		} while ( $deleted >= self::BATCH_SIZE );
+		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,PluginCheck.Security.DirectDB.UnescapedDBParameter,WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 
 		return $total;
 	}
@@ -274,6 +284,7 @@ class PressArk_Retention {
 		$cutoff = gmdate( 'Y-m-d H:i:s', time() - ( $days * DAY_IN_SECONDS ) );
 		$total  = 0;
 
+		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,PluginCheck.Security.DirectDB.UnescapedDBParameter,WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- Retention cleanup intentionally performs bounded batch deletes against an internal plugin-owned automations table; table name is internal and caching is not relevant.
 		do {
 			$deleted = (int) $wpdb->query( $wpdb->prepare(
 				"DELETE FROM {$table}
@@ -286,6 +297,7 @@ class PressArk_Retention {
 			) );
 			$total += $deleted;
 		} while ( $deleted >= self::BATCH_SIZE );
+		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,PluginCheck.Security.DirectDB.UnescapedDBParameter,WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 
 		return $total;
 	}

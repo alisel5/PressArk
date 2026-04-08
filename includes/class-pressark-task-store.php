@@ -44,6 +44,96 @@ class PressArk_Task_Store {
 	}
 
 	/**
+	 * Get the task-store table name as a quoted SQL identifier.
+	 */
+	private static function table_sql(): string {
+		return '`' . str_replace( '`', '``', self::table_name() ) . '`';
+	}
+
+	/**
+	 * Read a single scalar from the internal task table without caching.
+	 *
+	 * Task state changes frequently, so inbox/activity reads should reflect the
+	 * current database row instead of a stale cache layer.
+	 *
+	 * @return mixed
+	 */
+	private function read_var( string $sql, array $args = array() ) {
+		global $wpdb;
+
+		// phpcs:disable WordPress.DB.PreparedSQL.NotPrepared -- Helper accepts only internal SQL templates and prepares placeholders before execution.
+		$query = empty( $args ) ? $sql : $wpdb->prepare( $sql, ...$args );
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,PluginCheck.Security.DirectDB.UnescapedDBParameter -- Internal task-store reads must reflect live state from the custom table.
+		$value = $wpdb->get_var( $query );
+		// phpcs:enable WordPress.DB.PreparedSQL.NotPrepared
+
+		return $value;
+	}
+
+	/**
+	 * Read rows from the internal task table without caching.
+	 *
+	 * @return array<int,array<string,mixed>>
+	 */
+	private function read_results( string $sql, array $args = array() ): array {
+		global $wpdb;
+
+		// phpcs:disable WordPress.DB.PreparedSQL.NotPrepared -- Helper accepts only internal SQL templates and prepares placeholders before execution.
+		$query = empty( $args ) ? $sql : $wpdb->prepare( $sql, ...$args );
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,PluginCheck.Security.DirectDB.UnescapedDBParameter -- Internal task-store reads must reflect live state from the custom table.
+		$rows = $wpdb->get_results( $query, ARRAY_A );
+		// phpcs:enable WordPress.DB.PreparedSQL.NotPrepared
+
+		return is_array( $rows ) ? $rows : array();
+	}
+
+	/**
+	 * Read a single row from the internal task table without caching.
+	 *
+	 * @return array<string,mixed>|null
+	 */
+	private function read_row( string $sql, array $args = array() ): ?array {
+		global $wpdb;
+
+		// phpcs:disable WordPress.DB.PreparedSQL.NotPrepared -- Helper accepts only internal SQL templates and prepares placeholders before execution.
+		$query = empty( $args ) ? $sql : $wpdb->prepare( $sql, ...$args );
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,PluginCheck.Security.DirectDB.UnescapedDBParameter -- Internal task-store reads must reflect live state from the custom table.
+		$row = $wpdb->get_row( $query, ARRAY_A );
+		// phpcs:enable WordPress.DB.PreparedSQL.NotPrepared
+
+		return is_array( $row ) ? $row : null;
+	}
+
+	/**
+	 * Run a prepared write query against the internal task table.
+	 *
+	 * @return int|false
+	 */
+	private function write_query( string $sql, array $args = array() ) {
+		global $wpdb;
+
+		// phpcs:disable WordPress.DB.PreparedSQL.NotPrepared -- Helper accepts only internal SQL templates and prepares placeholders before execution.
+		$query = empty( $args ) ? $sql : $wpdb->prepare( $sql, ...$args );
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,PluginCheck.Security.DirectDB.UnescapedDBParameter -- Internal task-store writes must execute immediately against the custom table for durable queue state.
+		$result = $wpdb->query( $query );
+		// phpcs:enable WordPress.DB.PreparedSQL.NotPrepared
+
+		return $result;
+	}
+
+	/**
+	 * Update internal task rows without caching.
+	 *
+	 * @return int|false
+	 */
+	private function update_task( array $data, array $where, array $formats, array $where_formats ) {
+		global $wpdb;
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- Internal task-store writes must execute immediately against the custom table for durable queue state.
+		return $wpdb->update( self::table_name(), $data, $where, $formats, $where_formats );
+	}
+
+	/**
 	 * DDL for dbDelta (called from pressark_activate and upgrade migration).
 	 *
 	 * v3.7.0: Added idempotency_key column.
@@ -226,23 +316,18 @@ class PressArk_Task_Store {
 	 * Find the active task currently holding an idempotency key.
 	 */
 	public function find_in_flight_by_idempotency_key( string $idempotency_key ): string {
-		global $wpdb;
-		$table = self::table_name();
-
 		$idempotency_key = sanitize_text_field( $idempotency_key );
 		if ( '' === $idempotency_key ) {
 			return '';
 		}
 
-		$existing = $wpdb->get_var(
-			$wpdb->prepare(
-				"SELECT task_id FROM {$table}
-				 WHERE idempotency_key = %s
-				   AND idempotency_active = 1
-				   AND status IN ('queued', 'running')
-				 LIMIT 1",
-				$idempotency_key
-			)
+		$existing = $this->read_var(
+			'SELECT task_id FROM ' . self::table_sql() . "
+			 WHERE idempotency_key = %s
+			   AND idempotency_active = 1
+			   AND status IN ('queued', 'running')
+			 LIMIT 1",
+			array( $idempotency_key )
 		);
 
 		return is_string( $existing ) ? $existing : '';
@@ -254,15 +339,9 @@ class PressArk_Task_Store {
 	 * @return array|null The task row, or null if not found.
 	 */
 	public function get( string $task_id ): ?array {
-		global $wpdb;
-		$table = self::table_name();
-
-		$row = $wpdb->get_row(
-			$wpdb->prepare(
-				"SELECT * FROM {$table} WHERE task_id = %s",
-				$task_id
-			),
-			ARRAY_A
+		$row = $this->read_row(
+			'SELECT * FROM ' . self::table_sql() . ' WHERE task_id = %s',
+			array( $task_id )
 		);
 
 		if ( ! $row ) {
@@ -280,10 +359,7 @@ class PressArk_Task_Store {
 	 * @return bool
 	 */
 	public function update_payload( string $task_id, array $payload ): bool {
-		global $wpdb;
-
-		$rows = $wpdb->update(
-			self::table_name(),
+		$rows = $this->update_task(
 			array( 'payload' => wp_json_encode( $payload ) ),
 			array( 'task_id' => $task_id ),
 			array( '%s' ),
@@ -304,10 +380,7 @@ class PressArk_Task_Store {
 	 * @return bool True if this caller won the race.
 	 */
 	public function claim( string $task_id ): bool {
-		global $wpdb;
-
-		$rows = $wpdb->update(
-			self::table_name(),
+		$rows = $this->update_task(
 			array(
 				'status'     => 'running',
 				'started_at' => current_time( 'mysql', true ),
@@ -330,14 +403,10 @@ class PressArk_Task_Store {
 	 * removes them, so we no longer stamp a short-lived expires_at here.
 	 */
 	public function complete( string $task_id, array $result ): bool {
-		global $wpdb;
-		$table = self::table_name();
-
 		$now = current_time( 'mysql', true );
 
-		$rows = $wpdb->query(
-			$wpdb->prepare(
-				"UPDATE {$table}
+		$rows = $this->write_query(
+			'UPDATE ' . self::table_sql() . "
 				 SET status = 'complete',
 				     result = %s,
 				     completed_at = %s,
@@ -345,10 +414,7 @@ class PressArk_Task_Store {
 				     idempotency_active = NULL
 				 WHERE task_id = %s
 				   AND status = 'running'",
-				wp_json_encode( $result ),
-				$now,
-				$task_id
-			)
+			array( wp_json_encode( $result ), $now, $task_id )
 		);
 
 		return $rows === 1;
@@ -358,13 +424,10 @@ class PressArk_Task_Store {
 	 * Mark task as failed with reason.
 	 */
 	public function fail( string $task_id, string $reason ): bool {
-		global $wpdb;
-		$table = self::table_name();
 		$now = current_time( 'mysql', true );
 
-		$rows = $wpdb->query(
-			$wpdb->prepare(
-				"UPDATE {$table}
+		$rows = $this->write_query(
+			'UPDATE ' . self::table_sql() . "
 				 SET status = 'failed',
 				     fail_reason = %s,
 				     completed_at = %s,
@@ -372,10 +435,7 @@ class PressArk_Task_Store {
 				     idempotency_active = NULL
 				 WHERE task_id = %s
 				   AND status = 'running'",
-				$reason,
-				$now,
-				$task_id
-			)
+			array( $reason, $now, $task_id )
 		);
 
 		return $rows >= 1;
@@ -385,12 +445,8 @@ class PressArk_Task_Store {
 	 * Retry a failed task: failed → queued, increment retries, clear state.
 	 */
 	public function retry( string $task_id ): bool {
-		global $wpdb;
-		$table = self::table_name();
-
-		$rows = $wpdb->query(
-			$wpdb->prepare(
-				"UPDATE {$table}
+		$rows = $this->write_query(
+			'UPDATE ' . self::table_sql() . "
 				 SET status      = 'queued',
 				     retries     = retries + 1,
 				     started_at  = NULL,
@@ -402,8 +458,7 @@ class PressArk_Task_Store {
 				     	ELSE 1
 				     END
 				 WHERE task_id = %s AND status = 'failed'",
-				$task_id
-			)
+			array( $task_id )
 		);
 
 		return $rows >= 1;
@@ -416,20 +471,15 @@ class PressArk_Task_Store {
 	 * to temporary contention, such as an unavailable concurrency slot.
 	 */
 	public function defer( string $task_id ): bool {
-		global $wpdb;
-		$table = self::table_name();
-
-		$rows = $wpdb->query(
-			$wpdb->prepare(
-				"UPDATE {$table}
+		$rows = $this->write_query(
+			'UPDATE ' . self::table_sql() . "
 				 SET status = 'queued',
 				     started_at = NULL,
 				     completed_at = NULL,
 				     fail_reason = NULL
 				 WHERE task_id = %s
 				   AND status = 'running'",
-				$task_id
-			)
+			array( $task_id )
 		);
 
 		return $rows >= 1;
@@ -439,10 +489,7 @@ class PressArk_Task_Store {
 	 * Mark a completed task as delivered (result picked up by heartbeat).
 	 */
 	public function deliver( string $task_id ): bool {
-		global $wpdb;
-
-		$rows = $wpdb->update(
-			self::table_name(),
+		$rows = $this->update_task(
 			array( 'status' => 'delivered' ),
 			array( 'task_id' => $task_id, 'status' => 'complete' ),
 			array( '%s' ),
@@ -465,20 +512,16 @@ class PressArk_Task_Store {
 	 * @return bool Whether the transition succeeded.
 	 */
 	public function dead_letter( string $task_id, string $reason = '' ): bool {
-		global $wpdb;
-		$table = self::table_name();
-
-		$rows = $wpdb->query( $wpdb->prepare(
-			"UPDATE {$table}
+		$rows = $this->write_query(
+			'UPDATE ' . self::table_sql() . "
 			 SET status      = 'dead_letter',
 			     fail_reason = CONCAT(COALESCE(fail_reason, ''), %s),
 			     expires_at  = DATE_ADD(UTC_TIMESTAMP(), INTERVAL 30 DAY),
 			     idempotency_active = NULL
 			 WHERE task_id = %s
 			 AND status IN ('failed', 'complete', 'undelivered')",
-			$reason ? ' [dead-letter: ' . $reason . ']' : '',
-			$task_id
-		) );
+			array( $reason ? ' [dead-letter: ' . $reason . ']' : '', $task_id )
+		);
 
 		return $rows >= 1;
 	}
@@ -498,19 +541,13 @@ class PressArk_Task_Store {
 	 * @return array Array of task rows with decoded result.
 	 */
 	public function get_pending_results( int $user_id ): array {
-		global $wpdb;
-		$table = self::table_name();
-
-		$rows = $wpdb->get_results(
-			$wpdb->prepare(
-				"SELECT * FROM {$table}
-				 WHERE user_id = %d
-				   AND status = 'complete'
-				   AND read_at IS NULL
-				 ORDER BY completed_at ASC",
-				$user_id
-			),
-			ARRAY_A
+		$rows = $this->read_results(
+			'SELECT * FROM ' . self::table_sql() . "
+			 WHERE user_id = %d
+			   AND status = 'complete'
+			   AND read_at IS NULL
+			 ORDER BY completed_at ASC",
+			array( $user_id )
 		);
 
 		if ( ! $rows ) {
@@ -527,13 +564,12 @@ class PressArk_Task_Store {
 	 * produced a deliverable result.
 	 */
 	public function pending_count( int $user_id ): int {
-		global $wpdb;
-		$table = self::table_name();
-
-		return (int) $wpdb->get_var( $wpdb->prepare(
-			"SELECT COUNT(*) FROM {$table} WHERE user_id = %d AND status IN ('queued', 'running')",
-			$user_id
-		) );
+		return (int) $this->read_var(
+			'SELECT COUNT(*) FROM ' . self::table_sql() . "
+			 WHERE user_id = %d
+			   AND status IN ('queued', 'running')",
+			array( $user_id )
+		);
 	}
 
 	/**
@@ -543,15 +579,19 @@ class PressArk_Task_Store {
 	 * @return array { status => count }
 	 */
 	public function status_counts( int $user_id = 0 ): array {
-		global $wpdb;
-		$table = self::table_name();
-
-		$where = $user_id ? $wpdb->prepare( 'WHERE user_id = %d', $user_id ) : '';
-
-		$rows = $wpdb->get_results(
-			"SELECT status, COUNT(*) as cnt FROM {$table} {$where} GROUP BY status",
-			ARRAY_A
-		);
+		if ( $user_id > 0 ) {
+			$rows = $this->read_results(
+				'SELECT status, COUNT(*) as cnt FROM ' . self::table_sql() . '
+				 WHERE user_id = %d
+				 GROUP BY status',
+				array( $user_id )
+			);
+		} else {
+			$rows = $this->read_results(
+				'SELECT status, COUNT(*) as cnt FROM ' . self::table_sql() . '
+				 GROUP BY status'
+			);
+		}
 
 		$counts = array();
 		foreach ( $rows ?: array() as $row ) {
@@ -572,14 +612,11 @@ class PressArk_Task_Store {
 	 * @return int Number of rows deleted.
 	 */
 	public function cleanup_expired(): int {
-		global $wpdb;
-		$table   = self::table_name();
 		$deleted = 0;
 
 		// v3.7.0: Escalate permanently failed tasks to dead_letter instead of deleting.
-		// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- $table is a hardcoded prefixed table name, all values are constants.
-		$wpdb->query(
-			"UPDATE {$table}
+		$this->write_query(
+			'UPDATE ' . self::table_sql() . "
 			 SET status     = 'dead_letter',
 			     expires_at = DATE_ADD(UTC_TIMESTAMP(), INTERVAL 30 DAY),
 			     idempotency_active = NULL
@@ -590,19 +627,18 @@ class PressArk_Task_Store {
 
 		// Mark unread complete tasks as 'undelivered' once the heartbeat
 		// handoff window has passed so they stay visible in Activity.
-		$wpdb->query( $wpdb->prepare(
-			"UPDATE {$table}
+		$this->write_query(
+			'UPDATE ' . self::table_sql() . "
 			 SET status = 'undelivered'
 			 WHERE status = 'complete'
 			 AND read_at IS NULL
 			 AND completed_at < DATE_SUB( UTC_TIMESTAMP(), INTERVAL %d HOUR )",
-			self::UNDELIVERED_HOURS
-		) );
+			array( self::UNDELIVERED_HOURS )
+		);
 
 		// v3.7.0: Clean up dead_letter tasks past their retention period.
-		// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- $table is a hardcoded prefixed table name, all values are constants.
-		$deleted += (int) $wpdb->query(
-			"DELETE FROM {$table}
+		$deleted += (int) $this->write_query(
+			'DELETE FROM ' . self::table_sql() . "
 			 WHERE status = 'dead_letter'
 			 AND expires_at < UTC_TIMESTAMP()"
 		);
@@ -624,16 +660,12 @@ class PressArk_Task_Store {
 	 * @return array|null The overdue task row, or null.
 	 */
 	public function find_oldest_overdue_queued(): ?array {
-		global $wpdb;
-		$table = self::table_name();
-
-		$row = $wpdb->get_row(
-			"SELECT * FROM {$table}
+		$row = $this->read_row(
+			'SELECT * FROM ' . self::table_sql() . "
 			 WHERE status = 'queued'
 			 AND created_at < DATE_SUB( UTC_TIMESTAMP(), INTERVAL 2 MINUTE )
 			 ORDER BY created_at ASC
-			 LIMIT 1",
-			ARRAY_A
+			 LIMIT 1"
 		);
 
 		return $row ? $this->decode_row( $row ) : null;
@@ -649,12 +681,10 @@ class PressArk_Task_Store {
 	 * @return int Number of rows affected.
 	 */
 	public function cleanup_stale(): int {
-		global $wpdb;
-		$table   = self::table_name();
 		$timeout = self::STALE_TIMEOUT_MINUTES;
 
-		$count = (int) $wpdb->query( $wpdb->prepare(
-			"UPDATE {$table}
+		$count = (int) $this->write_query(
+			'UPDATE ' . self::table_sql() . "
 			 SET status      = 'failed',
 			     fail_reason = %s,
 			     completed_at = UTC_TIMESTAMP(),
@@ -662,9 +692,11 @@ class PressArk_Task_Store {
 			     idempotency_active = NULL
 			 WHERE status = 'running'
 			 AND started_at < DATE_SUB( UTC_TIMESTAMP(), INTERVAL %d MINUTE )",
-			sprintf( 'Timed out after %d minutes (likely a dead process)', $timeout ),
-			$timeout
-		) );
+			array(
+				sprintf( 'Timed out after %d minutes (likely a dead process)', $timeout ),
+				$timeout,
+			)
+		);
 
 		if ( $count > 0 ) {
 			PressArk_Error_Tracker::warning( 'TaskStore', 'Cleaned up stale running tasks', array( 'count' => $count ) );
@@ -688,24 +720,20 @@ class PressArk_Task_Store {
 	 * @return int Count of unread results.
 	 */
 	public function unread_count( int $user_id = 0 ): int {
-		global $wpdb;
-		$table = self::table_name();
-
 		if ( $user_id > 0 ) {
-			return (int) $wpdb->get_var( $wpdb->prepare(
-				"SELECT COUNT(*) FROM {$table}
+			return (int) $this->read_var(
+				'SELECT COUNT(*) FROM ' . self::table_sql() . "
 				 WHERE user_id = %d
-				 AND status IN ('complete', 'undelivered', 'delivered')
-				 AND read_at IS NULL",
-				$user_id
-			) );
+				   AND status IN ('complete', 'undelivered', 'delivered')
+				   AND read_at IS NULL",
+				array( $user_id )
+			);
 		}
 
-		// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- $table is a hardcoded prefixed table name, statuses are constants.
-		return (int) $wpdb->get_var(
-			"SELECT COUNT(*) FROM {$table}
+		return (int) $this->read_var(
+			'SELECT COUNT(*) FROM ' . self::table_sql() . "
 			 WHERE status IN ('complete', 'undelivered', 'delivered')
-			 AND read_at IS NULL"
+			   AND read_at IS NULL"
 		);
 	}
 
@@ -717,10 +745,7 @@ class PressArk_Task_Store {
 	 * @return bool
 	 */
 	public function mark_read( string $task_id ): bool {
-		global $wpdb;
-
-		$rows = $wpdb->update(
-			self::table_name(),
+		$rows = $this->update_task(
 			array( 'read_at' => current_time( 'mysql', true ) ),
 			array( 'task_id' => $task_id ),
 			array( '%s' ),
@@ -743,38 +768,46 @@ class PressArk_Task_Store {
 	 * @return array
 	 */
 	public function get_activity( int $user_id = 0, int $limit = 25, int $offset = 0, string $status_filter = '' ): array {
-		global $wpdb;
-		$table = self::table_name();
+		$status_filter = sanitize_key( $status_filter );
+		$limit         = max( 1, min( 100, $limit ) );
+		$offset        = max( 0, $offset );
+		$select_sql    = 'SELECT task_id, user_id, message, status, retries, max_retries,
+			        fail_reason, created_at, started_at, completed_at, read_at
+			 FROM ' . self::table_sql();
 
-		$where = array();
-		$args  = array();
-
-		if ( $user_id > 0 ) {
-			$where[] = 'user_id = %d';
-			$args[]  = $user_id;
+		if ( $user_id > 0 && '' !== $status_filter ) {
+			$rows = $this->read_results(
+				$select_sql . "
+			 WHERE user_id = %d
+			   AND status = %s
+			 ORDER BY created_at DESC
+			 LIMIT %d OFFSET %d",
+				array( $user_id, $status_filter, $limit, $offset )
+			);
+		} elseif ( $user_id > 0 ) {
+			$rows = $this->read_results(
+				$select_sql . "
+			 WHERE user_id = %d
+			 ORDER BY created_at DESC
+			 LIMIT %d OFFSET %d",
+				array( $user_id, $limit, $offset )
+			);
+		} elseif ( '' !== $status_filter ) {
+			$rows = $this->read_results(
+				$select_sql . "
+			 WHERE status = %s
+			 ORDER BY created_at DESC
+			 LIMIT %d OFFSET %d",
+				array( $status_filter, $limit, $offset )
+			);
+		} else {
+			$rows = $this->read_results(
+				$select_sql . "
+			 ORDER BY created_at DESC
+			 LIMIT %d OFFSET %d",
+				array( $limit, $offset )
+			);
 		}
-
-		if ( '' !== $status_filter ) {
-			$where[] = 'status = %s';
-			$args[]  = sanitize_key( $status_filter );
-		}
-
-		$where_sql = ! empty( $where ) ? 'WHERE ' . implode( ' AND ', $where ) : '';
-		$args[]    = max( 1, min( 100, $limit ) );
-		$args[]    = max( 0, $offset );
-
-		$rows = $wpdb->get_results(
-			$wpdb->prepare(
-				"SELECT task_id, user_id, message, status, retries, max_retries,
-				        fail_reason, created_at, started_at, completed_at, read_at
-				 FROM {$table}
-				 {$where_sql}
-				 ORDER BY created_at DESC
-				 LIMIT %d OFFSET %d",
-				...$args
-			),
-			ARRAY_A
-		);
 
 		if ( ! $rows ) {
 			return array();
@@ -794,33 +827,35 @@ class PressArk_Task_Store {
 	 * @since 4.2.1
 	 */
 	public function count_activity( int $user_id = 0, string $status_filter = '' ): int {
-		global $wpdb;
-		$table = self::table_name();
+		$status_filter = sanitize_key( $status_filter );
+		$count_sql     = 'SELECT COUNT(*) FROM ' . self::table_sql();
 
-		$where = array();
-		$args  = array();
+		if ( $user_id > 0 && '' !== $status_filter ) {
+			return (int) $this->read_var(
+				$count_sql . '
+			 WHERE user_id = %d
+			   AND status = %s',
+				array( $user_id, $status_filter )
+			);
+		}
 
 		if ( $user_id > 0 ) {
-			$where[] = 'user_id = %d';
-			$args[]  = $user_id;
+			return (int) $this->read_var(
+				$count_sql . '
+			 WHERE user_id = %d',
+				array( $user_id )
+			);
 		}
 
 		if ( '' !== $status_filter ) {
-			$where[] = 'status = %s';
-			$args[]  = sanitize_key( $status_filter );
+			return (int) $this->read_var(
+				$count_sql . '
+			 WHERE status = %s',
+				array( $status_filter )
+			);
 		}
 
-		$where_sql = ! empty( $where ) ? 'WHERE ' . implode( ' AND ', $where ) : '';
-
-		if ( ! empty( $args ) ) {
-			return (int) $wpdb->get_var( $wpdb->prepare(
-				"SELECT COUNT(*) FROM {$table} {$where_sql}",
-				...$args
-			) );
-		}
-
-		// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- $table is a hardcoded prefixed table name, $where_sql built from hardcoded conditions.
-		return (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$table} {$where_sql}" );
+		return (int) $this->read_var( $count_sql );
 	}
 
 	/**
@@ -872,13 +907,10 @@ class PressArk_Task_Store {
 	 * @return bool Whether the receipt was saved.
 	 */
 	public function record_receipt( string $task_id, string $operation_key, string $summary = '' ): bool {
-		global $wpdb;
-		$table = self::table_name();
-
-		$row = $wpdb->get_row( $wpdb->prepare(
-			"SELECT payload FROM {$table} WHERE task_id = %s",
-			$task_id
-		), ARRAY_A );
+		$row = $this->read_row(
+			'SELECT payload FROM ' . self::table_sql() . ' WHERE task_id = %s',
+			array( $task_id )
+		);
 
 		if ( ! $row ) return false;
 
@@ -892,8 +924,7 @@ class PressArk_Task_Store {
 
 		$payload['_receipts'] = $receipts;
 
-		$rows = $wpdb->update(
-			$table,
+		$rows = $this->update_task(
 			array( 'payload' => wp_json_encode( $payload ) ),
 			array( 'task_id' => $task_id ),
 			array( '%s' ),
@@ -936,13 +967,10 @@ class PressArk_Task_Store {
 	 * Mark a queued task as failed before it ever reached a worker.
 	 */
 	public function fail_queued( string $task_id, string $reason ): bool {
-		global $wpdb;
-		$table = self::table_name();
 		$now   = current_time( 'mysql', true );
 
-		$rows = $wpdb->query(
-			$wpdb->prepare(
-				"UPDATE {$table}
+		$rows = $this->write_query(
+			'UPDATE ' . self::table_sql() . "
 				 SET status = 'failed',
 				     fail_reason = %s,
 				     completed_at = %s,
@@ -950,10 +978,7 @@ class PressArk_Task_Store {
 				     idempotency_active = NULL
 				 WHERE task_id = %s
 				   AND status = 'queued'",
-				$reason,
-				$now,
-				$task_id
-			)
+			array( $reason, $now, $task_id )
 		);
 
 		return $rows === 1;
@@ -967,6 +992,7 @@ class PressArk_Task_Store {
 	protected function insert_row( array $row, array $formats ): bool {
 		global $wpdb;
 
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery -- Internal task-store writes must execute immediately against the custom table for durable queue state.
 		return false !== $wpdb->insert( self::table_name(), $row, $formats );
 	}
 
@@ -974,9 +1000,6 @@ class PressArk_Task_Store {
 	 * Emit a concise insert failure log for support/debugging.
 	 */
 	public function get_progress_snapshots( array $task_ids ): array {
-		global $wpdb;
-		$table = self::table_name();
-
 		$task_ids = array_values(
 			array_filter(
 				array_map(
@@ -995,16 +1018,13 @@ class PressArk_Task_Store {
 			return array();
 		}
 
-		$rows = $wpdb->get_results(
-			$wpdb->prepare(
-				"SELECT task_id, run_id, parent_run_id, root_run_id, user_id, message, status,
-				        retries, max_retries, fail_reason, payload, handoff_capsule, result,
-				        created_at, started_at, completed_at
-				 FROM {$table}
-				 WHERE task_id IN (" . implode( ',', array_fill( 0, count( $task_ids ), '%s' ) ) . ')',
-				...$task_ids
-			),
-			ARRAY_A
+		$rows = $this->read_results(
+			'SELECT task_id, run_id, parent_run_id, root_run_id, user_id, message, status,
+			        retries, max_retries, fail_reason, payload, handoff_capsule, result,
+			        created_at, started_at, completed_at
+			 FROM ' . self::table_sql() . '
+			 WHERE task_id IN (' . implode( ',', array_fill( 0, count( $task_ids ), '%s' ) ) . ')',
+			$task_ids
 		);
 
 		if ( ! $rows ) {

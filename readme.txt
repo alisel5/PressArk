@@ -2,7 +2,7 @@
 Contributors: pressark
 Tags: ai, assistant, chat, woocommerce, content
 Requires at least: 6.0
-Tested up to: 6.8
+Tested up to: 6.9
 Requires PHP: 8.0
 Stable tag: 5.1.0
 License: GPLv2 or later

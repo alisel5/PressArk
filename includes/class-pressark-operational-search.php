@@ -153,24 +153,41 @@ class PressArk_Operational_Search {
 		global $wpdb;
 
 		$table = PressArk_Run_Store::table_name();
-		$where = array( "route <> 'handoff'" );
-		$args  = array();
+		$limit = max( 1, min( 400, $limit ) );
 
+		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- Operational search intentionally reads from internal run-store tables for bounded diagnostics; table name comes from the store abstraction and caching is not relevant to live search results.
 		if ( $user_id > 0 ) {
-			$where[] = 'user_id = %d';
-			$args[]  = $user_id;
+			$rows = $wpdb->get_results(
+				$wpdb->prepare(
+					"SELECT run_id, user_id, task_id, route, status, message, error_summary,
+						correlation_id, reservation_id, parent_run_id, root_run_id,
+						workflow_state, result, pending_actions, created_at, settled_at
+					FROM {$table}
+					WHERE route <> 'handoff'
+						AND user_id = %d
+					ORDER BY created_at DESC
+					LIMIT %d",
+					$user_id,
+					$limit
+				),
+				ARRAY_A
+			);
+		} else {
+			$rows = $wpdb->get_results(
+				$wpdb->prepare(
+					"SELECT run_id, user_id, task_id, route, status, message, error_summary,
+						correlation_id, reservation_id, parent_run_id, root_run_id,
+						workflow_state, result, pending_actions, created_at, settled_at
+					FROM {$table}
+					WHERE route <> 'handoff'
+					ORDER BY created_at DESC
+					LIMIT %d",
+					$limit
+				),
+				ARRAY_A
+			);
 		}
-
-		$args[] = max( 1, min( 400, $limit ) );
-		$sql    = "SELECT run_id, user_id, task_id, route, status, message, error_summary,
-				correlation_id, reservation_id, parent_run_id, root_run_id,
-				workflow_state, result, pending_actions, created_at, settled_at
-			FROM {$table}
-			WHERE " . implode( ' AND ', $where ) . '
-			ORDER BY created_at DESC
-			LIMIT %d';
-
-		$rows = $wpdb->get_results( $wpdb->prepare( $sql, ...$args ), ARRAY_A );
+		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 
 		return array_map(
 			function ( array $row ): array {
@@ -208,25 +225,39 @@ class PressArk_Operational_Search {
 		global $wpdb;
 
 		$table = PressArk_Task_Store::table_name();
-		$where = array();
-		$args  = array();
+		$limit = max( 1, min( 400, $limit ) );
 
+		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- Operational search intentionally reads from internal task-store tables for bounded diagnostics; table name comes from the store abstraction and caching is not relevant to live search results.
 		if ( $user_id > 0 ) {
-			$where[] = 'user_id = %d';
-			$args[]  = $user_id;
+			$rows = $wpdb->get_results(
+				$wpdb->prepare(
+					"SELECT task_id, run_id, parent_run_id, root_run_id, user_id, status, retries,
+						max_retries, message, fail_reason, payload, result, handoff_capsule,
+						created_at, started_at, completed_at
+					FROM {$table}
+					WHERE user_id = %d
+					ORDER BY created_at DESC
+					LIMIT %d",
+					$user_id,
+					$limit
+				),
+				ARRAY_A
+			);
+		} else {
+			$rows = $wpdb->get_results(
+				$wpdb->prepare(
+					"SELECT task_id, run_id, parent_run_id, root_run_id, user_id, status, retries,
+						max_retries, message, fail_reason, payload, result, handoff_capsule,
+						created_at, started_at, completed_at
+					FROM {$table}
+					ORDER BY created_at DESC
+					LIMIT %d",
+					$limit
+				),
+				ARRAY_A
+			);
 		}
-
-		$where_sql = ! empty( $where ) ? 'WHERE ' . implode( ' AND ', $where ) : '';
-		$args[]    = max( 1, min( 400, $limit ) );
-		$sql       = "SELECT task_id, run_id, parent_run_id, root_run_id, user_id, status, retries,
-				max_retries, message, fail_reason, payload, result, handoff_capsule,
-				created_at, started_at, completed_at
-			FROM {$table}
-			{$where_sql}
-			ORDER BY created_at DESC
-			LIMIT %d";
-
-		$rows = $wpdb->get_results( $wpdb->prepare( $sql, ...$args ), ARRAY_A );
+		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 
 		return array_map(
 			function ( array $row ): array {
@@ -253,31 +284,46 @@ class PressArk_Operational_Search {
 		$event_table = PressArk_Activity_Event_Store::table_name();
 		$run_table   = PressArk_Run_Store::table_name();
 		$task_table  = PressArk_Task_Store::table_name();
-		$where       = array();
-		$args        = array();
+		$limit       = max( 1, min( 500, $limit ) );
 
+		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- Operational search intentionally joins internal event/run/task store tables for bounded diagnostics; table names come from store abstractions and caching is not relevant to live search results.
 		if ( $user_id > 0 ) {
-			$where[] = "(
-				( e.run_id IS NOT NULL AND e.run_id <> '' AND r.user_id = %d )
-				OR
-				( e.task_id IS NOT NULL AND e.task_id <> '' AND t.user_id = %d )
-			)";
-			$args[]  = $user_id;
-			$args[]  = $user_id;
+			$rows = $wpdb->get_results(
+				$wpdb->prepare(
+					"SELECT e.event_id, e.run_id, e.task_id, e.event_type, e.reason, e.summary,
+						e.payload, e.created_at, COALESCE( r.user_id, t.user_id, 0 ) AS user_id
+					FROM {$event_table} e
+					LEFT JOIN {$run_table} r ON e.run_id = r.run_id
+					LEFT JOIN {$task_table} t ON e.task_id = t.task_id
+					WHERE (
+						( e.run_id IS NOT NULL AND e.run_id <> '' AND r.user_id = %d )
+						OR
+						( e.task_id IS NOT NULL AND e.task_id <> '' AND t.user_id = %d )
+					)
+					ORDER BY e.created_at DESC, e.id DESC
+					LIMIT %d",
+					$user_id,
+					$user_id,
+					$limit
+				),
+				ARRAY_A
+			);
+		} else {
+			$rows = $wpdb->get_results(
+				$wpdb->prepare(
+					"SELECT e.event_id, e.run_id, e.task_id, e.event_type, e.reason, e.summary,
+						e.payload, e.created_at, COALESCE( r.user_id, t.user_id, 0 ) AS user_id
+					FROM {$event_table} e
+					LEFT JOIN {$run_table} r ON e.run_id = r.run_id
+					LEFT JOIN {$task_table} t ON e.task_id = t.task_id
+					ORDER BY e.created_at DESC, e.id DESC
+					LIMIT %d",
+					$limit
+				),
+				ARRAY_A
+			);
 		}
-
-		$where_sql = ! empty( $where ) ? 'WHERE ' . implode( ' AND ', $where ) : '';
-		$args[]    = max( 1, min( 500, $limit ) );
-		$sql       = "SELECT e.event_id, e.run_id, e.task_id, e.event_type, e.reason, e.summary,
-				e.payload, e.created_at, COALESCE( r.user_id, t.user_id, 0 ) AS user_id
-			FROM {$event_table} e
-			LEFT JOIN {$run_table} r ON e.run_id = r.run_id
-			LEFT JOIN {$task_table} t ON e.task_id = t.task_id
-			{$where_sql}
-			ORDER BY e.created_at DESC, e.id DESC
-			LIMIT %d";
-
-		$rows = $wpdb->get_results( $wpdb->prepare( $sql, ...$args ), ARRAY_A );
+		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 
 		return array_map(
 			static function ( array $row ): array {
