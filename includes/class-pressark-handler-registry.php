@@ -48,7 +48,7 @@ class PressArk_Handler_Registry {
 		}
 	}
 
-	public function dispatch( PressArk_Operation $operation, array $params ): array {
+	public function dispatch( PressArk_Operation $operation, array $params, ?callable $on_progress = null ): array {
 		$handler = $this->get( $operation->handler );
 		$method  = $operation->method;
 
@@ -62,7 +62,47 @@ class PressArk_Handler_Registry {
 			);
 		}
 
+		$progress_callback = is_callable( $on_progress )
+			? $on_progress
+			: ( is_callable( $operation->on_progress ) ? $operation->on_progress : null );
+
+		if ( ! is_callable( $progress_callback ) ) {
+			return $handler->{$method}( $params );
+		}
+
+		try {
+			$reflection = new \ReflectionMethod( $handler, $method );
+			if ( $reflection->getNumberOfParameters() >= 2 ) {
+				return $handler->{$method}( $params, $progress_callback );
+			}
+		} catch ( \ReflectionException $e ) {
+			PressArk_Error_Tracker::warning(
+				'HandlerRegistry',
+				'Unable to inspect handler method for progress callback support',
+				array(
+					'handler' => $operation->handler,
+					'method'  => $method,
+					'error'   => $e->getMessage(),
+				)
+			);
+		}
+
 		return $handler->{$method}( $params );
+	}
+
+	public function check_permissions( PressArk_Operation $operation, array $params, array $context = array() ): array {
+		$handler = $this->get( $operation->handler );
+
+		if ( $handler instanceof PressArk_Handler_Base ) {
+			return $handler->check_permissions( $operation->name, $params, $context );
+		}
+
+		return array(
+			'allowed'   => true,
+			'behavior'  => 'allow',
+			'reason'    => '',
+			'ui_action' => 'none',
+		);
 	}
 
 	public function get( string $key ): object {

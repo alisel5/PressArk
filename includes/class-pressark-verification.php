@@ -177,7 +177,7 @@ class PressArk_Verification {
 	 * @param array $readback_result Read-back tool result.
 	 * @return array{passed: bool, evidence: string, mismatches: array}
 	 */
-	public static function evaluate( array $policy, array $write_args, array $readback_result ): array {
+	public static function evaluate( array $policy, array $write_args, array $readback_result, array $write_result = array() ): array {
 		$strategy     = $policy['strategy'] ?? 'none';
 		$check_fields = self::verification_check_fields( $policy, $write_args );
 		$mismatches   = array();
@@ -210,17 +210,18 @@ class PressArk_Verification {
 			$data = $readback_result['data'] ?? $readback_result;
 
 			foreach ( $check_fields as $field ) {
-				$expected = $write_args[ $field ] ?? $write_args['changes'][ $field ] ?? null;
+				$expected_meta = self::resolve_expected_verification_value( $field, $policy, $write_args, $write_result );
+				$expected      = $expected_meta['value'];
 				$actual   = $data[ $field ] ?? null;
 
 				// Skip fields not in the write intent (nothing to compare).
-				if ( null === $expected ) {
+				if ( empty( $expected_meta['found'] ) ) {
 					continue;
 				}
 
 				// Normalize for comparison.
-				$expected_normalized = is_scalar( $expected ) ? (string) $expected : wp_json_encode( $expected );
-				$actual_normalized   = is_scalar( $actual ) ? (string) $actual : wp_json_encode( $actual );
+				$expected_normalized = self::normalize_verification_value( $expected );
+				$actual_normalized   = self::normalize_verification_value( $actual );
 
 				if ( $expected_normalized !== $actual_normalized ) {
 					$mismatches[] = array(
@@ -309,8 +310,12 @@ class PressArk_Verification {
 			'name'           => 'name',
 			'status'         => 'status',
 			'post_status'    => 'status',
-			'regular_price'  => 'price',
+			'regular_price'  => 'regular_price',
+			'sale_price'     => 'sale_price',
 			'price'          => 'price',
+			'on_sale'        => 'on_sale',
+			'sale_from'      => 'sale_from',
+			'sale_to'        => 'sale_to',
 			'stock_quantity' => 'stock',
 			'stock_status'   => 'stock_status',
 			'type'           => 'type',
@@ -318,10 +323,16 @@ class PressArk_Verification {
 		);
 
 		foreach ( $evidence_fields as $source => $label ) {
-			if ( isset( $data[ $source ] ) && '' !== (string) $data[ $source ] ) {
-				$value = is_scalar( $data[ $source ] ) ? (string) $data[ $source ] : wp_json_encode( $data[ $source ] );
-				$parts[] = $label . '=' . self::truncate( $value, 40 );
+			if ( ! array_key_exists( $source, $data ) ) {
+				continue;
 			}
+
+			$value = self::normalize_verification_value( $data[ $source ] );
+			if ( '' === $value || '(null)' === $value ) {
+				continue;
+			}
+
+			$parts[] = $label . '=' . self::truncate( $value, 40 );
 		}
 
 		$id = absint( $data['id'] ?? $data['post_id'] ?? $data['order_id'] ?? $data['product_id'] ?? 0 );
@@ -358,6 +369,18 @@ class PressArk_Verification {
 			return $text;
 		}
 		return mb_substr( $text, 0, $max - 3 ) . '...';
+	}
+
+	private static function normalize_verification_value( $value ): string {
+		if ( is_bool( $value ) ) {
+			return $value ? 'true' : 'false';
+		}
+
+		if ( null === $value ) {
+			return '(null)';
+		}
+
+		return is_scalar( $value ) ? (string) $value : wp_json_encode( $value );
 	}
 
 	/**
@@ -413,7 +436,7 @@ class PressArk_Verification {
 	private static function verification_check_fields( array $policy, array $write_args ): array {
 		$declared = array_values( array_filter( array_map( 'strval', (array) ( $policy['check_fields'] ?? array() ) ) ) );
 		if ( ! empty( $declared ) ) {
-			return $declared;
+			return self::append_wc_pricing_verification_fields( $declared, $policy, $write_args );
 		}
 
 		$changes = is_array( $write_args['changes'] ?? null ) ? array_keys( $write_args['changes'] ) : array();
@@ -429,8 +452,9 @@ class PressArk_Verification {
 		$allowed = match ( $read_tool ) {
 			'get_product' => array(
 				'name', 'description', 'short_description', 'status', 'regular_price',
-				'sale_price', 'sku', 'manage_stock', 'stock_quantity', 'stock_status',
-				'featured', 'virtual', 'downloadable', 'weight',
+				'sale_price', 'price', 'on_sale', 'sale_from', 'sale_to', 'sku',
+				'manage_stock', 'stock_quantity', 'stock_status', 'featured',
+				'virtual', 'downloadable', 'weight',
 			),
 			'get_order' => array( 'status', 'customer_note', 'payment_method' ),
 			default => array(),
@@ -440,6 +464,94 @@ class PressArk_Verification {
 			return array();
 		}
 
-		return array_values( array_intersect( array_map( 'strval', $changes ), $allowed ) );
+		return self::append_wc_pricing_verification_fields(
+			array_values( array_intersect( array_map( 'strval', $changes ), $allowed ) ),
+			$policy,
+			$write_args
+		);
+	}
+
+	private static function resolve_expected_verification_value( string $field, array $policy, array $write_args, array $write_result ): array {
+		if ( self::should_compare_wc_pricing_state( $policy, $write_args ) ) {
+			$pricing_state = is_array( $write_result['pricing_state'] ?? null ) ? $write_result['pricing_state'] : array();
+			if ( in_array( $field, self::wc_pricing_verification_fields( $policy ), true ) && array_key_exists( $field, $pricing_state ) ) {
+				return array(
+					'found' => true,
+					'value' => $pricing_state[ $field ],
+				);
+			}
+		}
+
+		if ( array_key_exists( $field, $write_args ) ) {
+			return array(
+				'found' => true,
+				'value' => $write_args[ $field ],
+			);
+		}
+
+		$changes = is_array( $write_args['changes'] ?? null ) ? $write_args['changes'] : array();
+		if ( array_key_exists( $field, $changes ) ) {
+			return array(
+				'found' => true,
+				'value' => $changes[ $field ],
+			);
+		}
+
+		return array(
+			'found' => false,
+			'value' => null,
+		);
+	}
+
+	private static function append_wc_pricing_verification_fields( array $fields, array $policy, array $write_args ): array {
+		if ( ! self::should_compare_wc_pricing_state( $policy, $write_args ) ) {
+			return $fields;
+		}
+
+		foreach ( self::wc_pricing_verification_fields( $policy ) as $field ) {
+			if ( ! in_array( $field, $fields, true ) ) {
+				$fields[] = $field;
+			}
+		}
+
+		return $fields;
+	}
+
+	private static function should_compare_wc_pricing_state( array $policy, array $write_args ): bool {
+		return ! empty( $policy['computed_pricing_check'] ) && self::is_wc_price_affecting_write( $write_args );
+	}
+
+	private static function wc_pricing_verification_fields( array $policy ): array {
+		$fields = array_values( array_filter( array_map( 'strval', (array) ( $policy['pricing_state_fields'] ?? array() ) ) ) );
+		if ( ! empty( $fields ) ) {
+			return $fields;
+		}
+
+		return array( 'regular_price', 'sale_price', 'price', 'on_sale', 'sale_from', 'sale_to' );
+	}
+
+	private static function is_wc_price_affecting_write( array $write_args ): bool {
+		$pricing_keys = array( 'regular_price', 'sale_price', 'clear_sale', 'sale_from', 'sale_to', 'price_delta', 'price_adjust_pct' );
+		$candidates   = array();
+		$candidates[] = is_array( $write_args['changes'] ?? null ) ? $write_args['changes'] : $write_args;
+
+		$products = is_array( $write_args['products'] ?? null ) ? $write_args['products'] : array();
+		foreach ( $products as $product_args ) {
+			if ( ! is_array( $product_args ) ) {
+				continue;
+			}
+
+			$candidates[] = is_array( $product_args['changes'] ?? null ) ? $product_args['changes'] : $product_args;
+		}
+
+		foreach ( $candidates as $candidate ) {
+			foreach ( $pricing_keys as $key ) {
+				if ( array_key_exists( $key, $candidate ) ) {
+					return true;
+				}
+			}
+		}
+
+		return false;
 	}
 }

@@ -9,6 +9,8 @@ if ( ! defined( 'ABSPATH' ) ) {
  */
 class PressArk_Chat {
 
+	private const MAX_STREAM_PROGRESS_TOKENS = 10000;
+
 	public function __construct() {
 		add_action( 'rest_api_init', array( $this, 'register_routes' ) );
 	}
@@ -402,6 +404,120 @@ class PressArk_Chat {
 			),
 		) );
 
+		register_rest_route( 'pressark/v1', '/confirm-stream', array(
+			'methods'             => 'POST',
+			'callback'            => array( $this, 'handle_confirm_stream' ),
+			'permission_callback' => array( $this, 'check_permissions' ),
+			'args'                => array(
+				'run_id' => array(
+					'required'          => false,
+					'type'              => 'string',
+					'default'           => '',
+					'sanitize_callback' => 'sanitize_text_field',
+				),
+				'action_index' => array(
+					'required'          => false,
+					'type'              => 'integer',
+					'default'           => 0,
+					'sanitize_callback' => 'absint',
+				),
+				'confirmed' => array(
+					'required' => false,
+					'type'     => 'boolean',
+					'default'  => false,
+				),
+			),
+		) );
+
+		register_rest_route( 'pressark/v1', '/plan/execute', array(
+			'methods'             => 'POST',
+			'callback'            => array( $this, 'handle_plan_execute' ),
+			'permission_callback' => array( $this, 'check_permissions' ),
+			'args'                => array(
+				'run_id' => array(
+					'required'          => true,
+					'type'              => 'string',
+					'sanitize_callback' => 'sanitize_text_field',
+				),
+			),
+		) );
+
+		register_rest_route( 'pressark/v1', '/plan/execute-stream', array(
+			'methods'             => 'POST',
+			'callback'            => array( $this, 'handle_plan_execute_stream' ),
+			'permission_callback' => array( $this, 'check_permissions' ),
+			'args'                => array(
+				'run_id' => array(
+					'required'          => true,
+					'type'              => 'string',
+					'sanitize_callback' => 'sanitize_text_field',
+				),
+			),
+		) );
+
+		register_rest_route( 'pressark/v1', '/plan/approve', array(
+			'methods'             => 'POST',
+			'callback'            => array( $this, 'handle_plan_approve' ),
+			'permission_callback' => array( $this, 'check_permissions' ),
+			'args'                => array(
+				'run_id' => array(
+					'required'          => true,
+					'type'              => 'string',
+					'sanitize_callback' => 'sanitize_text_field',
+				),
+			),
+		) );
+
+		register_rest_route( 'pressark/v1', '/plan/approve-stream', array(
+			'methods'             => 'POST',
+			'callback'            => array( $this, 'handle_plan_approve_stream' ),
+			'permission_callback' => array( $this, 'check_permissions' ),
+			'args'                => array(
+				'run_id' => array(
+					'required'          => true,
+					'type'              => 'string',
+					'sanitize_callback' => 'sanitize_text_field',
+				),
+			),
+		) );
+
+		register_rest_route( 'pressark/v1', '/plan/revise', array(
+			'methods'             => 'POST',
+			'callback'            => array( $this, 'handle_plan_revise' ),
+			'permission_callback' => array( $this, 'check_permissions' ),
+			'args'                => array(
+				'run_id' => array(
+					'required'          => true,
+					'type'              => 'string',
+					'sanitize_callback' => 'sanitize_text_field',
+				),
+				'revision_note' => array(
+					'required'          => true,
+					'type'              => 'string',
+					'sanitize_callback' => 'sanitize_text_field',
+				),
+			),
+		) );
+
+		register_rest_route( 'pressark/v1', '/plan/reject', array(
+			'methods'             => 'POST',
+			'callback'            => array( $this, 'handle_plan_reject' ),
+			'permission_callback' => array( $this, 'check_permissions' ),
+			'args'                => array(
+				'run_id' => array(
+					'required'          => true,
+					'type'              => 'string',
+					'sanitize_callback' => 'sanitize_text_field',
+				),
+				'reason' => array(
+					'required'          => false,
+					'type'              => 'string',
+					'default'           => '',
+					'sanitize_callback' => 'sanitize_text_field',
+				),
+			),
+		) );
+
 		register_rest_route( 'pressark/v1', '/onboarded', array(
 			'methods'             => 'POST',
 			'callback'            => array( $this, 'handle_onboarded' ),
@@ -563,6 +679,410 @@ class PressArk_Chat {
 		}
 
 		return true;
+	}
+
+	private function ensure_plan_mode_loaded(): void {
+		if ( ! class_exists( 'PressArk_Plan_Mode' ) ) {
+			require_once __DIR__ . '/class-pressark-plan-mode.php';
+		}
+	}
+
+	private function is_plan_route( array $routing ): bool {
+		return PressArk_Router::ROUTE_PLAN === (string) ( $routing['route'] ?? '' );
+	}
+
+	private function decorate_plan_ready_result( array $result, array $ctx ): array {
+		$this->ensure_plan_mode_loaded();
+
+		$checkpoint = ! empty( $result['checkpoint'] ) && is_array( $result['checkpoint'] )
+			? PressArk_Checkpoint::from_array( $result['checkpoint'] )
+			: ( ! empty( $ctx['checkpoint_data'] ) && is_array( $ctx['checkpoint_data'] )
+				? PressArk_Checkpoint::from_array( $ctx['checkpoint_data'] )
+				: PressArk_Checkpoint::from_array( array() ) );
+
+		$artifact = class_exists( 'PressArk_Plan_Artifact' )
+			? PressArk_Plan_Artifact::ensure(
+				is_array( $result['plan_artifact'] ?? null ) ? (array) $result['plan_artifact'] : array(),
+				is_array( $result['plan_steps'] ?? null ) ? (array) $result['plan_steps'] : array(),
+				array(
+					'plan_markdown'   => (string) ( $result['plan_markdown'] ?? $result['message'] ?? '' ),
+					'approval_level'  => (string) ( $result['approval_level'] ?? 'hard' ),
+					'request_message' => (string) ( $ctx['message'] ?? $ctx['original_message'] ?? '' ),
+					'execute_message' => (string) ( $ctx['execution_message'] ?? $ctx['message'] ?? '' ),
+					'run_id'          => (string) ( $ctx['run_id'] ?? '' ),
+				)
+			)
+			: array();
+
+		if ( empty( $artifact ) && method_exists( $checkpoint, 'get_plan_artifact' ) ) {
+			$artifact = $checkpoint->get_plan_artifact();
+		}
+
+		$plan_markdown = ! empty( $artifact ) && class_exists( 'PressArk_Plan_Artifact' )
+			? PressArk_Plan_Artifact::to_markdown( $artifact )
+			: sanitize_textarea_field( (string) ( $result['plan_markdown'] ?? $result['message'] ?? '' ) );
+		$step_source   = ! empty( $artifact ) && class_exists( 'PressArk_Plan_Artifact' )
+			? PressArk_Plan_Artifact::to_plan_steps( $artifact )
+			: ( $result['plan_steps'] ?? $result['steps'] ?? array() );
+		$steps         = PressArk_Plan_Mode::extract_steps( $plan_markdown, is_array( $step_source ) ? $step_source : array() );
+		$approval_level = sanitize_key( (string) ( $artifact['approval_level'] ?? $result['approval_level'] ?? 'hard' ) );
+		if ( ! in_array( $approval_level, array( 'soft', 'hard' ), true ) ) {
+			$approval_level = 'hard';
+		}
+
+		if ( '' === trim( $plan_markdown ) && ! empty( $steps ) ) {
+			$lines = array();
+			foreach ( $steps as $index => $step ) {
+				$text = sanitize_text_field( (string) ( is_array( $step ) ? ( $step['text'] ?? '' ) : $step ) );
+				if ( '' !== $text ) {
+					$lines[] = sprintf( '%d. %s', $index + 1, $text );
+				}
+			}
+			$plan_markdown = implode( "\n", $lines );
+		}
+
+		if ( ! empty( $artifact ) && method_exists( $checkpoint, 'set_plan_artifact' ) ) {
+			$checkpoint->set_plan_artifact( $artifact );
+			if ( ! empty( $ctx['chat_id'] ) ) {
+				$checkpoint->touch();
+				$checkpoint->save( (int) $ctx['chat_id'], (int) ( $ctx['user_id'] ?? get_current_user_id() ) );
+			}
+		}
+
+		if ( 'hard' === $approval_level && ! empty( $ctx['run_id'] ) ) {
+			PressArk_Plan_Mode::enter(
+				(string) $ctx['run_id'],
+				(string) ( $ctx['original_message'] ?? $ctx['message'] ?? '' ),
+				array(
+					'conversation'   => is_array( $ctx['conversation'] ?? null ) ? $ctx['conversation'] : array(),
+					'screen'         => sanitize_text_field( (string) ( $ctx['screen'] ?? '' ) ),
+					'post_id'        => (int) ( $ctx['post_id'] ?? 0 ),
+					'deep_mode'      => ! empty( $ctx['deep_mode'] ),
+					'loaded_groups'  => is_array( $ctx['loaded_groups'] ?? null ) ? $ctx['loaded_groups'] : array(),
+					'checkpoint'     => $checkpoint->to_array(),
+					'chat_id'        => (int) ( $ctx['chat_id'] ?? 0 ),
+					'user_id'        => (int) ( $ctx['user_id'] ?? 0 ),
+					'correlation_id' => (string) ( $ctx['correlation_id'] ?? '' ),
+					'permission'     => is_array( $ctx['routing']['meta']['permission'] ?? null ) ? $ctx['routing']['meta']['permission'] : array(),
+					'approval_level' => $approval_level,
+					'planning_mode'  => (string) ( $result['planning_mode'] ?? $ctx['routing']['meta']['planning_mode'] ?? 'hard_plan' ),
+					'policy'         => is_array( $result['planning_decision'] ?? null )
+						? (array) $result['planning_decision']
+						: ( is_array( $ctx['routing']['meta']['planning_decision'] ?? null ) ? (array) $ctx['routing']['meta']['planning_decision'] : array() ),
+					'phase'          => (string) ( $result['plan_phase'] ?? 'planning' ),
+				)
+			);
+		}
+
+		$reply = sanitize_text_field(
+			(string) (
+				$result['reply']
+				?? (
+					! empty( $steps )
+						? sprintf(
+							/* translators: %d: number of checklist steps. */
+							__( 'Plan ready. Review the %d-step checklist below, then approve, revise, or cancel before execution continues.', 'pressark' ),
+							count( $steps )
+						)
+						: __( 'I need a narrower request before I can build a safe execution plan.', 'pressark' )
+				)
+			)
+		);
+		$plan_phase = sanitize_key( (string) ( $result['plan_phase'] ?? ( method_exists( $checkpoint, 'get_plan_phase' ) ? $checkpoint->get_plan_phase() : 'planning' ) ) );
+
+		$result['type']             = 'plan_ready';
+		$result['status']           = 'ready';
+		$result['permission_mode']  = 'hard' === $approval_level ? 'plan' : 'mixed';
+		$result['mode']             = 'hard' === $approval_level ? 'plan' : 'execute';
+		$result['reply']            = $reply;
+		$result['plan_markdown']    = $plan_markdown;
+		$result['plan_steps']       = $steps;
+		$result['steps']            = $steps;
+		$result['plan_artifact']    = $artifact;
+		$result['plan_phase']       = $plan_phase ?: 'planning';
+		$result['approval_level']   = $approval_level;
+		$result['can_execute']      = ! empty( $steps );
+		$result['approve_endpoint'] = ! empty( $steps ) ? esc_url_raw( rest_url( 'pressark/v1/plan/approve' ) ) : '';
+		$result['execute_endpoint'] = ! empty( $steps ) ? esc_url_raw( rest_url( 'pressark/v1/plan/execute' ) ) : '';
+		$result['revise_endpoint']  = ! empty( $steps ) ? esc_url_raw( rest_url( 'pressark/v1/plan/revise' ) ) : '';
+		$result['reject_endpoint']  = ! empty( $steps ) ? esc_url_raw( rest_url( 'pressark/v1/plan/reject' ) ) : '';
+
+		$trace_context = array(
+			'run_id'         => sanitize_text_field( (string) ( $ctx['run_id'] ?? '' ) ),
+			'correlation_id' => sanitize_text_field( (string) ( $ctx['correlation_id'] ?? '' ) ),
+			'reservation_id' => sanitize_text_field( (string) ( $ctx['reservation_id'] ?? '' ) ),
+			'chat_id'        => (int) ( $ctx['chat_id'] ?? 0 ),
+			'user_id'        => (int) ( $ctx['user_id'] ?? 0 ),
+			'route'          => sanitize_text_field( (string) ( $ctx['routing']['route'] ?? PressArk_Router::ROUTE_PLAN ) ),
+		);
+
+		PressArk_Activity_Trace::publish(
+			array(
+				'event_type' => 'run.plan_ready',
+				'phase'      => 'plan',
+				'status'     => 'waiting',
+				'reason'     => 'plan_ready',
+				'summary'    => 'Plan ready for user review.',
+				'payload'    => array(
+					'type'             => 'plan_ready',
+					'step_count'       => count( $steps ),
+					'steps'            => $steps,
+					'permission_mode'  => $result['permission_mode'],
+					'plan_markdown'    => $plan_markdown,
+					'can_execute'      => ! empty( $steps ),
+					'execute_endpoint' => $result['execute_endpoint'],
+					'approve_endpoint' => $result['approve_endpoint'],
+					'revise_endpoint'  => $result['revise_endpoint'],
+					'reject_endpoint'  => $result['reject_endpoint'],
+				),
+			),
+			$trace_context
+		);
+
+		PressArk_Activity_Trace::publish(
+			array(
+				'event_type' => 'hard' === $approval_level ? 'plan.hard_generated' : 'plan.soft_generated',
+				'phase'      => 'plan',
+				'status'     => 'ready',
+				'reason'     => 'hard' === $approval_level ? 'approval_required' : 'soft_plan_generated',
+				'summary'    => 'hard' === $approval_level
+					? 'Generated a hard approval-gated plan artifact.'
+					: 'Generated a soft execution plan artifact.',
+				'payload'    => array(
+					'plan_id'      => sanitize_text_field( (string) ( $artifact['plan_id'] ?? '' ) ),
+					'plan_version' => (int) ( $artifact['version'] ?? 1 ),
+					'approval_level' => $approval_level,
+					'policy'       => is_array( $ctx['routing']['meta']['planning_decision'] ?? null ) ? (array) $ctx['routing']['meta']['planning_decision'] : array(),
+				),
+			),
+			$trace_context
+		);
+
+		return $result;
+	}
+
+	private function load_plan_action_run( string $run_id ): array|WP_REST_Response {
+		$run_id = sanitize_text_field( $run_id );
+		if ( '' === $run_id ) {
+			return new WP_REST_Response( array(
+				'error'   => 'missing_run_id',
+				'message' => __( 'A plan run ID is required.', 'pressark' ),
+			), 400 );
+		}
+
+		$run_store = new PressArk_Run_Store();
+		$run       = $run_store->get( $run_id );
+		if ( ! $run ) {
+			return new WP_REST_Response( array(
+				'error'   => 'plan_not_found',
+				'message' => __( 'That plan could not be found. Please generate it again.', 'pressark' ),
+			), 404 );
+		}
+
+		if ( (int) ( $run['user_id'] ?? 0 ) !== get_current_user_id() ) {
+			return new WP_REST_Response( array(
+				'error'   => 'forbidden',
+				'message' => __( 'You do not have permission to manage this plan.', 'pressark' ),
+			), 403 );
+		}
+
+		return $run;
+	}
+
+	private function resolve_run_plan_artifact( array $run, PressArk_Checkpoint $checkpoint ): array {
+		$artifact = method_exists( $checkpoint, 'get_plan_artifact' ) ? $checkpoint->get_plan_artifact() : array();
+		if ( ! empty( $artifact ) ) {
+			return $artifact;
+		}
+
+		$result_snapshot = is_array( $run['result'] ?? null ) ? $run['result'] : array();
+		if ( class_exists( 'PressArk_Plan_Artifact' ) ) {
+			return PressArk_Plan_Artifact::ensure(
+				is_array( $result_snapshot['plan_artifact'] ?? null ) ? (array) $result_snapshot['plan_artifact'] : array(),
+				is_array( $result_snapshot['plan_steps'] ?? null ) ? (array) $result_snapshot['plan_steps'] : array(),
+				array(
+					'plan_markdown'   => (string) ( $result_snapshot['plan_markdown'] ?? '' ),
+					'approval_level'  => (string) ( $result_snapshot['approval_level'] ?? 'hard' ),
+					'request_message' => (string) ( $run['message'] ?? '' ),
+					'execute_message' => PressArk_Plan_Mode::strip_plan_directive( (string) ( $run['message'] ?? '' ) ),
+					'run_id'          => (string) ( $run['run_id'] ?? '' ),
+				)
+			);
+		}
+
+		return array();
+	}
+
+	private function resolve_plan_context( array $run, PressArk_Checkpoint $checkpoint ): array {
+		$this->ensure_plan_mode_loaded();
+
+		$run_id        = sanitize_text_field( (string) ( $run['run_id'] ?? '' ) );
+		$transient     = '' !== $run_id ? PressArk_Plan_Mode::get_context( $run_id ) : array();
+		$request_state = method_exists( $checkpoint, 'get_plan_request_context' ) ? $checkpoint->get_plan_request_context() : array();
+		$artifact      = $this->resolve_run_plan_artifact( $run, $checkpoint );
+		$result_state  = is_array( $run['result'] ?? null ) ? (array) $run['result'] : array();
+		$chat_id       = (int) ( $request_state['chat_id'] ?? $run['chat_id'] ?? 0 );
+
+		$conversation = is_array( $transient['conversation'] ?? null ) ? (array) $transient['conversation'] : array();
+		if ( empty( $conversation ) && is_array( $request_state['conversation'] ?? null ) ) {
+			$conversation = (array) $request_state['conversation'];
+		}
+		if ( empty( $conversation ) && $chat_id > 0 ) {
+			$chat_history = new PressArk_Chat_History();
+			$stored_chat  = $chat_history->get_chat( $chat_id );
+			if ( $stored_chat && is_array( $stored_chat['messages'] ?? null ) ) {
+				$conversation = (array) $stored_chat['messages'];
+			}
+		}
+
+		$message = (string) (
+			$transient['message']
+			?? $request_state['message']
+			?? $run['message']
+			?? ''
+		);
+		$execute_message = (string) (
+			$transient['execute_message']
+			?? $request_state['execute_message']
+			?? ( $artifact['execute_message'] ?? '' )
+			?? PressArk_Plan_Mode::strip_plan_directive( $message )
+		);
+
+		return array(
+			'message'         => $message,
+			'execute_message' => '' !== trim( $execute_message ) ? $execute_message : PressArk_Plan_Mode::strip_plan_directive( $message ),
+			'conversation'    => $conversation,
+			'screen'          => sanitize_text_field( (string) ( $transient['screen'] ?? $request_state['screen'] ?? '' ) ),
+			'post_id'         => absint( $transient['post_id'] ?? $request_state['post_id'] ?? ( $run['post_id'] ?? 0 ) ),
+			'deep_mode'       => ! empty( $transient['deep_mode'] ) || ! empty( $request_state['deep_mode'] ),
+			'loaded_groups'   => array_values(
+				array_filter(
+					array_map(
+						'sanitize_text_field',
+						(array) ( $transient['loaded_groups'] ?? $request_state['loaded_groups'] ?? array() )
+					)
+				)
+			),
+			'chat_id'         => $chat_id,
+			'approval_level'  => sanitize_key( (string) ( $artifact['approval_level'] ?? $result_state['approval_level'] ?? 'hard' ) ),
+			'planning_mode'   => sanitize_key( (string) ( $transient['planning_mode'] ?? $result_state['planning_mode'] ?? 'hard_plan' ) ),
+			'policy'          => is_array( $transient['policy'] ?? null )
+				? (array) $transient['policy']
+				: ( method_exists( $checkpoint, 'get_plan_policy' ) ? $checkpoint->get_plan_policy() : array() ),
+		);
+	}
+
+	private function publish_plan_trace_event( array $run, string $event_type, string $status, string $reason, string $summary, array $payload = array() ): void {
+		PressArk_Activity_Trace::publish(
+			array(
+				'event_type' => $event_type,
+				'phase'      => 'plan',
+				'status'     => sanitize_key( $status ),
+				'reason'     => sanitize_key( $reason ),
+				'summary'    => $summary,
+				'payload'    => $payload,
+			),
+			array(
+				'run_id'         => sanitize_text_field( (string) ( $run['run_id'] ?? '' ) ),
+				'correlation_id' => sanitize_text_field( (string) ( $run['correlation_id'] ?? '' ) ),
+				'chat_id'        => (int) ( $run['chat_id'] ?? 0 ),
+				'user_id'        => (int) ( $run['user_id'] ?? 0 ),
+				'route'          => sanitize_text_field( (string) ( $run['route'] ?? '' ) ),
+			)
+		);
+	}
+
+	private function advance_plan_execution_state( PressArk_Checkpoint $checkpoint, array $allowed_kinds, string $evidence ): void {
+		if ( ! class_exists( 'PressArk_Execution_Ledger' ) || ! class_exists( 'PressArk_Plan_Artifact' ) ) {
+			return;
+		}
+		if ( 'executing' !== $checkpoint->get_plan_phase() ) {
+			return;
+		}
+
+		$artifact = $checkpoint->get_plan_artifact();
+		if ( empty( $artifact ) ) {
+			return;
+		}
+
+		$execution = PressArk_Execution_Ledger::complete_current_task(
+			$checkpoint->get_execution(),
+			$allowed_kinds,
+			$evidence
+		);
+		$checkpoint->set_execution( $execution );
+		$checkpoint->set_plan_artifact( PressArk_Plan_Artifact::sync_step_statuses( $artifact, $execution ) );
+	}
+
+	private function should_clear_plan_state_after_execution( PressArk_Checkpoint $checkpoint ): bool {
+		if ( ! class_exists( 'PressArk_Execution_Ledger' ) ) {
+			return true;
+		}
+
+		return ! PressArk_Execution_Ledger::has_remaining_tasks( $checkpoint->get_execution() );
+	}
+
+	private function maybe_complete_plan_execution( array $run, PressArk_Checkpoint $checkpoint ): void {
+		if ( 'executing' !== $checkpoint->get_plan_phase() ) {
+			return;
+		}
+		if ( ! $this->should_clear_plan_state_after_execution( $checkpoint ) ) {
+			return;
+		}
+		if ( method_exists( $checkpoint, 'get_plan_status' ) && 'completed' === $checkpoint->get_plan_status() ) {
+			$checkpoint->clear_plan_state();
+			return;
+		}
+
+		$artifact = $checkpoint->get_plan_artifact();
+		if ( method_exists( $checkpoint, 'set_plan_status' ) ) {
+			$checkpoint->set_plan_status( 'completed' );
+		}
+
+		$this->publish_plan_trace_event(
+			$run,
+			'plan.execution_completed',
+			'completed',
+			'approved_plan_finished',
+			'Execution completed for the approved plan artifact.',
+			array(
+				'plan_id'      => sanitize_text_field( (string) ( $artifact['plan_id'] ?? '' ) ),
+				'plan_version' => (int) ( $artifact['version'] ?? 1 ),
+				'approval_level' => sanitize_key( (string) ( $artifact['approval_level'] ?? 'hard' ) ),
+			)
+		);
+
+		$checkpoint->clear_plan_state();
+	}
+
+	private function build_plan_execute_request( array $run, array $plan_context, PressArk_Checkpoint $checkpoint ): WP_REST_Request {
+		$this->ensure_plan_mode_loaded();
+
+		$message = (string) ( $plan_context['execute_message'] ?? $plan_context['message'] ?? $run['message'] ?? '' );
+		$message = PressArk_Plan_Mode::strip_plan_directive( $message );
+
+		$request = new WP_REST_Request( 'POST', '/pressark/v1/chat' );
+		$request->set_param( 'message', $message );
+		$request->set_param( 'conversation', is_array( $plan_context['conversation'] ?? null ) ? $plan_context['conversation'] : array() );
+		$request->set_param( 'screen', sanitize_text_field( (string) ( $plan_context['screen'] ?? '' ) ) );
+		$request->set_param( 'post_id', absint( $plan_context['post_id'] ?? ( $run['post_id'] ?? 0 ) ) );
+		$request->set_param( 'deep_mode', ! empty( $plan_context['deep_mode'] ) );
+		$request->set_param(
+			'loaded_groups',
+			array_values(
+				array_filter(
+					array_map(
+						'sanitize_text_field',
+						is_array( $plan_context['loaded_groups'] ?? null ) ? $plan_context['loaded_groups'] : array()
+					)
+				)
+			)
+		);
+		$request->set_param( 'chat_id', (int) ( $plan_context['chat_id'] ?? ( $run['chat_id'] ?? 0 ) ) );
+		$request->set_param( 'checkpoint', $checkpoint->to_array() );
+		$request->set_param( 'suppress_plan', true );
+
+		return $request;
 	}
 
 	/**
@@ -958,20 +1478,27 @@ class PressArk_Chat {
 
 		if ( preg_match( $write_patterns, $message ) ) {
 			$limit_msg = PressArk_Entitlements::limit_message( 'write_limit', $tier );
-			return new WP_REST_Response( array(
-				'reply'             => $limit_msg,
-				'actions_performed' => array(
+			$permission = array(
+				'allowed'     => false,
+				'behavior'    => 'ask',
+				'reason'      => $limit_msg,
+				'message'     => $limit_msg,
+				'ui_action'   => 'upgrade_modal',
+				'error'       => 'entitlement_denied',
+				'basis'       => 'group_limit_exhausted',
+				'upgrade_url' => pressark_get_upgrade_url(),
+			);
+
+			return new WP_REST_Response(
+				array_merge(
+					PressArk_Pipeline::build_permission_response( $permission ),
 					array(
-						'type'           => 'limit_reached',
-						'success'        => false,
-						'message'        => __( 'Free edit limit reached.', 'pressark' ),
-						'upgrade_prompt' => true,
-					),
+						'usage'     => $tracker->get_usage_data(),
+						'plan_info' => PressArk_Entitlements::get_plan_info( $tier ),
+					)
 				),
-				'pending_actions'   => array(),
-				'usage'             => $tracker->get_usage_data(),
-				'plan_info'         => PressArk_Entitlements::get_plan_info( $tier ),
-			), 200 );
+				200
+			);
 		}
 
 		return null; // Reads are always allowed.
@@ -985,7 +1512,14 @@ class PressArk_Chat {
 	 */
 	public function handle_chat( WP_REST_Request $request ): WP_REST_Response {
 		try {
-			return $this->process_chat( $request );
+			$response = $this->process_chat( $request );
+			$data     = $response->get_data();
+
+			if ( is_array( $data ) && 'permission_required' === ( $data['type'] ?? '' ) ) {
+				$response->set_status( 200 );
+			}
+
+			return $response;
 		} catch ( \Throwable $e ) {
 			PressArk_Error_Tracker::error( 'Chat', 'Chat request failed', array( 'error' => $e->getMessage(), 'file' => $e->getFile(), 'line' => $e->getLine() ) );
 			return rest_ensure_response( array(
@@ -1000,8 +1534,230 @@ class PressArk_Chat {
 		}
 	}
 
+	public function handle_plan_execute( WP_REST_Request $request ): WP_REST_Response {
+		return $this->handle_plan_approve( $request );
+	}
+
+	public function handle_plan_execute_stream( WP_REST_Request $request ): void {
+		$this->handle_plan_approve_stream( $request );
+	}
+
+	private function prepare_plan_execution_request( WP_REST_Request $request ): WP_REST_Request|WP_REST_Response {
+		$this->ensure_plan_mode_loaded();
+
+		$loaded = $this->load_plan_action_run( (string) $request->get_param( 'run_id' ) );
+		if ( $loaded instanceof WP_REST_Response ) {
+			return $loaded;
+		}
+
+		$run = $loaded;
+		$this->hydrate_trace_context_from_run( $run );
+
+		$checkpoint = $this->load_or_bootstrap_run_checkpoint( $run );
+		$artifact   = $this->resolve_run_plan_artifact( $run, $checkpoint );
+		if ( empty( $artifact ) ) {
+			return new WP_REST_Response( array(
+				'error'   => 'missing_plan',
+				'message' => __( 'This run does not have a saved plan to execute.', 'pressark' ),
+			), 409 );
+		}
+
+		$plan_context = $this->resolve_plan_context( $run, $checkpoint );
+		$artifact     = $checkpoint->approve_plan_artifact( $artifact );
+		if ( class_exists( 'PressArk_Plan_Artifact' ) ) {
+			$checkpoint->set_execution( PressArk_Plan_Artifact::seed_execution_ledger( $artifact, $checkpoint->get_execution() ) );
+			$checkpoint->set_plan_artifact( PressArk_Plan_Artifact::sync_step_statuses( $artifact, $checkpoint->get_execution() ) );
+		}
+
+		$this->persist_run_checkpoint( $run, $checkpoint );
+		PressArk_Plan_Mode::exit( (string) ( $run['run_id'] ?? '' ), (string) ( $checkpoint->get_plan_text() ?: ( class_exists( 'PressArk_Plan_Artifact' ) ? PressArk_Plan_Artifact::to_markdown( $artifact ) : '' ) ) );
+
+		$this->publish_plan_trace_event(
+			$run,
+			'plan.approved',
+			'approved',
+			'user_approved',
+			'The plan was approved for execution.',
+			array(
+				'plan_id'        => sanitize_text_field( (string) ( $artifact['plan_id'] ?? '' ) ),
+				'plan_version'   => (int) ( $artifact['version'] ?? 1 ),
+				'approval_level' => sanitize_key( (string) ( $artifact['approval_level'] ?? 'hard' ) ),
+			)
+		);
+		$this->publish_plan_trace_event(
+			$run,
+			'plan.execution_started',
+			'running',
+			'approved_plan_execution',
+			'Execution started from the approved plan artifact.',
+			array(
+				'plan_id'      => sanitize_text_field( (string) ( $artifact['plan_id'] ?? '' ) ),
+				'plan_version' => (int) ( $artifact['version'] ?? 1 ),
+			)
+		);
+
+		$execute_request = $this->build_plan_execute_request( $run, $plan_context, $checkpoint );
+		$execute_request->set_param( 'plan_execute', true );
+
+		return $execute_request;
+	}
+
+	public function handle_plan_approve( WP_REST_Request $request ): WP_REST_Response {
+		$execute_request = $this->prepare_plan_execution_request( $request );
+		if ( $execute_request instanceof WP_REST_Response ) {
+			return $execute_request;
+		}
+
+		return $this->handle_chat( $execute_request );
+	}
+
+	public function handle_plan_approve_stream( WP_REST_Request $request ): void {
+		$execute_request = $this->prepare_plan_execution_request( $request );
+		if ( $execute_request instanceof WP_REST_Response ) {
+			$status = $execute_request->get_status();
+			$data   = $execute_request->get_data();
+
+			if ( 200 === $status ) {
+				$emitter = new PressArk_SSE_Emitter();
+				$emitter->start();
+				$emitter->emit(
+					'done',
+					is_array( $data )
+						? $data
+						: array( 'type' => 'final_response', 'message' => (string) $data )
+				);
+				$emitter->close();
+				exit;
+			}
+
+			wp_send_json( $data, $status );
+			return;
+		}
+
+		$this->handle_chat_stream( $execute_request );
+	}
+
+	public function handle_plan_revise( WP_REST_Request $request ): WP_REST_Response {
+		$this->ensure_plan_mode_loaded();
+
+		$loaded = $this->load_plan_action_run( (string) $request->get_param( 'run_id' ) );
+		if ( $loaded instanceof WP_REST_Response ) {
+			return $loaded;
+		}
+
+		$revision_note = sanitize_text_field( (string) $request->get_param( 'revision_note' ) );
+		if ( '' === $revision_note ) {
+			return new WP_REST_Response( array(
+				'error'   => 'missing_revision_note',
+				'message' => __( 'Add a revision note so I know how to update the plan.', 'pressark' ),
+			), 400 );
+		}
+
+		$run = $loaded;
+		$this->hydrate_trace_context_from_run( $run );
+
+		$checkpoint = $this->load_or_bootstrap_run_checkpoint( $run );
+		$artifact   = $this->resolve_run_plan_artifact( $run, $checkpoint );
+		if ( empty( $artifact ) ) {
+			return new WP_REST_Response( array(
+				'error'   => 'missing_plan',
+				'message' => __( 'There is no active plan to revise.', 'pressark' ),
+			), 409 );
+		}
+
+		$checkpoint->set_plan_artifact( $artifact );
+		$checkpoint->queue_plan_revision( $revision_note );
+		$checkpoint->set_plan_phase( 'planning' );
+		if ( method_exists( $checkpoint, 'set_plan_status' ) ) {
+			$checkpoint->set_plan_status( 'revising' );
+		}
+		$this->persist_run_checkpoint( $run, $checkpoint );
+
+		$this->publish_plan_trace_event(
+			$run,
+			'plan.revised',
+			'queued',
+			'user_revised',
+			'The plan was sent back for revision.',
+			array(
+				'plan_id'        => sanitize_text_field( (string) ( $artifact['plan_id'] ?? '' ) ),
+				'prior_version'  => (int) ( $artifact['version'] ?? 1 ),
+				'revision_note'  => $revision_note,
+				'next_version'   => method_exists( $checkpoint, 'get_next_plan_version' ) ? (int) $checkpoint->get_next_plan_version() : 0,
+			)
+		);
+
+		$plan_context    = $this->resolve_plan_context( $run, $checkpoint );
+		$base_message    = PressArk_Plan_Mode::strip_plan_directive( (string) ( $plan_context['message'] ?? $run['message'] ?? '' ) );
+		$revised_message = trim( $base_message . "\nRevision note: " . $revision_note );
+		$revised_request = new WP_REST_Request( 'POST', '/pressark/v1/chat' );
+		$revised_request->set_param( 'message', '/plan ' . $revised_message );
+		$revised_request->set_param( 'conversation', $plan_context['conversation'] ?? array() );
+		$revised_request->set_param( 'screen', $plan_context['screen'] ?? '' );
+		$revised_request->set_param( 'post_id', (int) ( $plan_context['post_id'] ?? 0 ) );
+		$revised_request->set_param( 'deep_mode', ! empty( $plan_context['deep_mode'] ) );
+		$revised_request->set_param( 'loaded_groups', $plan_context['loaded_groups'] ?? array() );
+		$revised_request->set_param( 'chat_id', (int) ( $plan_context['chat_id'] ?? ( $run['chat_id'] ?? 0 ) ) );
+		$revised_request->set_param( 'checkpoint', $checkpoint->to_array() );
+
+		return $this->handle_chat( $revised_request );
+	}
+
+	public function handle_plan_reject( WP_REST_Request $request ): WP_REST_Response {
+		$this->ensure_plan_mode_loaded();
+
+		$loaded = $this->load_plan_action_run( (string) $request->get_param( 'run_id' ) );
+		if ( $loaded instanceof WP_REST_Response ) {
+			return $loaded;
+		}
+
+		$run    = $loaded;
+		$reason = sanitize_text_field( (string) $request->get_param( 'reason' ) );
+		$this->hydrate_trace_context_from_run( $run );
+
+		$checkpoint = $this->load_or_bootstrap_run_checkpoint( $run );
+		$artifact   = $this->resolve_run_plan_artifact( $run, $checkpoint );
+		if ( empty( $artifact ) ) {
+			return new WP_REST_Response( array(
+				'error'   => 'missing_plan',
+				'message' => __( 'There is no active plan to reject.', 'pressark' ),
+			), 409 );
+		}
+
+		$checkpoint->reject_plan_artifact( $reason );
+		$this->persist_run_checkpoint( $run, $checkpoint );
+		PressArk_Plan_Mode::abort( (string) ( $run['run_id'] ?? '' ) );
+
+		$this->publish_plan_trace_event(
+			$run,
+			'plan.rejected',
+			'cancelled',
+			'user_rejected',
+			'The plan was cancelled before execution.',
+			array(
+				'plan_id'      => sanitize_text_field( (string) ( $artifact['plan_id'] ?? '' ) ),
+				'plan_version' => (int) ( $artifact['version'] ?? 1 ),
+				'reason'       => $reason,
+			)
+		);
+
+		$result = array(
+			'success'        => true,
+			'type'           => 'final_response',
+			'message'        => __( 'Plan cancelled. No changes were made.', 'pressark' ),
+			'reply'          => __( 'Plan cancelled. No changes were made.', 'pressark' ),
+			'plan_rejected'  => true,
+			'run_id'         => (string) ( $run['run_id'] ?? '' ),
+			'correlation_id' => (string) ( $run['correlation_id'] ?? '' ),
+			'checkpoint'     => $checkpoint->to_array(),
+		);
+		$this->persist_run_detail_snapshot( $run, $result, $checkpoint );
+
+		return rest_ensure_response( $result );
+	}
+
 	/**
-	 * Pre-flight steps 1-6: sanitize, write check, throttle, reserve, route, acquire slot.
+	 * Pre-flight steps 1-6: sanitize, write check, throttle, route/permission gate, reserve, acquire slot.
 	 *
 	 * Shared by process_chat() and process_chat_stream() to avoid duplicating ~200 lines.
 	 *
@@ -1063,6 +1819,13 @@ class PressArk_Chat {
 		$conversation = $this->sanitize_conversation( $request->get_param( 'conversation' ) );
 		$screen       = $request->get_param( 'screen' );
 		$post_id      = (int) $request->get_param( 'post_id' );
+		$suppress_plan = (bool) $request->get_param( 'suppress_plan' );
+		$plan_execute  = (bool) $request->get_param( 'plan_execute' );
+		$this->ensure_plan_mode_loaded();
+		$original_message = (string) $message;
+		$execution_message = ( $suppress_plan || PressArk_Plan_Mode::message_requests_plan( $original_message ) )
+			? PressArk_Plan_Mode::strip_plan_directive( $original_message )
+			: $original_message;
 
 		$tracker = new PressArk_Usage_Tracker();
 		$user_id = get_current_user_id();
@@ -1085,7 +1848,7 @@ class PressArk_Chat {
 		$chat_id = (int) $request->get_param( 'chat_id' );
 		if ( $chat_id <= 0 && ! empty( $conversation ) ) {
 			$chat_history = new PressArk_Chat_History();
-			$chat_title   = PressArk_Chat_History::generate_title( (string) $message );
+			$chat_title   = PressArk_Chat_History::generate_title( $execution_message );
 			$created_chat = $chat_history->create_chat( $chat_title, $conversation );
 			if ( $created_chat ) {
 				$chat_id = (int) $created_chat;
@@ -1172,7 +1935,7 @@ class PressArk_Chat {
 			return new WP_REST_Response( array( 'error' => 'Empty message' ), 400 );
 		}
 
-		$post_id = $this->resolve_effective_post_id( (string) $message, $post_id, $checkpoint_data );
+		$post_id = $this->resolve_effective_post_id( $execution_message, $post_id, $checkpoint_data );
 
 		// ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ [1b] Chat-level mutex ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬
 		// Prevents concurrent requests for the same chat from creating
@@ -1188,9 +1951,32 @@ class PressArk_Chat {
 		$correlation_id = $this->begin_trace_context( $user_id, $chat_id );
 
 		// ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ [2] Pre-flight write check ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬
-		$write_block = $this->quick_write_check( $tier, $message, $tracker );
-		if ( $write_block ) {
-			return $write_block;
+		$connector   = new PressArk_AI_Connector( $tier );
+		$logger      = new PressArk_Action_Logger();
+		$engine      = new PressArk_Action_Engine( $logger );
+		$routing     = PressArk_Router::resolve(
+			$execution_message,
+			$conversation,
+			$connector,
+			$engine,
+			$tier,
+			$deep_mode,
+			$screen,
+			$post_id,
+			array(
+				'suppress_plan'   => $suppress_plan,
+				'plan_execute'    => $plan_execute,
+				'original_message' => $original_message,
+			)
+		);
+		$permission  = is_array( $routing['meta']['permission'] ?? null ) ? $routing['meta']['permission'] : array();
+		$is_plan_run = $this->is_plan_route( $routing );
+
+		if ( ! $is_plan_run ) {
+			$write_block = $this->quick_write_check( $tier, $execution_message, $tracker );
+			if ( $write_block ) {
+				return $write_block;
+			}
 		}
 
 		// ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ [3] Throttle check ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬
@@ -1208,11 +1994,47 @@ class PressArk_Chat {
 		}
 
 		// ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ [4] Estimate + reserve tokens ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬
+		if ( ! $is_plan_run && ! $plan_execute && 'ask' === ( $permission['behavior'] ?? '' ) ) {
+			return new WP_REST_Response(
+				array_merge(
+					PressArk_Pipeline::build_permission_response( $permission ),
+					array(
+						'usage'          => $tracker->get_usage_data(),
+						'plan_info'      => $plan_info,
+						'chat_id'        => $chat_id,
+						'correlation_id' => $correlation_id,
+					)
+				),
+				200
+			);
+		}
+
+		if ( ! $is_plan_run && 'block' === ( $permission['behavior'] ?? '' ) ) {
+			return new WP_REST_Response(
+				array(
+					'error'           => 'permission_blocked',
+					'message'         => sanitize_text_field( (string) ( $permission['reason'] ?? __( 'You do not have permission to perform this action.', 'pressark' ) ) ),
+					'permission'      => $permission,
+					'permission_tool' => sanitize_key( (string) ( $permission['tool_name'] ?? '' ) ),
+					'usage'           => $tracker->get_usage_data(),
+					'plan_info'       => $plan_info,
+					'chat_id'         => $chat_id,
+					'correlation_id'  => $correlation_id,
+				),
+				403
+			);
+		}
+
 		$reservation    = new PressArk_Reservation();
-		$reserve_model  = PressArk_Model_Policy::resolve( $tier, $deep_mode );
-		$estimated_raw  = $reservation->estimate_tokens( $message, $conversation, $tier );
-		$estimated      = $reservation->estimate_icus( $message, $conversation, $tier, $reserve_model );
-		$reserve_result = $reservation->reserve( $user_id, $estimated, 'pending', $tier, $reserve_model, $estimated_raw );
+		$pipeline       = new PressArk_Pipeline( $reservation, $tracker, $throttle, $tier, $plan_info );
+		$reserve_model  = $is_plan_run
+			? PressArk_Model_Policy::for_phase( 'plan_mode', $tier, array( 'deep_mode' => $deep_mode ) )
+			: PressArk_Model_Policy::resolve( $tier, $deep_mode );
+		$estimated_raw  = $reservation->estimate_tokens( $execution_message, $conversation, $tier );
+		$estimated      = $reservation->estimate_icus( $execution_message, $conversation, $tier, $reserve_model );
+		$reserve_result = $is_plan_run
+			? $pipeline->reserve_for_plan( $user_id, $estimated, $reserve_model, $estimated_raw )
+			: $pipeline->reserve_full( $user_id, $estimated, (string) ( $routing['route'] ?? 'pending' ), $reserve_model, $estimated_raw );
 
 		if ( ! $reserve_result['ok'] ) {
 			if ( 'token_limit_reached' === ( $reserve_result['error'] ?? '' ) ) {
@@ -1239,28 +2061,16 @@ class PressArk_Chat {
 			array(
 				'correlation_id' => $correlation_id,
 				'reservation_id' => $reservation_id,
-			)
-		);
-
-		// ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ [5] Unified routing ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬
-		$connector = new PressArk_AI_Connector( $tier );
-		$logger    = new PressArk_Action_Logger();
-		$engine    = new PressArk_Action_Engine( $logger );
-
-		$routing = PressArk_Router::resolve( $message, $conversation, $connector, $engine, $tier, $deep_mode, $screen, $post_id );
-		PressArk_Activity_Trace::set_current_context(
-			array(
-				'correlation_id' => $correlation_id,
-				'reservation_id' => $reservation_id,
 				'route'          => (string) ( $routing['route'] ?? '' ),
 			)
 		);
 
+		// ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ [5] Unified routing ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬
 		// [5a] Async early return.
 		if ( PressArk_Router::ROUTE_ASYNC === $routing['route'] ) {
 			$queue            = new PressArk_Task_Queue();
 			$handoff_capsule  = PressArk_Task_Queue::build_handoff_capsule(
-				$message,
+				$execution_message,
 				$conversation,
 				$loaded_groups,
 				$checkpoint_data ?: null,
@@ -1278,7 +2088,7 @@ class PressArk_Chat {
 				array(
 					'user_id'         => $user_id,
 					'chat_id'         => $chat_id,
-					'message'         => $message,
+					'message'         => $execution_message,
 					'reservation_id'  => $reservation_id,
 					'correlation_id'  => $correlation_id,
 					'tier'            => $tier,
@@ -1298,7 +2108,7 @@ class PressArk_Chat {
 			);
 
 			$queued = $queue->enqueue(
-				$message,
+				$execution_message,
 				$conversation,
 				array(),
 				$user_id,
@@ -1377,15 +2187,15 @@ class PressArk_Chat {
 		}
 
 		// ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ Build pipeline + run record ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬
-		$pipeline = new PressArk_Pipeline( $reservation, $tracker, $throttle, $tier, $plan_info );
 		$pipeline->register_resources( $reservation_id, $user_id, true, $slot_id );
 
+		$stored_message = $is_plan_run ? $original_message : $execution_message;
 		$run_store = new PressArk_Run_Store();
 		$run_id    = $run_store->create( array(
 			'user_id'        => $user_id,
 			'chat_id'        => $chat_id,
 			'route'          => $routing['route'],
-			'message'        => $message,
+			'message'        => $stored_message,
 			'reservation_id' => $reservation_id,
 			'correlation_id' => $correlation_id,
 			'tier'           => $tier,
@@ -1400,7 +2210,9 @@ class PressArk_Chat {
 		);
 
 		return array(
-			'message'         => $message,
+			'message'         => $execution_message,
+			'original_message' => $original_message,
+			'execution_message' => $execution_message,
 			'conversation'    => $conversation,
 			'screen'          => $screen,
 			'post_id'         => $post_id,
@@ -1434,7 +2246,24 @@ class PressArk_Chat {
 
 		if ( $preflight instanceof WP_REST_Response ) {
 			// Preflight failed ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â send as JSON (headers not committed yet).
-			wp_send_json( $preflight->get_data(), $preflight->get_status() );
+			$status = $preflight->get_status();
+			$data   = $preflight->get_data();
+			$this->release_chat_lock();
+
+			if ( 200 === $status ) {
+				$emitter = new PressArk_SSE_Emitter();
+				$emitter->start();
+				$emitter->emit(
+					'done',
+					is_array( $data )
+						? $data
+						: array( 'type' => 'final_response', 'message' => (string) $data )
+				);
+				$emitter->close();
+				return;
+			}
+
+			wp_send_json( $data, $status );
 			return;
 		}
 
@@ -1561,21 +2390,56 @@ class PressArk_Chat {
 		$routing   = $ctx['routing'];
 		$run_store = new PressArk_Run_Store();
 		$run_cancel_check = $this->build_run_cancel_check( $run_store, $ctx['run_id'] );
+		$is_plan_run = $this->is_plan_route( $routing );
 
 		// Emit run metadata immediately so the frontend can cancel by run_id
 		// even on the first message (before it knows the chat_id).
-			$emitter->emit( 'run_started', array(
-				'run_id'         => $ctx['run_id'],
-				'correlation_id' => $ctx['correlation_id'] ?? '',
-				'chat_id'        => $ctx['chat_id'],
-			) );
+		$emitter->emit( 'run_started', array(
+			'run_id'         => $ctx['run_id'],
+			'correlation_id' => $ctx['correlation_id'] ?? '',
+			'chat_id'        => $ctx['chat_id'],
+		) );
 
 		try {
-			if ( PressArk_Router::ROUTE_AGENT === $routing['route'] ) {
+			if ( PressArk_Router::ROUTE_AGENT === $routing['route'] || $is_plan_run ) {
 				// Agent path ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â full streaming support.
 				$stream_connector = new PressArk_Stream_Connector( $ctx['connector'], $emitter, $run_cancel_check );
 				$agent = new PressArk_Agent( $ctx['connector'], $ctx['engine'], $ctx['tier'] );
 				$agent->set_run_context( $ctx['run_id'], (int) $ctx['chat_id'] );
+				$agent->set_mode( $is_plan_run ? 'plan' : 'execute' );
+				$agent->set_planning_context(
+					array(
+						'planning_mode'     => (string) ( $routing['meta']['planning_mode'] ?? ( $is_plan_run ? 'hard_plan' : 'none' ) ),
+						'planning_decision' => is_array( $routing['meta']['planning_decision'] ?? null ) ? (array) $routing['meta']['planning_decision'] : array(),
+						'plan_artifact'     => is_array( $ctx['checkpoint_data']['plan_state']['current_artifact'] ?? null )
+							? (array) $ctx['checkpoint_data']['plan_state']['current_artifact']
+							: array(),
+					)
+				);
+
+				if ( $is_plan_run ) {
+					$this->ensure_plan_mode_loaded();
+					PressArk_Plan_Mode::enter(
+						(string) $ctx['run_id'],
+						(string) ( $ctx['original_message'] ?? $ctx['message'] ),
+						array(
+							'conversation'   => is_array( $ctx['conversation'] ?? null ) ? $ctx['conversation'] : array(),
+							'screen'         => sanitize_text_field( (string) ( $ctx['screen'] ?? '' ) ),
+							'post_id'        => (int) ( $ctx['post_id'] ?? 0 ),
+							'deep_mode'      => ! empty( $ctx['deep_mode'] ),
+							'loaded_groups'  => is_array( $ctx['loaded_groups'] ?? null ) ? $ctx['loaded_groups'] : array(),
+							'checkpoint'     => is_array( $ctx['checkpoint_data'] ?? null ) ? $ctx['checkpoint_data'] : array(),
+							'chat_id'        => (int) ( $ctx['chat_id'] ?? 0 ),
+							'user_id'        => (int) ( $ctx['user_id'] ?? 0 ),
+							'correlation_id' => (string) ( $ctx['correlation_id'] ?? '' ),
+							'permission'     => is_array( $routing['meta']['permission'] ?? null ) ? $routing['meta']['permission'] : array(),
+							'approval_level' => 'hard',
+							'planning_mode'  => (string) ( $routing['meta']['planning_mode'] ?? 'hard_plan' ),
+							'policy'         => is_array( $routing['meta']['planning_decision'] ?? null ) ? (array) $routing['meta']['planning_decision'] : array(),
+							'phase'          => 'planning',
+						)
+					);
+				}
 
 				$result = $agent->run_streaming(
 					$ctx['message'],
@@ -1630,6 +2494,12 @@ class PressArk_Chat {
 			$result['run_id'] = $ctx['run_id'];
 			$result['correlation_id'] = $ctx['correlation_id'] ?? '';
 
+			if ( empty( $result['cancelled'] ) && 'plan_ready' === ( $result['type'] ?? '' ) ) {
+				$result = $this->decorate_plan_ready_result( $result, $ctx );
+			} elseif ( $is_plan_run ) {
+				PressArk_Plan_Mode::abort( (string) $ctx['run_id'] );
+			}
+
 			// Persist run state on approval boundaries.
 			$result_type = $result['type'] ?? 'final_response';
 
@@ -1652,12 +2522,23 @@ class PressArk_Chat {
 			// Persist checkpoint.
 			if ( $ctx['chat_id'] > 0 && ! empty( $result['checkpoint'] ) ) {
 				$cp = PressArk_Checkpoint::from_array( $result['checkpoint'] );
+				$this->maybe_complete_plan_execution(
+					array(
+						'run_id'         => (string) ( $ctx['run_id'] ?? '' ),
+						'correlation_id' => (string) ( $ctx['correlation_id'] ?? '' ),
+						'chat_id'        => (int) ( $ctx['chat_id'] ?? 0 ),
+						'user_id'        => (int) ( $ctx['user_id'] ?? 0 ),
+						'route'          => (string) ( $routing['route'] ?? '' ),
+					),
+					$cp
+				);
+				$result['checkpoint'] = $cp->to_array();
 				$cp->touch();
 				$cp->save( $ctx['chat_id'], $ctx['user_id'] );
 			}
 
 			// Finalize (settle tokens, track, release slot).
-			$finalized = $ctx['pipeline']->finalize( $result, $routing['route'] );
+			$finalized = $ctx['pipeline']->finalize( $result, $routing['route'], $is_plan_run ? 'plan' : 'execute' );
 			$finalized_response_data = $finalized['response']->get_data();
 			if ( is_array( $finalized_response_data ) ) {
 				if ( ! empty( $finalized_response_data['budget'] ) ) {
@@ -1674,12 +2555,20 @@ class PressArk_Chat {
 
 			// Determine run outcome ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â cancelled beats settled.
 			$user_cancelled = ! empty( $result['cancelled'] );
-			$client_aborted = ! $user_cancelled && connection_aborted();
+			$client_aborted = ! $user_cancelled
+				&& connection_aborted()
+				&& 'plan_ready' !== $result_type;
 			$cancelled      = $user_cancelled || $client_aborted;
 
 			if ( $user_cancelled ) {
+				if ( $is_plan_run ) {
+					PressArk_Plan_Mode::abort( (string) $ctx['run_id'] );
+				}
 				$run_store->fail( $ctx['run_id'], 'User cancelled', $result );
 			} elseif ( $client_aborted ) {
+				if ( $is_plan_run ) {
+					PressArk_Plan_Mode::abort( (string) $ctx['run_id'] );
+				}
 				$run_store->fail(
 					$ctx['run_id'],
 					'Client disconnected',
@@ -1705,10 +2594,30 @@ class PressArk_Chat {
 
 			// Only emit if the client is still listening.
 			if ( ! $cancelled ) {
+				if ( 'plan_ready' === $result_type ) {
+					$emitter->emit( 'plan', array(
+						'type'             => 'plan',
+						'status'           => 'ready',
+						'steps'            => $result['plan_steps'] ?? array(),
+						'run_id'           => $ctx['run_id'],
+						'plan_markdown'    => $result['plan_markdown'] ?? '',
+						'plan_phase'       => $result['plan_phase'] ?? '',
+						'approval_level'   => $result['approval_level'] ?? '',
+						'execute_endpoint' => $result['execute_endpoint'] ?? '',
+						'approve_endpoint' => $result['approve_endpoint'] ?? '',
+						'revise_endpoint'  => $result['revise_endpoint'] ?? '',
+						'reject_endpoint'  => $result['reject_endpoint'] ?? '',
+						'plan_artifact'    => $result['plan_artifact'] ?? array(),
+						'reply'            => $result['reply'] ?? '',
+					) );
+				}
 				$emitter->emit( 'done', $response_data );
 			}
 
 		} catch ( \Throwable $e ) {
+			if ( $is_plan_run ) {
+				PressArk_Plan_Mode::abort( (string) $ctx['run_id'] );
+			}
 			PressArk_Pipeline::fail_run( $ctx['run_id'], $e->getMessage() );
 			$ctx['pipeline']->cleanup( $e->getMessage() );
 			throw $e;
@@ -1734,12 +2643,48 @@ class PressArk_Chat {
 		$pipeline  = $ctx['pipeline'];
 		$run_store = new PressArk_Run_Store();
 		$run_cancel_check = $this->build_run_cancel_check( $run_store, $run_id );
+		$is_plan_run = $this->is_plan_route( $routing );
 
 		try {
 			$agent = new PressArk_Agent( $ctx['connector'], $ctx['engine'], $ctx['tier'] );
 			$agent->set_run_context( $run_id, (int) $chat_id );
+			$agent->set_mode( $is_plan_run ? 'plan' : 'execute' );
+			$agent->set_planning_context(
+				array(
+					'planning_mode'     => (string) ( $routing['meta']['planning_mode'] ?? ( $is_plan_run ? 'hard_plan' : 'none' ) ),
+					'planning_decision' => is_array( $routing['meta']['planning_decision'] ?? null ) ? (array) $routing['meta']['planning_decision'] : array(),
+					'plan_artifact'     => is_array( $ctx['checkpoint_data']['plan_state']['current_artifact'] ?? null )
+						? (array) $ctx['checkpoint_data']['plan_state']['current_artifact']
+						: array(),
+				)
+			);
+
+			if ( $is_plan_run ) {
+				$this->ensure_plan_mode_loaded();
+				PressArk_Plan_Mode::enter(
+					$run_id,
+					(string) ( $ctx['original_message'] ?? $ctx['message'] ),
+					array(
+						'conversation'   => is_array( $ctx['conversation'] ?? null ) ? $ctx['conversation'] : array(),
+						'screen'         => sanitize_text_field( (string) ( $ctx['screen'] ?? '' ) ),
+						'post_id'        => (int) ( $ctx['post_id'] ?? 0 ),
+						'deep_mode'      => ! empty( $ctx['deep_mode'] ),
+						'loaded_groups'  => is_array( $ctx['loaded_groups'] ?? null ) ? $ctx['loaded_groups'] : array(),
+						'checkpoint'     => is_array( $ctx['checkpoint_data'] ?? null ) ? $ctx['checkpoint_data'] : array(),
+						'chat_id'        => (int) $chat_id,
+						'user_id'        => (int) ( $ctx['user_id'] ?? 0 ),
+						'correlation_id' => (string) ( $ctx['correlation_id'] ?? '' ),
+						'permission'     => is_array( $routing['meta']['permission'] ?? null ) ? $routing['meta']['permission'] : array(),
+						'approval_level' => 'hard',
+						'planning_mode'  => (string) ( $routing['meta']['planning_mode'] ?? 'hard_plan' ),
+						'policy'         => is_array( $routing['meta']['planning_decision'] ?? null ) ? (array) $routing['meta']['planning_decision'] : array(),
+						'phase'          => 'planning',
+					)
+				);
+			}
 
 			$result = match ( $routing['route'] ) {
+				PressArk_Router::ROUTE_PLAN,
 				PressArk_Router::ROUTE_AGENT  => $agent->run(
 					$ctx['message'], $ctx['conversation'], $ctx['deep_mode'], $ctx['screen'], $ctx['post_id'], $ctx['loaded_groups'], $ctx['checkpoint_data'], $run_cancel_check ),
 				PressArk_Router::ROUTE_LEGACY => $this->run_legacy_raw(
@@ -1770,6 +2715,12 @@ class PressArk_Chat {
 			$result['run_id'] = $run_id;
 			$result['correlation_id'] = $ctx['correlation_id'] ?? '';
 
+			if ( empty( $result['cancelled'] ) && 'plan_ready' === ( $result['type'] ?? '' ) ) {
+				$result = $this->decorate_plan_ready_result( $result, $ctx );
+			} elseif ( $is_plan_run ) {
+				PressArk_Plan_Mode::abort( $run_id );
+			}
+
 			// Persist run state on approval boundaries.
 			$result_type = $result['type'] ?? 'final_response';
 
@@ -1792,12 +2743,23 @@ class PressArk_Chat {
 			// Persist checkpoint server-side.
 			if ( $chat_id > 0 && ! empty( $result['checkpoint'] ) ) {
 				$cp = PressArk_Checkpoint::from_array( $result['checkpoint'] );
+				$this->maybe_complete_plan_execution(
+					array(
+						'run_id'         => (string) $run_id,
+						'correlation_id' => (string) ( $ctx['correlation_id'] ?? '' ),
+						'chat_id'        => (int) $chat_id,
+						'user_id'        => (int) ( $ctx['user_id'] ?? 0 ),
+						'route'          => (string) ( $routing['route'] ?? '' ),
+					),
+					$cp
+				);
+				$result['checkpoint'] = $cp->to_array();
 				$cp->touch();
 				$cp->save( $chat_id, $ctx['user_id'] );
 			}
 
 			// Finalize (settle tokens, track, release slot).
-			$finalized = $pipeline->finalize( $result, $routing['route'] );
+			$finalized = $pipeline->finalize( $result, $routing['route'], $is_plan_run ? 'plan' : 'execute' );
 			$finalized_response_data = $finalized['response']->get_data();
 			if ( is_array( $finalized_response_data ) ) {
 				if ( ! empty( $finalized_response_data['budget'] ) ) {
@@ -1813,6 +2775,9 @@ class PressArk_Chat {
 			}
 
 			if ( ! empty( $result['cancelled'] ) ) {
+				if ( $is_plan_run ) {
+					PressArk_Plan_Mode::abort( $run_id );
+				}
 				$run_store->fail( $run_id, 'User cancelled', $result );
 			} elseif ( ! in_array( $result_type, array( 'preview', 'confirm_card' ), true ) ) {
 				$run_store->settle( $run_id, $result );
@@ -1825,6 +2790,9 @@ class PressArk_Chat {
 
 			return $response;
 		} catch ( \Throwable $e ) {
+			if ( $is_plan_run ) {
+				PressArk_Plan_Mode::abort( $run_id );
+			}
 			PressArk_Pipeline::fail_run( $run_id, $e->getMessage() );
 			$pipeline->cleanup( $e->getMessage() );
 			throw $e; // Re-throw for handle_chat() to catch.
@@ -1838,6 +2806,33 @@ class PressArk_Chat {
 	 *
 	 * @since 3.0.0 Refactored from run_legacy() ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â no longer settles or builds WP_REST_Response.
 	 */
+	private function accumulate_context_metrics( array $totals, PressArk_AI_Connector $connector ): array {
+		$metrics = $connector->get_last_context_metrics();
+		if ( empty( $metrics['context_used'] ) ) {
+			return $totals;
+		}
+
+		$totals['context_used'] = true;
+		$totals['context_tokens'] = max( 0, (int) ( $totals['context_tokens'] ?? 0 ) ) + max( 0, (int) ( $metrics['context_tokens'] ?? 0 ) );
+		$totals['user_context_tokens'] = max( 0, (int) ( $totals['user_context_tokens'] ?? 0 ) ) + max( 0, (int) ( $metrics['user_context_tokens'] ?? 0 ) );
+		$totals['system_context_tokens'] = max( 0, (int) ( $totals['system_context_tokens'] ?? 0 ) ) + max( 0, (int) ( $metrics['system_context_tokens'] ?? 0 ) );
+
+		return $totals;
+	}
+
+	private function append_context_metrics_to_result( array $result, array $metrics ): array {
+		if ( empty( $metrics['context_used'] ) ) {
+			return $result;
+		}
+
+		$result['context_used']          = true;
+		$result['context_tokens']        = max( 0, (int) ( $metrics['context_tokens'] ?? 0 ) );
+		$result['user_context_tokens']   = max( 0, (int) ( $metrics['user_context_tokens'] ?? 0 ) );
+		$result['system_context_tokens'] = max( 0, (int) ( $metrics['system_context_tokens'] ?? 0 ) );
+
+		return $result;
+	}
+
 	private function run_legacy_raw(
 		string                $message,
 		array                 $conversation,
@@ -1853,14 +2848,16 @@ class PressArk_Chat {
 		$effective_model    = $tracker->is_byok()
 			? (string) get_option( 'pressark_byok_model', $connector->get_model() )
 			: $connector->get_model();
+		$context_totals     = array();
 
 		if ( PressArk_Agent::is_lightweight_chat_request( $message, $conversation ) ) {
 			$ai_result       = $connector->send_lightweight_chat( $message, $conversation, $deep_mode );
+			$context_totals  = $this->accumulate_context_metrics( $context_totals, $connector );
 			$usage_breakdown = $this->extract_usage_breakdown( $ai_result );
 			$routing_decision = (array) ( $ai_result['routing_decision'] ?? $connector->get_last_routing_decision() );
 
 			if ( ! empty( $ai_result['error'] ) ) {
-				return array(
+				return $this->append_context_metrics_to_result( array(
 					'type'              => 'final_response',
 					'message'           => $ai_result['error'],
 					'tokens_used'       => $usage_breakdown['total_tokens'],
@@ -1876,10 +2873,10 @@ class PressArk_Chat {
 					'pending_actions'   => array(),
 					'routing_decision'  => $routing_decision,
 					'is_error'          => true,
-				);
+				), $context_totals );
 			}
 
-			return array(
+			return $this->append_context_metrics_to_result( array(
 				'type'              => 'final_response',
 				'message'           => $ai_result['message'] ?? '',
 				'tokens_used'       => $usage_breakdown['total_tokens'],
@@ -1894,7 +2891,7 @@ class PressArk_Chat {
 				'actions_performed' => array(),
 				'pending_actions'   => array(),
 				'routing_decision'  => $routing_decision,
-			);
+			), $context_totals );
 		}
 
 		// Build compact context ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â dynamic part only (cached part in connector).
@@ -1915,11 +2912,12 @@ class PressArk_Chat {
 		$compressed_history = PressArk_History_Manager::prepare( $conversation, $deep_mode );
 
 		$ai_result       = $connector->send_message( $message, $context_text, $compressed_history, $deep_mode );
+		$context_totals  = $this->accumulate_context_metrics( $context_totals, $connector );
 		$usage_breakdown = $this->extract_usage_breakdown( $ai_result );
 		$routing_decision = (array) ( $ai_result['routing_decision'] ?? $connector->get_last_routing_decision() );
 
 		if ( ! empty( $ai_result['error'] ) ) {
-			return array(
+			return $this->append_context_metrics_to_result( array(
 				'type'              => 'final_response',
 				'message'           => $ai_result['error'],
 				'tokens_used'       => $usage_breakdown['total_tokens'],
@@ -1935,7 +2933,7 @@ class PressArk_Chat {
 				'pending_actions'   => array(),
 				'routing_decision'  => $routing_decision,
 				'is_error'          => true,
-			);
+			), $context_totals );
 		}
 
 		// If AI returned parsed actions, separate reads from writes.
@@ -2032,6 +3030,7 @@ class PressArk_Chat {
 					$scan_label,
 					$compressed_history
 				);
+				$context_totals = $this->accumulate_context_metrics( $context_totals, $connector );
 			}
 
 			if ( '' === trim( $reply_text ) && ( empty( $followup_result['message'] ) || ! empty( $followup_result['error'] ) ) ) {
@@ -2040,6 +3039,7 @@ class PressArk_Chat {
 					trim( $read_supplements ),
 					$compressed_history
 				);
+				$context_totals = $this->accumulate_context_metrics( $context_totals, $connector );
 			}
 
 			if ( empty( $followup_result['error'] ) && ! empty( $followup_result['message'] ) ) {
@@ -2057,8 +3057,9 @@ class PressArk_Chat {
 		if ( ! empty( $preview_actions ) ) {
 			$preview = new PressArk_Preview();
 			$session = $preview->create_session( $preview_actions, $preview_actions[0]['arguments'] ?? array() );
+			$preview_actions = $preview->get_session_tool_calls( $session['session_id'] );
 
-			return array(
+			return $this->append_context_metrics_to_result( array(
 				'type'               => 'preview',
 				'message'            => $reply_text,
 				'tokens_used'        => $usage_breakdown['total_tokens'],
@@ -2077,12 +3078,12 @@ class PressArk_Chat {
 				'preview_session_id' => $session['session_id'],
 				'preview_url'        => $session['signed_url'],
 				'diff'               => $session['diff'],
-			);
+			), $context_totals );
 		}
 
 		$response_type = ! empty( $pending ) ? 'confirm_card' : 'final_response';
 
-		return array(
+		return $this->append_context_metrics_to_result( array(
 			'type'              => $response_type,
 			'message'           => $reply_text,
 			'tokens_used'       => $usage_breakdown['total_tokens'],
@@ -2097,7 +3098,167 @@ class PressArk_Chat {
 			'actions_performed' => $performed,
 			'pending_actions'   => $pending,
 			'routing_decision'  => $routing_decision,
-		);
+		), $context_totals );
+	}
+
+	/**
+	 * Handle action confirmation (approve or cancel).
+	 *
+	 * v3.1.0: Run-aware. If run_id is provided, looks up the originating run,
+	 * restores the persisted pause snapshot, and executes the post-apply verify phase.
+	 * Falls back to legacy behavior if run_id is empty (backward compat).
+	 *
+	 * v3.7.2: Server-authoritative action loading. When run_id is provided,
+	 * the action is loaded from the run's persisted pending_actions instead
+	 * of trusting client-supplied action_data. This prevents a malicious
+	 * client from executing arbitrary actions the AI never proposed.
+	 */
+	public function handle_confirm_stream( WP_REST_Request $request ): void {
+		$confirmed    = (bool) $request->get_param( 'confirmed' );
+		$run_id       = sanitize_text_field( (string) $request->get_param( 'run_id' ) );
+		$action_index = (int) $request->get_param( 'action_index' );
+
+		if ( ! $confirmed ) {
+			$response = $this->handle_confirm( $request );
+			wp_send_json( $response->get_data(), $response->get_status() );
+			return;
+		}
+
+		$tracker = new PressArk_Usage_Tracker();
+		$license = new PressArk_License();
+		$tier    = $license->get_tier();
+
+		if ( empty( $run_id ) ) {
+			wp_send_json(
+				array(
+					'success' => false,
+					'message' => __( 'A run_id is required to confirm actions. Please refresh the page and try again.', 'pressark' ),
+				),
+				400
+			);
+			return;
+		}
+
+		if ( ! PressArk_Entitlements::can_write( $tier ) ) {
+			wp_send_json(
+				array(
+					'success'        => false,
+					'message'        => PressArk_Entitlements::limit_message( 'write_limit', $tier ),
+					'upgrade_prompt' => true,
+					'plan_info'      => PressArk_Entitlements::get_plan_info( $tier ),
+				),
+				403
+			);
+			return;
+		}
+
+		$run_store = new PressArk_Run_Store();
+		$run       = $run_store->get( $run_id );
+
+		if ( ! $run ) {
+			wp_send_json(
+				array(
+					'success' => false,
+					'message' => __( 'Run not found. The confirmation may have expired.', 'pressark' ),
+				),
+				404
+			);
+			return;
+		}
+
+		if ( (int) $run['user_id'] !== get_current_user_id() ) {
+			wp_send_json(
+				array(
+					'success' => false,
+					'message' => __( 'You do not own this run.', 'pressark' ),
+				),
+				403
+			);
+			return;
+		}
+
+		if ( ! in_array( $run['status'], array( 'awaiting_confirm', 'partially_confirmed' ), true ) ) {
+			wp_send_json(
+				array(
+					'success' => false,
+					'message' => sprintf(
+						/* translators: %s: current run status */
+						__( 'This run is in "%s" state and cannot be confirmed. Only runs awaiting confirmation can be approved.', 'pressark' ),
+						$run['status']
+					),
+				),
+				409
+			);
+			return;
+		}
+
+		$pending = $run['pending_actions'] ?? array();
+		if ( ! isset( $pending[ $action_index ] ) ) {
+			wp_send_json(
+				array(
+					'success' => false,
+					'message' => __( 'Invalid action index. The requested action does not exist in this run.', 'pressark' ),
+				),
+				404
+			);
+			return;
+		}
+		if ( ! empty( $pending[ $action_index ]['resolved'] ) ) {
+			wp_send_json(
+				array(
+					'success' => false,
+					'message' => __( 'This action has already been confirmed.', 'pressark' ),
+				),
+				409
+			);
+			return;
+		}
+
+		$action  = $pending[ $action_index ]['action'] ?? $pending[ $action_index ];
+		$emitter = new PressArk_SSE_Emitter();
+		$emitter->start();
+
+		try {
+			$this->hydrate_trace_context_from_run( $run );
+
+			if ( $emitter->is_connected() ) {
+				$emitter->emit(
+					'run_started',
+					array(
+						'run_id'         => (string) ( $run['run_id'] ?? $run_id ),
+						'correlation_id' => (string) ( $run['correlation_id'] ?? '' ),
+					)
+				);
+			}
+
+			$result = $this->execute_confirmed_action( $run, $pending, $action, $action_index, $tracker, $tier, $emitter );
+
+			if ( $emitter->is_connected() ) {
+				$emitter->emit( 'done', $result );
+			}
+		} catch ( \Throwable $e ) {
+			PressArk_Error_Tracker::error(
+				'Chat',
+				'Confirm stream failed',
+				array(
+					'run_id' => $run_id,
+					'error'  => $e->getMessage(),
+				)
+			);
+
+			if ( $emitter->is_connected() ) {
+				$emitter->emit(
+					'done',
+					array(
+						'success' => false,
+						'message' => __( 'The changes could not be applied due to an unexpected error. No modifications were made. Please try again.', 'pressark' ),
+					)
+				);
+			}
+		} finally {
+			$emitter->close();
+			exit;
+		}
 	}
 
 	/**
@@ -2268,8 +3429,9 @@ class PressArk_Chat {
 				) );
 			}
 
-			// Load the action from server-persisted pending_actions.
 			$action = $pending[ $action_index ]['action'] ?? $pending[ $action_index ];
+			$result = $this->execute_confirmed_action( $run, $pending, $action, $action_index, $tracker, $tier );
+			return rest_ensure_response( $result );
 			$action_meta = is_array( $action['meta'] ?? null ) ? $action['meta'] : array();
 			$permission_meta = is_array( $action_meta['permission_meta'] ?? null ) ? $action_meta['permission_meta'] : array();
 			$permission_meta['run_id']       = sanitize_text_field( (string) $run_id );
@@ -2374,7 +3536,7 @@ class PressArk_Chat {
 						if ( $readback_call ) {
 							try {
 								$readback_result = $engine->execute_read( $readback_call['name'], $readback_call['arguments'] );
-								$eval = PressArk_Verification::evaluate( $policy, $action_args, $readback_result );
+								$eval = PressArk_Verification::evaluate( $policy, $action_args, $readback_result, $result );
 								$checkpoint->record_verification(
 									$tool_name,
 									$readback_result,
@@ -2459,6 +3621,480 @@ class PressArk_Chat {
 	 * restores the persisted pause snapshot, and executes the post-apply verify phase.
 	 * Falls back to legacy behavior if no run record exists (backward compat).
 	 */
+	// v5.6.0: Streaming progress via on_progress callback (inspired by Claude Code Tool.ts pattern).
+	private function execute_confirmed_action(
+		array $run,
+		array $pending,
+		array $action,
+		int $action_index,
+		PressArk_Usage_Tracker $tracker,
+		string $tier,
+		?PressArk_SSE_Emitter $emitter = null
+	): array {
+		$run_id          = sanitize_text_field( (string) ( $run['run_id'] ?? '' ) );
+		$action_meta     = is_array( $action['meta'] ?? null ) ? $action['meta'] : array();
+		$permission_meta = is_array( $action_meta['permission_meta'] ?? null ) ? $action_meta['permission_meta'] : array();
+		$permission_meta['run_id']       = $run_id;
+		$permission_meta['action_index'] = $action_index;
+		$permission_meta['source']       = 'confirm';
+		$action_meta['approval_granted'] = true;
+		$action_meta['permission_meta']  = $permission_meta;
+		if ( empty( $action_meta['permission_context'] ) ) {
+			$action_meta['permission_context'] = 'interactive';
+		}
+		$action['meta'] = $action_meta;
+		$action_name    = (string) ( $action['type'] ?? 'confirmed_action' );
+
+		$operation            = PressArk_Operation_Registry::resolve( $action_name );
+		$tool_progress_key    = $this->confirm_tool_progress_key( $action );
+		$max_chunk_tokens     = max(
+			1,
+			(int) ( $operation instanceof PressArk_Operation ? $operation->max_stream_chunk_tokens : 500 )
+		);
+		$streamed_chunks      = array();
+		$streamed_token_count = 0;
+		$progress_sequence    = 0;
+		$stream_limit_hit     = false;
+
+		if ( $emitter && $emitter->is_connected() ) {
+			$emitter->emit(
+				'tool_call',
+				array(
+					'name'     => $action_name,
+					'tool'     => $action_name,
+					'tool_key' => $tool_progress_key,
+				)
+			);
+		}
+
+		$progress_callback = function ( $chunk ) use (
+			$emitter,
+			$action_name,
+			$tool_progress_key,
+			$max_chunk_tokens,
+			&$streamed_chunks,
+			&$streamed_token_count,
+			&$progress_sequence,
+			&$stream_limit_hit
+		): void {
+			try {
+				foreach ( $this->build_confirm_stream_progress_packets( $chunk, $max_chunk_tokens ) as $packet ) {
+					$chunk_tokens = (int) ( $packet['estimated_tokens'] ?? 0 );
+					if ( $chunk_tokens <= 0 ) {
+						continue;
+					}
+
+					if ( ( $streamed_token_count + $chunk_tokens ) > self::MAX_STREAM_PROGRESS_TOKENS ) {
+						if ( ! $stream_limit_hit ) {
+							$stream_limit_hit = true;
+							PressArk_Error_Tracker::warning(
+								'Chat',
+								'Stopped confirm progress streaming after reaching the token ceiling',
+								array(
+									'tool'       => $action_name,
+									'max_tokens' => self::MAX_STREAM_PROGRESS_TOKENS,
+								)
+							);
+						}
+						break;
+					}
+
+					$progress_sequence++;
+					$streamed_chunks[] = array(
+						'sequence'    => $progress_sequence,
+						'data'        => $packet['data'],
+						'token_count' => $chunk_tokens,
+					);
+					$streamed_token_count += $chunk_tokens;
+
+					if ( $emitter && $emitter->is_connected() ) {
+						$emitter->emit(
+							'tool_progress',
+							array(
+								'name'     => $action_name,
+								'tool'     => $action_name,
+								'tool_key' => $tool_progress_key,
+								'sequence' => $progress_sequence,
+								'progress' => $packet['data'],
+							)
+						);
+					}
+				}
+			} catch ( \Throwable $e ) {
+				PressArk_Error_Tracker::warning(
+					'Chat',
+					'Confirm progress callback failed but execution continued',
+					array(
+						'tool'  => $action_name,
+						'error' => $e->getMessage(),
+					)
+				);
+			}
+		};
+
+		$logger = new PressArk_Action_Logger();
+		$engine = new PressArk_Action_Engine( $logger );
+		$result = $engine->execute_single( $action, false, $progress_callback );
+
+		if ( ! empty( $streamed_chunks ) ) {
+			$result['streamed_chunks'] = array(
+				array(
+					'tool'        => sanitize_key( $action_name ),
+					'tool_key'    => $tool_progress_key,
+					'chunk_count' => count( $streamed_chunks ),
+					'token_count' => $streamed_token_count,
+					'progress'    => $this->merge_confirm_stream_progress_chunks( $streamed_chunks ),
+				),
+			);
+			$result['streamed_token_count'] = $streamed_token_count;
+		}
+
+		if ( $emitter && $emitter->is_connected() ) {
+			$emitter->emit(
+				'tool_result',
+				array(
+					'name'     => $action_name,
+					'tool'     => $action_name,
+					'tool_key' => $tool_progress_key,
+					'success'  => ! empty( $result['success'] ),
+					'summary'  => sanitize_text_field( (string) ( $result['message'] ?? '' ) ),
+				)
+			);
+		}
+
+		$result = $this->attach_approval_outcome(
+			$result,
+			'approved',
+			array(
+				'action'      => $action_name,
+				'actor'       => 'user',
+				'scope'       => 'confirm',
+				'source'      => 'approval',
+				'reason_code' => 'user_confirmed',
+			)
+		);
+
+		if ( ! empty( $result['success'] ) ) {
+			$tracker->increment_if_write( $action['type'] ?? '' );
+		}
+
+		$run_store    = new PressArk_Run_Store();
+		$all_resolved = false;
+
+		if ( ! empty( $result['success'] ) ) {
+			if ( ! is_array( $pending[ $action_index ] ) ) {
+				$pending[ $action_index ] = array(
+					'action' => $action,
+				);
+			}
+			$pending[ $action_index ]['resolved'] = true;
+			$all_resolved                          = true;
+
+			foreach ( $pending as $pending_action ) {
+				if ( empty( $pending_action['resolved'] ) ) {
+					$all_resolved = false;
+					break;
+				}
+			}
+
+			if ( $all_resolved ) {
+				$result        = PressArk_Pipeline::settle_run( $run_id, $result );
+				$run['status'] = 'settled';
+			} else {
+				$run_store->update_pending( $run_id, $pending, 'partially_confirmed' );
+				$run['pending_actions']   = $pending;
+				$run['status']            = 'partially_confirmed';
+				$result['run_id']         = $run_id;
+				$result['correlation_id'] = (string) ( $run['correlation_id'] ?? '' );
+			}
+		} else {
+			$result['run_id']         = $run_id;
+			$result['correlation_id'] = (string) ( $run['correlation_id'] ?? '' );
+		}
+
+		$action_args = is_array( $action['params'] ?? null ) ? $action['params'] : array();
+		if ( empty( $action_args ) ) {
+			$action_args = $action;
+			unset( $action_args['type'], $action_args['description'], $action_args['meta'] );
+		}
+
+		$checkpoint = $this->load_or_bootstrap_run_checkpoint( $run );
+		$this->remember_approval_outcome(
+			$checkpoint,
+			$action_name,
+			'approved',
+			array(
+				'scope'       => 'confirm',
+				'source'      => 'approval',
+				'actor'       => 'user',
+				'reason_code' => 'user_confirmed',
+			)
+		);
+		$checkpoint->record_execution_write( (string) ( $action['type'] ?? '' ), $action_args, $result );
+
+		if ( ! empty( $result['success'] ) ) {
+			$checkpoint->clear_blockers();
+			$checkpoint->add_approval( $action_name );
+			$this->advance_plan_execution_state( $checkpoint, array( 'confirm' ), $action_name . ':confirm' );
+			$this->advance_plan_execution_state( $checkpoint, array( 'write' ), $action_name );
+			if ( $all_resolved ) {
+				$checkpoint->set_workflow_stage( 'settled' );
+			}
+
+			if ( class_exists( 'PressArk_Verification' ) ) {
+				$tool_name = (string) ( $action['type'] ?? '' );
+				$policy    = PressArk_Verification::get_policy( $tool_name, $result );
+				if ( $policy && 'none' !== ( $policy['strategy'] ?? 'none' ) ) {
+					$readback_call = PressArk_Verification::build_readback( $policy, $result, $action_args );
+					if ( $readback_call ) {
+						try {
+							$readback_result = $engine->execute_read( $readback_call['name'], $readback_call['arguments'] );
+							$eval            = PressArk_Verification::evaluate( $policy, $action_args, $readback_result, $result );
+							$checkpoint->record_verification(
+								$tool_name,
+								$readback_result,
+								$eval['passed'],
+								$eval['evidence'],
+								array(
+									'policy'     => $policy,
+									'readback'   => array( 'tool' => $readback_call['name'] ?? '' ),
+									'mismatches' => $eval['mismatches'] ?? array(),
+								)
+							);
+							$result['verification'] = array(
+								'passed'   => $eval['passed'],
+								'evidence' => $eval['evidence'],
+								'status'   => $eval['passed'] ? 'verified' : 'uncertain',
+							);
+						} catch ( \Throwable $ve ) {
+							$readback_error = 'Read-back failed: ' . sanitize_text_field( $ve->getMessage() );
+							$checkpoint->record_verification(
+								$tool_name,
+								array(
+									'success' => false,
+									'message' => $readback_error,
+								),
+								false,
+								$readback_error,
+								array(
+									'policy'          => $policy,
+									'readback'        => array( 'tool' => $readback_call['name'] ?? '' ),
+									'readback_failed' => true,
+								)
+							);
+							$result['verification'] = array(
+								'passed'   => false,
+								'evidence' => $readback_error,
+								'status'   => 'uncertain',
+							);
+						}
+					}
+				}
+
+				$nudge = PressArk_Verification::build_nudge( $tool_name, $result, $result['verification'] ?? null );
+				if ( $nudge ) {
+					$result['verification_nudge'] = $nudge;
+				}
+			}
+			if ( ! empty( $result['verification'] ) ) {
+				$this->advance_plan_execution_state( $checkpoint, array( 'verify' ), $action_name . ':verify' );
+			}
+			$this->maybe_complete_plan_execution( $run, $checkpoint );
+		} else {
+			$checkpoint->add_blocker( (string) ( $result['message'] ?? 'Confirmed action failed.' ) );
+		}
+
+		$this->persist_run_checkpoint( $run, $checkpoint );
+		$result['checkpoint'] = $checkpoint->to_array();
+		$result               = $this->attach_continuation_context( $result, $run, $checkpoint );
+		$this->persist_run_detail_snapshot( $run, $result, $checkpoint );
+
+		$result['usage']     = $tracker->get_usage_data();
+		$result['plan_info'] = PressArk_Entitlements::get_plan_info( $tier );
+		$result              = $this->hydrate_approval_receipt(
+			$result,
+			array(
+				'run_status' => sanitize_key( (string) ( $run['status'] ?? '' ) ),
+			)
+		);
+
+		return $this->hydrate_chat_surfaces( $result, (string) ( $run['route'] ?? 'agent' ) );
+	}
+
+	private function confirm_tool_progress_key( array $action ): string {
+		$id = sanitize_text_field( (string) ( $action['id'] ?? '' ) );
+		if ( '' !== $id ) {
+			return $id;
+		}
+
+		$name      = sanitize_key( (string) ( $action['type'] ?? $action['name'] ?? 'tool' ) );
+		$arguments = wp_json_encode( $action['params'] ?? $action['arguments'] ?? array() );
+		if ( ! is_string( $arguments ) ) {
+			$arguments = '';
+		}
+
+		return $name . ':' . substr( md5( $arguments ), 0, 12 );
+	}
+
+	private function build_confirm_stream_progress_packets( $chunk, int $max_chunk_tokens ): array {
+		$data = $this->normalize_confirm_stream_chunk( $chunk );
+		if ( empty( $data ) ) {
+			return array();
+		}
+
+		$estimated = $this->estimate_stream_payload_tokens( $data );
+		if ( $estimated <= $max_chunk_tokens ) {
+			return array(
+				array(
+					'data'             => $data,
+					'estimated_tokens' => $estimated,
+				),
+			);
+		}
+
+		$packets = array();
+		$current = array();
+		$is_list = array_keys( $data ) === range( 0, count( $data ) - 1 );
+
+		foreach ( $data as $key => $value ) {
+			$candidate = $current;
+			if ( $is_list ) {
+				$candidate[] = $value;
+			} else {
+				$candidate[ $key ] = $value;
+			}
+
+			if ( ! empty( $current ) && $this->estimate_stream_payload_tokens( $candidate ) > $max_chunk_tokens ) {
+				$packets[] = array(
+					'data'             => $current,
+					'estimated_tokens' => $this->estimate_stream_payload_tokens( $current ),
+				);
+				$current = $is_list ? array( $value ) : array( $key => $value );
+				continue;
+			}
+
+			$current = $candidate;
+		}
+
+		if ( ! empty( $current ) ) {
+			$packets[] = array(
+				'data'             => $current,
+				'estimated_tokens' => $this->estimate_stream_payload_tokens( $current ),
+			);
+		}
+
+		return ! empty( $packets )
+			? $packets
+			: array(
+				array(
+					'data'             => $data,
+					'estimated_tokens' => $estimated,
+				),
+			);
+	}
+
+	private function normalize_confirm_stream_chunk( $chunk ): array {
+		if ( is_array( $chunk ) ) {
+			$data = $chunk;
+		} elseif ( is_object( $chunk ) ) {
+			$data = (array) $chunk;
+		} elseif ( null === $chunk ) {
+			return array();
+		} else {
+			$data = array(
+				'message' => sanitize_text_field( (string) $chunk ),
+			);
+		}
+
+		$sanitized = $this->sanitize_confirm_stream_value( $data );
+		if ( ! is_array( $sanitized ) ) {
+			return array();
+		}
+
+		return array_filter(
+			$sanitized,
+			static function ( $value ) {
+				if ( null === $value ) {
+					return false;
+				}
+				if ( is_string( $value ) ) {
+					return '' !== trim( $value );
+				}
+				if ( is_array( $value ) ) {
+					return ! empty( $value );
+				}
+				return true;
+			}
+		);
+	}
+
+	private function sanitize_confirm_stream_value( $value, ?string $key = null ) {
+		if ( is_array( $value ) ) {
+			$sanitized = array();
+			foreach ( $value as $child_key => $child_value ) {
+				$normalized_key               = is_string( $child_key ) ? $child_key : (string) $child_key;
+				$sanitized[ $normalized_key ] = $this->sanitize_confirm_stream_value( $child_value, $normalized_key );
+			}
+			return $sanitized;
+		}
+
+		if ( is_object( $value ) ) {
+			return $this->sanitize_confirm_stream_value( (array) $value, $key );
+		}
+
+		if ( is_bool( $value ) || is_int( $value ) || is_float( $value ) || null === $value ) {
+			return $value;
+		}
+
+		$text     = sanitize_text_field( (string) $value );
+		$key_name = strtolower( (string) $key );
+
+		if ( '' === $text ) {
+			return '';
+		}
+
+		if ( '' !== $key_name && preg_match( '/(email|e-mail|api[_-]?key|token|secret|password|authorization|auth)/i', $key_name ) ) {
+			return '[redacted]';
+		}
+
+		if ( preg_match( '/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i', $text ) ) {
+			return '[redacted-email]';
+		}
+
+		if ( preg_match( '/\b(?:sk|pk|rk|api)[-_][A-Za-z0-9_-]{8,}\b/', $text ) ) {
+			return '[redacted-secret]';
+		}
+
+		if ( mb_strlen( $text ) > 240 ) {
+			$text = mb_substr( $text, 0, 240 ) . '...';
+		}
+
+		return $text;
+	}
+
+	private function estimate_stream_payload_tokens( $value ): int {
+		$serialized = wp_json_encode( $value );
+		if ( ! is_string( $serialized ) || '' === $serialized ) {
+			return 0;
+		}
+
+		return (int) ceil( mb_strlen( $serialized ) / 4 );
+	}
+
+	private function merge_confirm_stream_progress_chunks( array $chunks ): array {
+		if ( empty( $chunks ) ) {
+			return array();
+		}
+
+		$last = end( $chunks );
+		reset( $chunks );
+
+		return is_array( $last['data'] ?? null ) ? (array) $last['data'] : array();
+	}
+
+	/**
+	 * Handle preview keep.
+	 */
 	public function handle_preview_keep( WP_REST_Request $request ): WP_REST_Response {
 		try {
 			$session_id = $request->get_param( 'session_id' );
@@ -2541,7 +4177,11 @@ class PressArk_Chat {
 				if ( ! empty( $result['success'] ) ) {
 					$checkpoint->clear_blockers();
 					$checkpoint->set_workflow_stage( 'settled' );
-					$checkpoint->clear_plan_state();
+					$this->advance_plan_execution_state( $checkpoint, array( 'preview' ), 'preview_apply:preview' );
+					$advance_count = max( 1, is_array( $session_calls ) ? count( $session_calls ) : 0 );
+					for ( $advance_index = 0; $advance_index < $advance_count; $advance_index++ ) {
+						$this->advance_plan_execution_state( $checkpoint, array( 'write' ), 'preview_apply' );
+					}
 
 					// v5.4.0: Evidence-based verification for preview-applied writes.
 					if ( class_exists( 'PressArk_Verification' ) && ! empty( $session_calls ) ) {
@@ -2560,7 +4200,7 @@ class PressArk_Chat {
 							}
 							try {
 								$readback_result_v = $engine_v->execute_read( $readback_call_v['name'], $readback_call_v['arguments'] );
-								$eval_v = PressArk_Verification::evaluate( $policy_v, $args_v, $readback_result_v );
+								$eval_v = PressArk_Verification::evaluate( $policy_v, $args_v, $readback_result_v, $result );
 								$checkpoint->record_verification(
 									$tool_name_v,
 									$readback_result_v,
@@ -2608,6 +4248,13 @@ class PressArk_Chat {
 							}
 						}
 					}
+					if ( ! empty( $result['verification'] ) ) {
+						$verification_count = is_array( $result['verification'] ) ? count( $result['verification'] ) : 1;
+						for ( $verify_index = 0; $verify_index < max( 1, $verification_count ); $verify_index++ ) {
+							$this->advance_plan_execution_state( $checkpoint, array( 'verify' ), 'preview_apply:verify' );
+						}
+					}
+					$this->maybe_complete_plan_execution( $run, $checkpoint );
 				} else {
 					$checkpoint->add_blocker( (string) ( $result['message'] ?? 'Preview apply failed.' ) );
 				}
@@ -3049,6 +4696,9 @@ class PressArk_Chat {
 	public function handle_delete_chat( WP_REST_Request $request ): WP_REST_Response {
 		$history = new PressArk_Chat_History();
 		$deleted = $history->delete_chat( absint( $request['id'] ) );
+		if ( $deleted && class_exists( 'PressArk_Context_Collector' ) ) {
+			PressArk_Context_Collector::clear_cache();
+		}
 
 		return rest_ensure_response( array( 'success' => $deleted ) );
 	}

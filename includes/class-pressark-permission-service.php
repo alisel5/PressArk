@@ -200,8 +200,44 @@ class PressArk_Permission_Service {
 		$approval_granted = ! empty( $meta['approval_granted'] )
 			&& ( ! class_exists( 'PressArk_Policy_Engine' ) || PressArk_Policy_Engine::CONTEXT_INTERACTIVE === $context );
 
+		$local_permission = class_exists( 'PressArk_Operation_Registry' )
+			? PressArk_Operation_Registry::check_permissions(
+				$operation_name,
+				$params,
+				array_merge(
+					array(
+						'context' => $context,
+					),
+					$meta
+				)
+			)
+			: array(
+				'allowed'   => true,
+				'behavior'  => 'allow',
+				'reason'    => '',
+				'ui_action' => 'none',
+			);
+		$local_behavior   = sanitize_key( (string) ( $local_permission['behavior'] ?? 'allow' ) );
+		if ( ! in_array( $local_behavior, array( 'allow', 'ask', 'block' ), true ) ) {
+			$local_behavior = ! empty( $local_permission['allowed'] ) ? 'allow' : 'block';
+		}
+
 		if ( PressArk_Permission_Decision::is_denied( $decision ) ) {
 			return $gate;
+		}
+
+		if ( 'allow' !== $local_behavior ) {
+			$gate['permission_decision'] = self::build_local_permission_decision(
+				$operation_name,
+				$params,
+				$context,
+				$meta,
+				$local_permission
+			);
+
+			if ( 'block' === $local_behavior || ! $approval_granted ) {
+				return $gate;
+			}
 		}
 
 		if ( PressArk_Permission_Decision::is_ask( $decision ) && ! $approval_granted ) {
@@ -220,6 +256,138 @@ class PressArk_Permission_Service {
 
 		$gate['allowed'] = true;
 		return $gate;
+	}
+
+	/**
+	 * Convert an operation-local permission probe into the canonical decision
+	 * shape used by execution denials and receipts.
+	 *
+	 * @param string $operation_name Operation name.
+	 * @param array  $params         Operation arguments.
+	 * @param string $context        Execution context.
+	 * @param array  $meta           Extra execution metadata.
+	 * @param array  $permission     Raw local permission payload.
+	 * @return array
+	 */
+	private static function build_local_permission_decision(
+		string $operation_name,
+		array $params,
+		string $context,
+		array $meta,
+		array $permission
+	): array {
+		$behavior = sanitize_key( (string) ( $permission['behavior'] ?? 'allow' ) );
+		if ( ! in_array( $behavior, array( 'allow', 'ask', 'block' ), true ) ) {
+			$behavior = ! empty( $permission['allowed'] ) ? 'allow' : 'block';
+		}
+
+		$reason    = sanitize_text_field(
+			(string) (
+				$permission['reason']
+				?? $permission['message']
+				?? ( 'ask' === $behavior
+					? __( 'This action needs permission before it can run.', 'pressark' )
+					: __( 'Blocked by the operation permission contract.', 'pressark' ) )
+			)
+		);
+		$operation = class_exists( 'PressArk_Operation_Registry' )
+			? PressArk_Operation_Registry::resolve( $operation_name )
+			: null;
+		$decision  = PressArk_Permission_Decision::create(
+			'ask' === $behavior
+				? PressArk_Permission_Decision::ASK
+				: ( 'allow' === $behavior ? PressArk_Permission_Decision::ALLOW : PressArk_Permission_Decision::DENY ),
+			$reason,
+			'operation_contract',
+			array(
+				'operation'  => $operation_name,
+				'context'    => $context,
+				'meta'       => $meta,
+				'provenance' => array(
+					'authority' => 'operation_contract',
+					'source'    => 'operation_contract',
+					'kind'      => 'local_permission',
+				),
+				'debug'      => array_filter(
+					array(
+						'registered'       => null !== $operation,
+						'group'            => $operation ? $operation->group : '',
+						'capability'       => class_exists( 'PressArk_Operation_Registry' )
+							? PressArk_Operation_Registry::classify( $operation_name, $params )
+							: 'read',
+						'risk'             => $operation ? $operation->risk : 'moderate',
+						'local_permission' => array_filter(
+							array(
+								'behavior'  => $behavior,
+								'ui_action' => sanitize_key( (string) ( $permission['ui_action'] ?? '' ) ),
+							),
+							static fn( $value ) => '' !== (string) $value
+						),
+					),
+					static function ( $value ) {
+						if ( is_array( $value ) ) {
+							return ! empty( $value );
+						}
+
+						return ! ( is_string( $value ) && '' === $value );
+					}
+				),
+			)
+		);
+
+		if ( 'ask' === $behavior ) {
+			$decision = PressArk_Permission_Decision::with_approval(
+				$decision,
+				true,
+				self::local_permission_approval_mode( $permission ),
+				self::local_permission_approval_available( $context, $permission )
+			);
+		}
+
+		return PressArk_Permission_Decision::with_visibility(
+			$decision,
+			! PressArk_Permission_Decision::is_denied( $decision ),
+			'ask' === $behavior ? array( 'local_permission_ask' ) : array( 'local_permission_block' )
+		);
+	}
+
+	/**
+	 * Map a local permission UI hint onto the canonical approval mode enum.
+	 *
+	 * @param array $permission Raw local permission payload.
+	 * @return string
+	 */
+	private static function local_permission_approval_mode( array $permission ): string {
+		$ui_action = sanitize_key( (string) ( $permission['ui_action'] ?? '' ) );
+
+		return match ( $ui_action ) {
+			'upgrade_modal' => PressArk_Permission_Decision::APPROVAL_UNAVAILABLE,
+			default => PressArk_Permission_Decision::APPROVAL_HUMAN,
+		};
+	}
+
+	/**
+	 * Determine whether the current context can satisfy a local ask verdict.
+	 *
+	 * @param string $context    Execution context.
+	 * @param array  $permission Raw local permission payload.
+	 * @return bool
+	 */
+	private static function local_permission_approval_available( string $context, array $permission ): bool {
+		$ui_action = sanitize_key( (string) ( $permission['ui_action'] ?? '' ) );
+		if ( 'upgrade_modal' === $ui_action ) {
+			return false;
+		}
+
+		return ! in_array(
+			$context,
+			array(
+				class_exists( 'PressArk_Policy_Engine' ) ? PressArk_Policy_Engine::CONTEXT_AGENT_READ : 'agent_read',
+				class_exists( 'PressArk_Policy_Engine' ) ? PressArk_Policy_Engine::CONTEXT_AUTOMATION : 'automation',
+				class_exists( 'PressArk_Policy_Engine' ) ? PressArk_Policy_Engine::CONTEXT_PREVIEW : 'preview',
+			),
+			true
+		);
 	}
 
 	/**

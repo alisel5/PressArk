@@ -14,12 +14,69 @@ if ( ! defined( 'ABSPATH' ) ) {
 class PressArk_Handler_SEO extends PressArk_Handler_Base {
 
 	/**
+	 * Fast pre-execution permission probe for SEO and security tools.
+	 *
+	 * @since 5.6.0
+	 */
+	public function check_permissions( string $tool_name, array $params, array $context = array() ): array {
+		$post_id = absint( $params['post_id'] ?? $params['scope'] ?? 0 );
+
+		switch ( $tool_name ) {
+			case 'analyze_seo':
+				return $post_id > 0
+					? $this->permission_require_capability(
+						$tool_name,
+						$params,
+						$context,
+						'edit_post',
+						$post_id,
+						__( 'Insufficient permissions.', 'pressark' )
+					)
+					: $this->permission_require_capability(
+						$tool_name,
+						$params,
+						$context,
+						'edit_posts',
+						null,
+						__( 'Insufficient permissions.', 'pressark' )
+					);
+
+			case 'fix_seo':
+				return $this->permission_require_capability(
+					$tool_name,
+					$params,
+					$context,
+					'edit_posts',
+					null,
+					__( 'Insufficient permissions.', 'pressark' )
+				);
+
+			case 'scan_security':
+			case 'fix_security':
+				return $this->permission_require_capability(
+					$tool_name,
+					$params,
+					$context,
+					'manage_options',
+					null,
+					__( 'Insufficient permissions.', 'pressark' )
+				);
+		}
+
+		return $this->entitlement_permission( $tool_name, $params, $context );
+	}
+
+	/**
 	 * Analyse on-page / site-wide SEO via PressArk_SEO_Scanner.
 	 *
 	 * @param array $params {post_id|scope} — 'all'/'site'/null for site-wide, int for single page.
 	 * @return array
 	 */
 	public function analyze_seo( array $params ): array {
+		// PressArk v5.1.1 hardening: require post-edit capability before SEO analysis.
+		if ( ! current_user_can( 'edit_posts' ) ) {
+			return $this->error( __( 'Insufficient permissions.', 'pressark' ) );
+		}
 		$scanner = new PressArk_SEO_Scanner();
 
 		// Accept post_id from multiple places the AI might put it.
@@ -107,7 +164,11 @@ class PressArk_Handler_SEO extends PressArk_Handler_Base {
 								continue;
 							}
 						}
-						PressArk_SEO_Resolver::write( $pid, $field, sanitize_text_field( $fix[ $field ] ) );
+						// PressArk v5.1.1 hardening: sanitize SEO field values with field-appropriate rules.
+						$value = 'og_image' === $field
+							? esc_url_raw( $fix[ $field ] )
+							: sanitize_text_field( $fix[ $field ] );
+						PressArk_SEO_Resolver::write( $pid, $field, $value );
 						$meta_applied[] = $label;
 					}
 
@@ -153,7 +214,15 @@ class PressArk_Handler_SEO extends PressArk_Handler_Base {
 				if ( 'update_meta' === $fix_type ) {
 					$fix_post_id = absint( $fix['post_id'] ?? 0 );
 					$fix_key     = sanitize_text_field( $fix['key'] ?? '' );
-					$fix_value   = sanitize_text_field( $fix['suggested_value'] ?? ( $fix['value'] ?? '' ) );
+					// PressArk v5.1.1 hardening: allow only supported SEO keys through the legacy update path.
+					$allowed     = array( 'meta_title', 'meta_description', 'og_title', 'og_description', 'og_image', 'focus_keyword' );
+					if ( ! in_array( $fix_key, $allowed, true ) ) {
+						continue;
+					}
+					$raw_value = $fix['suggested_value'] ?? ( $fix['value'] ?? '' );
+					$fix_value = 'og_image' === $fix_key
+						? esc_url_raw( $raw_value )
+						: sanitize_text_field( $raw_value );
 
 					if ( $fix_post_id && $fix_key && current_user_can( 'edit_post', $fix_post_id ) ) {
 						$resolved_key = PressArk_SEO_Resolver::resolve_key( $fix_key );

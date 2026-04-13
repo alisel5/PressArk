@@ -54,10 +54,10 @@ class PressArk_Action_Engine {
 	 * @param array  $tool_args Arguments from AI tool_call.
 	 * @return array Result from the action handler.
 	 */
-	public function execute_read( string $tool_name, array $tool_args ): array {
+	public function execute_read( string $tool_name, array $tool_args, ?callable $on_progress = null ): array {
 		$tracker = new PressArk_Usage_Tracker();
 
-		if ( $tracker->is_write_action( $tool_name ) || PressArk_Tool_Catalog::instance()->classify( $tool_name ) !== 'read' ) {
+		if ( $tracker->is_write_action( $tool_name ) || PressArk_Tool_Catalog::instance()->classify( $tool_name, $tool_args ) !== 'read' ) {
 			return array(
 				'success'     => false,
 				'message'     => sprintf( 'Tool "%s" is not a read-only tool.', $tool_name ),
@@ -70,7 +70,7 @@ class PressArk_Action_Engine {
 			'params' => $tool_args,
 		);
 
-		return $this->execute_single( $action, true );
+		return $this->execute_single( $action, true, $on_progress );
 	}
 
 	/**
@@ -80,7 +80,7 @@ class PressArk_Action_Engine {
 	 * @param bool  $skip_log Whether to skip action logging (used by agentic read loop).
 	 * @return array Result with success, message, action_type.
 	 */
-	public function execute_single( $action, bool $skip_log = false ): array {
+	public function execute_single( $action, bool $skip_log = false, ?callable $on_progress = null ): array {
 		try {
 			$action = $this->normalize_action( $action );
 			$type   = sanitize_text_field( $action['type'] ?? '' );
@@ -180,7 +180,7 @@ class PressArk_Action_Engine {
 						);
 					}
 
-					$rerouted_result = $this->execute_single( $rerouted_action, $skip_log );
+					$rerouted_result = $this->execute_single( $rerouted_action, $skip_log, $on_progress );
 
 					// Annotate the result so the model knows a reroute happened.
 					$rerouted_result['preflight_reroute'] = array(
@@ -296,7 +296,7 @@ class PressArk_Action_Engine {
 				$params = apply_filters( $hook_name, $params, $type );
 			}
 
-			$result = $this->dispatch( $type, $params );
+			$result = $this->dispatch( $type, $params, $on_progress );
 
 			$result['action_type'] = $type;
 
@@ -355,7 +355,7 @@ class PressArk_Action_Engine {
 	 * @param array  $params Tool arguments.
 	 * @return array Result with success, message, etc.
 	 */
-	private function dispatch( string $type, array $params ): array {
+	private function dispatch( string $type, array $params, ?callable $on_progress = null ): array {
 		$operation = PressArk_Operation_Registry::resolve( $type );
 
 		if ( ! $operation ) {
@@ -369,7 +369,7 @@ class PressArk_Action_Engine {
 			);
 		}
 
-		return $this->handlers->dispatch( $operation, $params );
+		return $this->handlers->dispatch( $operation, $params, $on_progress );
 	}
 
 	/**

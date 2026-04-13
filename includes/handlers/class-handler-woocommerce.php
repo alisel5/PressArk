@@ -13,6 +13,150 @@ if ( ! defined( 'ABSPATH' ) ) {
  */
 class PressArk_Handler_WooCommerce extends PressArk_Handler_Base {
 
+	/**
+	 * Fast pre-execution permission probe for WooCommerce tools.
+	 *
+	 * @since 5.6.0
+	 */
+	public function check_permissions( string $tool_name, array $params, array $context = array() ): array {
+		$product_id = absint( $params['product_id'] ?? $params['post_id'] ?? $params['id'] ?? 0 );
+
+		switch ( $tool_name ) {
+			case 'get_product':
+			case 'list_variations':
+			case 'list_product_attributes':
+			case 'inventory_report':
+			case 'stock_report':
+			case 'get_top_sellers':
+			case 'get_products_on_sale':
+				return $this->permission_require_wc(
+					$tool_name,
+					$params,
+					$context,
+					'edit_products',
+					null,
+					__( 'Insufficient permissions.', 'pressark' )
+				);
+
+			case 'edit_product':
+				return $product_id > 0
+					? $this->permission_require_wc(
+						$tool_name,
+						$params,
+						$context,
+						'edit_post',
+						$product_id,
+						__( 'You do not have permission to edit this product.', 'pressark' )
+					)
+					: $this->permission_require_wc(
+						$tool_name,
+						$params,
+						$context,
+						'edit_products',
+						null,
+						__( 'You do not have permission to edit products.', 'pressark' )
+					);
+
+			case 'create_product':
+				return $this->permission_require_wc(
+					$tool_name,
+					$params,
+					$context,
+					'publish_products',
+					null,
+					__( 'You do not have permission to create products.', 'pressark' )
+				);
+
+			case 'bulk_edit_products':
+			case 'edit_variation':
+			case 'create_variation':
+			case 'bulk_edit_variations':
+				return $this->permission_require_wc(
+					$tool_name,
+					$params,
+					$context,
+					'edit_products',
+					null,
+					__( 'You do not have permission to edit products.', 'pressark' )
+				);
+
+			case 'analyze_store':
+			case 'sales_summary':
+			case 'customer_insights':
+			case 'category_report':
+			case 'revenue_report':
+				return $this->permission_require_wc(
+					$tool_name,
+					$params,
+					$context,
+					'manage_woocommerce',
+					null,
+					__( 'You need the "manage_woocommerce" capability for this operation.', 'pressark' )
+				);
+
+			case 'list_orders':
+			case 'get_order':
+			case 'update_order':
+			case 'create_refund':
+			case 'create_order':
+			case 'get_order_statuses':
+				return $this->permission_require_wc(
+					$tool_name,
+					$params,
+					$context,
+					'edit_shop_orders',
+					null,
+					__( 'You need the "edit_shop_orders" capability to modify orders and refunds.', 'pressark' )
+				);
+
+			case 'manage_coupon':
+			case 'list_customers':
+			case 'get_customer':
+			case 'get_shipping_zones':
+			case 'get_tax_settings':
+			case 'get_payment_gateways':
+			case 'get_wc_settings':
+			case 'get_wc_emails':
+			case 'get_wc_status':
+			case 'manage_webhooks':
+			case 'get_wc_alerts':
+			case 'trigger_wc_email':
+				return $this->permission_require_wc(
+					$tool_name,
+					$params,
+					$context,
+					'manage_woocommerce',
+					null,
+					__( 'You need the "manage_woocommerce" capability for this operation.', 'pressark' )
+				);
+
+			case 'email_customer':
+				return $this->permission_require_wc(
+					$tool_name,
+					$params,
+					$context,
+					'manage_woocommerce',
+					null,
+					__( 'You need the "manage_woocommerce" capability to send customer emails.', 'pressark' )
+				);
+
+			case 'list_reviews':
+			case 'moderate_review':
+			case 'reply_review':
+			case 'bulk_reply_reviews':
+				return $this->permission_require_wc(
+					$tool_name,
+					$params,
+					$context,
+					'moderate_comments',
+					null,
+					__( 'Insufficient permissions.', 'pressark' )
+				);
+		}
+
+		return $this->permission_require_wc( $tool_name, $params, $context );
+	}
+
 	// ── v3.7.1 Capability Gates ──────────────────────────────────────
 
 	/**
@@ -73,6 +217,10 @@ class PressArk_Handler_WooCommerce extends PressArk_Handler_Base {
 	public function get_product( array $params ): array {
 		$err = $this->require_wc();
 		if ( $err ) return $err;
+		// PressArk v5.1.1 hardening: require product edit capability before exposing product details.
+		if ( ! current_user_can( 'edit_products' ) ) {
+			return $this->error( __( 'Insufficient permissions.', 'pressark' ) );
+		}
 
 		$post_id = absint( $params['product_id'] ?? $params['post_id'] ?? $params['id'] ?? 0 );
 		if ( ! $post_id ) {
@@ -92,6 +240,7 @@ class PressArk_Handler_WooCommerce extends PressArk_Handler_Base {
 			if ( $term && ! is_wp_error( $term ) ) {
 				$cats[] = $term->name;
 			}
+
 		}
 
 		// Tags.
@@ -101,6 +250,7 @@ class PressArk_Handler_WooCommerce extends PressArk_Handler_Base {
 			if ( $term && ! is_wp_error( $term ) ) {
 				$tags[] = $term->name;
 			}
+
 		}
 
 		// Attributes.
@@ -128,38 +278,29 @@ class PressArk_Handler_WooCommerce extends PressArk_Handler_Base {
 			$images[] = wp_get_attachment_url( $img_id );
 		}
 
-		$data = array(
-			'id'                => $post_id,
-			'name'              => $product->get_name(),
-			'type'              => $product->get_type(),
-			'status'            => $product->get_status(),
-			'url'               => $product->get_permalink(),
-			'sku'               => $product->get_sku(),
-			'description'       => $product->get_description(),
-			'short_description' => $product->get_short_description(),
-			'regular_price'     => $product->get_regular_price(),
-			'sale_price'        => $product->get_sale_price(),
-			'price'             => $product->get_price(),
-			'on_sale'           => $product->is_on_sale(),
-			'stock_status'      => $product->get_stock_status(),
-			'stock_quantity'    => $product->get_stock_quantity(),
-			'manage_stock'      => $product->get_manage_stock(),
-			'categories'        => $cats,
-			'tags'              => $tags,
-			'attributes'        => $attrs,
-			'featured'          => $product->get_featured(),
-			'virtual'           => $product->get_virtual(),
-			'downloadable'      => $product->get_downloadable(),
-			'weight'            => $product->get_weight(),
-			'dimensions'        => array(
-				'length' => $product->get_length(),
-				'width'  => $product->get_width(),
-				'height' => $product->get_height(),
-			),
-			'images'            => $images,
-			'total_sales'       => $product->get_total_sales(),
-			'average_rating'    => $product->get_average_rating(),
-			'review_count'      => $product->get_review_count(),
+		$data = array_merge(
+			$this->get_wc_product_state_snapshot( $product ),
+			array(
+				'url'               => $product->get_permalink(),
+				'description'       => $product->get_description(),
+				'short_description' => $product->get_short_description(),
+				'categories'        => $cats,
+				'tags'              => $tags,
+				'attributes'        => $attrs,
+				'featured'          => $product->get_featured(),
+				'virtual'           => $product->get_virtual(),
+				'downloadable'      => $product->get_downloadable(),
+				'weight'            => $product->get_weight(),
+				'dimensions'        => array(
+					'length' => $product->get_length(),
+					'width'  => $product->get_width(),
+					'height' => $product->get_height(),
+				),
+				'images'            => $images,
+				'total_sales'       => $product->get_total_sales(),
+				'average_rating'    => $product->get_average_rating(),
+				'review_count'      => $product->get_review_count(),
+			)
 		);
 
 		// Variable products: include variation count.
@@ -199,9 +340,38 @@ class PressArk_Handler_WooCommerce extends PressArk_Handler_Base {
 		// Save checkpoint before editing (for undo).
 		$checkpoint_id = $this->create_checkpoint( $post_id, 'edit_product' );
 
+		$ambiguous_price = $this->ambiguous_wc_price_write_response( $params );
+		if ( $ambiguous_price ) {
+			return $ambiguous_price;
+		}
+
 		$changes = $params['changes'] ?? $params;
+		if ( is_array( $changes ) ) {
+			$ambiguous_price = $this->ambiguous_wc_price_write_response( $changes );
+			if ( $ambiguous_price ) {
+				return $ambiguous_price;
+			}
+		}
 		$changes = is_array( $changes ) ? $this->normalize_product_changes( $changes ) : array();
 		$changed_list = array();
+		$had_sale_schedule = (bool) $product->get_date_on_sale_from() || (bool) $product->get_date_on_sale_to();
+		$clear_sale        = ! empty( $changes['clear_sale'] )
+			|| ( array_key_exists( 'sale_price', $changes ) && '' === (string) $changes['sale_price'] );
+
+		if ( $clear_sale ) {
+			$changes['sale_price'] = '';
+			unset( $changes['sale_from'], $changes['sale_to'] );
+		}
+
+		// PressArk v5.1.1 hardening: normalize and clamp absolute price fields before setters run.
+		$regular_price = isset( $changes['regular_price'] ) ? wc_format_decimal( wc_clean( $changes['regular_price'] ) ) : null;
+		if ( null !== $regular_price ) {
+			$changes['regular_price'] = $this->normalize_wc_price_for_write( $changes['regular_price'] );
+		}
+		$sale_price = isset( $changes['sale_price'] ) ? wc_format_decimal( wc_clean( $changes['sale_price'] ) ) : null;
+		if ( null !== $sale_price ) {
+			$changes['sale_price'] = $this->normalize_wc_price_for_write( $changes['sale_price'] );
+		}
 
 		// ── Scalar field map: param key => [setter, sanitizer] ──────────
 		$field_map = array(
@@ -253,7 +423,7 @@ class PressArk_Handler_WooCommerce extends PressArk_Handler_Base {
 			if ( ! array_key_exists( $key, $changes ) ) continue;
 			try {
 				$product->$setter( $sanitizer( $changes[ $key ] ) );
-				$changed_list[] = $key;
+				$changed_list[] = ( 'sale_price' === $key && $clear_sale ) ? 'sale_price (cleared)' : $key;
 			} catch ( \WC_Data_Exception $e ) {
 				return array(
 					/* translators: 1: field key, 2: WooCommerce error message. */
@@ -264,13 +434,47 @@ class PressArk_Handler_WooCommerce extends PressArk_Handler_Base {
 			}
 		}
 
+		if ( $clear_sale ) {
+			$product->set_date_on_sale_from( null );
+			$product->set_date_on_sale_to( null );
+			if ( $had_sale_schedule ) {
+				$changed_list[] = 'sale_schedule (cleared)';
+			}
+		}
+
 		// ── Scheduled sale dates ─────────────────────────────────────────
 		if ( array_key_exists( 'sale_from', $changes ) ) {
-			$product->set_date_on_sale_from( $changes['sale_from'] ?: null );
+			// PressArk v5.1.1 hardening: validate sale dates before persisting them.
+			if ( '' === (string) $changes['sale_from'] ) {
+				$product->set_date_on_sale_from( null );
+			} else {
+				$sale_from_ts = wc_string_to_timestamp( sanitize_text_field( (string) $changes['sale_from'] ) );
+				if ( ! $sale_from_ts ) {
+					return array(
+						'success' => false,
+						'message' => __( 'Invalid sale start date.', 'pressark' ),
+						'error'   => __( 'Invalid sale start date.', 'pressark' ),
+					);
+				}
+				$product->set_date_on_sale_from( $sale_from_ts );
+			}
 			$changed_list[] = 'sale_from';
 		}
 		if ( array_key_exists( 'sale_to', $changes ) ) {
-			$product->set_date_on_sale_to( $changes['sale_to'] ?: null );
+			// PressArk v5.1.1 hardening: validate sale dates before persisting them.
+			if ( '' === (string) $changes['sale_to'] ) {
+				$product->set_date_on_sale_to( null );
+			} else {
+				$sale_to_ts = wc_string_to_timestamp( sanitize_text_field( (string) $changes['sale_to'] ) );
+				if ( ! $sale_to_ts ) {
+					return array(
+						'success' => false,
+						'message' => __( 'Invalid sale end date.', 'pressark' ),
+						'error'   => __( 'Invalid sale end date.', 'pressark' ),
+					);
+				}
+				$product->set_date_on_sale_to( $sale_to_ts );
+			}
 			$changed_list[] = 'sale_to';
 		}
 		if ( isset( $changes['price_delta'] ) && ! isset( $changes['regular_price'] ) ) {
@@ -278,7 +482,8 @@ class PressArk_Handler_WooCommerce extends PressArk_Handler_Base {
 			if ( $current_price <= 0 ) {
 				$current_price = (float) $product->get_price();
 			}
-			$new_price = round( $current_price + (float) $changes['price_delta'], wc_get_price_decimals() );
+			// PressArk v5.1.1 hardening: prevent relative price edits from persisting negative values.
+			$new_price = max( 0, round( $current_price + (float) $changes['price_delta'], wc_get_price_decimals() ) );
 			$product->set_regular_price( (string) $new_price );
 			$changed_list[] = sprintf( 'regular_price (%+.2f => %.2f)', (float) $changes['price_delta'], $new_price );
 		}
@@ -288,7 +493,8 @@ class PressArk_Handler_WooCommerce extends PressArk_Handler_Base {
 				$current_price = (float) $product->get_price();
 			}
 			if ( $current_price > 0 ) {
-				$new_price = round( $current_price * ( 1 + ( (float) $changes['price_adjust_pct'] / 100 ) ), wc_get_price_decimals() );
+				// PressArk v5.1.1 hardening: prevent percentage price edits from persisting negative values.
+				$new_price = max( 0, round( $current_price * ( 1 + ( (float) $changes['price_adjust_pct'] / 100 ) ), wc_get_price_decimals() ) );
 				$product->set_regular_price( (string) $new_price );
 				$changed_list[] = sprintf( 'regular_price (%+.2f%% => %.2f)', (float) $changes['price_adjust_pct'], $new_price );
 			}
@@ -346,7 +552,7 @@ class PressArk_Handler_WooCommerce extends PressArk_Handler_Base {
 			return array(
 				'success' => false,
 				'message' => __( 'No product changes specified.', 'pressark' ),
-				'hint'    => __( 'Available fields: name, regular_price, sale_price, price_delta, price_adjust_pct, sale_from, sale_to, sku, stock_quantity, stock_adjust, stock_status, manage_stock, description, short_description, weight, length, width, height, tax_status, tax_class, featured, virtual, downloadable, category_ids, tag_ids, image_id, gallery_image_ids, and more.', 'pressark' ),
+				'hint'    => __( 'Available fields: name, regular_price, sale_price, clear_sale (canonical sale removal), price_delta, price_adjust_pct, sale_from, sale_to, sku, stock_quantity, stock_adjust, stock_status, manage_stock, description, short_description, weight, length, width, height, tax_status, tax_class, featured, virtual, downloadable, category_ids, tag_ids, image_id, gallery_image_ids, and more.', 'pressark' ),
 			);
 		}
 
@@ -369,6 +575,18 @@ class PressArk_Handler_WooCommerce extends PressArk_Handler_Base {
 		// v3.7.0: Flush WC transient caches to prevent stale data in admin.
 		$this->flush_wc_product_cache( $post_id );
 
+		$saved_product = wc_get_product( $post_id );
+		$saved_product = $saved_product ?: $product;
+		$data          = $this->get_wc_product_state_snapshot( $saved_product );
+		$pricing_state = array(
+			'regular_price' => $data['regular_price'],
+			'sale_price'    => $data['sale_price'],
+			'price'         => $data['price'],
+			'on_sale'       => $data['on_sale'],
+			'sale_from'     => $data['sale_from'],
+			'sale_to'       => $data['sale_to'],
+		);
+
 		// Log for undo.
 		$this->logger->log(
 			'edit_product',
@@ -381,10 +599,25 @@ class PressArk_Handler_WooCommerce extends PressArk_Handler_Base {
 		return array(
 			'success'        => true,
 			'post_id'        => $post_id,
-			'name'           => $product->get_name(),
+			'name'           => $saved_product->get_name(),
 			'changed'        => $changed_list,
+			'regular_price'  => $data['regular_price'],
+			'sale_price'     => $data['sale_price'],
+			'price'          => $data['price'],
+			'on_sale'        => $data['on_sale'],
+			'sale_from'      => $data['sale_from'],
+			'sale_to'        => $data['sale_to'],
+			'stock_quantity' => $data['stock_quantity'],
+			'stock_status'   => $data['stock_status'],
+			'manage_stock'   => $data['manage_stock'],
+			'pricing_state'  => $pricing_state,
+			'data'           => $data,
 			/* translators: %s: comma-separated list of updated product fields. */
-			'message'        => sprintf( __( 'Product updated: %s.', 'pressark' ), implode( ', ', $changed_list ) ),
+			'message'        => sprintf(
+				__( 'Product updated: %1$s. Pricing now %2$s.', 'pressark' ),
+				implode( ', ', $changed_list ),
+				$this->summarize_wc_product_pricing_state( $pricing_state )
+			),
 			'lookup_updated' => true,
 		);
 	}
@@ -397,6 +630,11 @@ class PressArk_Handler_WooCommerce extends PressArk_Handler_Base {
 	public function create_product( array $params ): array {
 		$err = $this->require_wc();
 		if ( $err ) return $err;
+
+		$ambiguous_price = $this->ambiguous_wc_price_write_response( $params );
+		if ( $ambiguous_price ) {
+			return $ambiguous_price;
+		}
 
 		if ( ! current_user_can( 'publish_products' ) ) {
 			return array( 'error' => __( 'Insufficient permissions to create products.', 'pressark' ) );
@@ -467,9 +705,13 @@ class PressArk_Handler_WooCommerce extends PressArk_Handler_Base {
 	 * v3.7.0: Added batch size cap, per-item exception isolation, WC cache
 	 * flush after batch, and partial-success reporting with error details.
 	 */
-	public function bulk_edit_products( array $params ): array {
+	public function bulk_edit_products( array $params, ?callable $on_progress = null ): array {
 		$err = $this->require_wc();
 		if ( $err ) return $err;
+		// PressArk v5.1.1 hardening: require product edit capability before bulk mutations.
+		if ( ! current_user_can( 'edit_products' ) ) {
+			return $this->error( __( 'Insufficient permissions.', 'pressark' ) );
+		}
 
 		$resolution = $this->resolve_bulk_product_updates( $params );
 		if ( ! empty( $resolution['error'] ) ) {
@@ -477,6 +719,7 @@ class PressArk_Handler_WooCommerce extends PressArk_Handler_Base {
 				'success' => false,
 				'message' => (string) ( $resolution['message'] ?? __( 'No products to update.', 'pressark' ) ),
 				'error'   => (string) $resolution['error'],
+				'hint'    => (string) ( $resolution['hint'] ?? '' ),
 			);
 		}
 
@@ -501,35 +744,106 @@ class PressArk_Handler_WooCommerce extends PressArk_Handler_Base {
 			);
 		}
 
-		$updated  = 0;
-		$errors   = 0;
-		$details  = array();
-		$updated_ids = array();
+		$updated             = 0;
+		$errors              = 0;
+		$details             = array();
+		$product_results     = array();
+		$updated_ids         = array();
+		$verification_target = array();
+		$total               = count( $products );
 
 		foreach ( $products as $i => $product_update ) {
+			$product_result = array(
+				'post_id'                 => (int) ( $product_update['post_id'] ?? 0 ),
+				'name'                    => (string) ( $product_update['name'] ?? '' ),
+				'type'                    => (string) ( $product_update['type'] ?? 'unknown' ),
+				'status'                  => (string) ( $product_update['status'] ?? '' ),
+				'price_affecting_changes' => ! empty( $product_update['price_affecting_changes'] ),
+				'success'                 => false,
+			);
+			if ( isset( $product_update['variation_count'] ) ) {
+				$product_result['variation_count'] = (int) $product_update['variation_count'];
+			}
+			if ( isset( $product_update['child_count'] ) ) {
+				$product_result['child_count'] = (int) $product_update['child_count'];
+			}
+			if ( ! empty( $product_update['warning_flags'] ) ) {
+				$product_result['warning_flags'] = array_values( array_unique( array_map( 'strval', (array) $product_update['warning_flags'] ) ) );
+			}
+			if ( ! empty( $product_update['warnings'] ) ) {
+				$product_result['warnings'] = array_values( array_unique( array_map( 'strval', (array) $product_update['warnings'] ) ) );
+			}
+
 			// v3.7.0: Isolate each product edit so one failure doesn't abort the batch.
 			try {
 				$result = $this->edit_product( $product_update );
 				if ( $result['success'] ?? false ) {
 					$updated++;
 					$updated_ids[] = (int) ( $product_update['post_id'] ?? 0 );
+					if ( empty( $verification_target ) && ! empty( $result['pricing_state'] ) ) {
+						$verification_target = array(
+							'product_id'    => (int) ( $result['post_id'] ?? $product_update['post_id'] ?? 0 ),
+							'name'          => (string) ( $result['name'] ?? '' ),
+							'pricing_state' => (array) $result['pricing_state'],
+						);
+					}
+					$product_result['success'] = true;
+					$product_result['name']    = (string) ( $result['name'] ?? $product_result['name'] );
+					$product_result['type']    = (string) ( $result['data']['type'] ?? $product_result['type'] );
+					$product_result['status']  = (string) ( $result['data']['status'] ?? $product_result['status'] );
+					$product_result['message'] = (string) ( $result['message'] ?? '' );
+					if ( ! empty( $result['changed'] ) ) {
+						$product_result['changed'] = array_values( array_map( 'strval', (array) $result['changed'] ) );
+					}
+					if ( ! empty( $result['pricing_state'] ) ) {
+						$product_result['pricing_state'] = (array) $result['pricing_state'];
+					}
+					if ( isset( $result['data']['variation_count'] ) ) {
+						$product_result['variation_count'] = (int) $result['data']['variation_count'];
+					}
+					if ( isset( $result['data']['child_count'] ) ) {
+						$product_result['child_count'] = (int) $result['data']['child_count'];
+					}
 				} else {
 					$errors++;
-					$details[] = sprintf(
-						/* translators: 1: product ID 2: product name 3: error message */
-						__( '#%1$d (%2$s): %3$s', 'pressark' ),
-						$product_update['post_id'] ?? $i,
-						$product_update['name'] ?? __( 'unknown', 'pressark' ),
-						$result['message'] ?? __( 'Unknown error', 'pressark' )
-					);
+					$error_message             = (string) ( $result['message'] ?? __( 'Unknown error', 'pressark' ) );
+					$product_result['message'] = $error_message;
+					if ( ! empty( $result['error'] ) ) {
+						$product_result['error'] = (string) $result['error'];
+					}
+					if ( ! empty( $result['changed_before_error'] ) ) {
+						$product_result['changed_before_error'] = array_values( array_map( 'strval', (array) $result['changed_before_error'] ) );
+					}
+					$details[] = $this->format_wc_bulk_product_error_detail( $product_result, $error_message, $i );
 				}
 			} catch ( \Throwable $e ) {
 				$errors++;
+				$product_result['message'] = sprintf(
+					/* translators: %s: exception message. */
+					__( 'Exception: %s', 'pressark' ),
+					$e->getMessage()
+				);
+				$product_result['error'] = $e->getMessage();
 				$details[] = sprintf(
 					/* translators: 1: product ID, 2: exception message. */
 					__( '#%1$d: Exception — %2$s', 'pressark' ),
 					$product_update['post_id'] ?? $i,
 					$e->getMessage()
+				);
+			}
+
+			$product_results[] = $product_result;
+			if ( 0 === ( ( $i + 1 ) % 5 ) || ( $i + 1 ) === $total ) {
+				// v5.6.0: Streaming progress via on_progress callback (inspired by Claude Code Tool.ts pattern).
+				$this->emit_progress(
+					$on_progress,
+					array(
+						'processed' => $i + 1,
+						'total'     => $total,
+						'updated'   => $updated,
+						'errors'    => $errors,
+						'tool'      => 'bulk_edit_products',
+					)
 				);
 			}
 		}
@@ -550,6 +864,19 @@ class PressArk_Handler_WooCommerce extends PressArk_Handler_Base {
 			),
 		);
 
+		if ( ! empty( $resolution['matched_product_types'] ) ) {
+			$response['matched_product_types'] = (array) $resolution['matched_product_types'];
+		}
+		if ( ! empty( $resolution['price_affecting_changes'] ) ) {
+			$response['price_affecting_changes'] = true;
+		}
+		if ( ! empty( $resolution['warning_flags'] ) ) {
+			$response['warning_flags'] = array_values( array_unique( array_map( 'strval', (array) $resolution['warning_flags'] ) ) );
+		}
+		if ( ! empty( $resolution['warnings'] ) ) {
+			$response['warnings'] = array_values( array_unique( array_map( 'strval', (array) $resolution['warnings'] ) ) );
+			$response['note']     = __( 'Inspect product_results for per-product types and pricing-scope warnings. Variable parent price edits do not update child variation prices.', 'pressark' );
+		}
 		if ( ! empty( $resolution['scope'] ) ) {
 			$response['scope']  = $resolution['scope'];
 			$response['status'] = $resolution['status'] ?? 'publish';
@@ -565,6 +892,21 @@ class PressArk_Handler_WooCommerce extends PressArk_Handler_Base {
 		}
 		if ( ! empty( $updated_ids ) ) {
 			$response['product_ids'] = array_values( array_filter( array_map( 'absint', $updated_ids ) ) );
+		}
+		if ( ! empty( $verification_target['product_id'] ) ) {
+			$response['product_id'] = (int) $verification_target['product_id'];
+		}
+		if ( ! empty( $verification_target['name'] ) ) {
+			$response['verification_target_name'] = $verification_target['name'];
+		}
+		if ( ! empty( $verification_target['pricing_state'] ) ) {
+			$response['pricing_state'] = $verification_target['pricing_state'];
+		}
+		if ( ! empty( $product_results ) ) {
+			$response['product_results'] = $product_results;
+		}
+		if ( ! empty( $resolution['price_affecting_changes'] ) && count( $products ) > 1 ) {
+			$response['pricing_state_note'] = __( 'Top-level pricing_state reflects a single verification target only. Inspect product_results for per-product pricing truth.', 'pressark' );
 		}
 
 		if ( ! empty( $details ) ) {
@@ -601,6 +943,15 @@ class PressArk_Handler_WooCommerce extends PressArk_Handler_Base {
 					continue;
 				}
 
+				$ambiguous_price = $this->ambiguous_wc_price_write_response( $product_update );
+				if ( $ambiguous_price ) {
+					return array(
+						'error'   => (string) $ambiguous_price['error'],
+						'message' => (string) $ambiguous_price['message'],
+						'hint'    => (string) $ambiguous_price['hint'],
+					);
+				}
+
 				// Accept post_id, id, or product_id — models often use 'id'.
 				$post_id = absint( $product_update['post_id'] ?? $product_update['id'] ?? $product_update['product_id'] ?? 0 );
 				if ( $post_id <= 0 ) {
@@ -608,19 +959,29 @@ class PressArk_Handler_WooCommerce extends PressArk_Handler_Base {
 				}
 
 				$changes = $product_update['changes'] ?? $product_update;
+				if ( is_array( $changes ) ) {
+					$ambiguous_price = $this->ambiguous_wc_price_write_response( $changes );
+					if ( $ambiguous_price ) {
+						return array(
+							'error'   => (string) $ambiguous_price['error'],
+							'message' => (string) $ambiguous_price['message'],
+							'hint'    => (string) $ambiguous_price['hint'],
+						);
+					}
+				}
 				$changes = is_array( $changes ) ? $this->normalize_product_changes( $changes ) : array();
 				unset( $changes['post_id'], $changes['changes'] );
 
-				$normalized[] = array(
-					'post_id' => $post_id,
-					'changes' => $changes,
-				);
+				$normalized[] = $this->enrich_wc_bulk_product_update( $post_id, $changes );
 			}
 
-			return array(
-				'products' => $normalized,
-				'scope'    => 'explicit',
-				'message'  => empty( $normalized ) ? __( 'No valid products were supplied for bulk update.', 'pressark' ) : '',
+			return array_merge(
+				array(
+					'products' => $normalized,
+					'scope'    => 'explicit',
+					'message'  => empty( $normalized ) ? __( 'No valid products were supplied for bulk update.', 'pressark' ) : '',
+				),
+				$this->summarize_wc_bulk_product_updates( $normalized )
 			);
 		}
 
@@ -637,6 +998,16 @@ class PressArk_Handler_WooCommerce extends PressArk_Handler_Base {
 			$decoded = json_decode( $changes, true );
 			if ( is_array( $decoded ) ) {
 				$changes = $decoded;
+			}
+		}
+		if ( is_array( $changes ) ) {
+			$ambiguous_price = $this->ambiguous_wc_price_write_response( $changes );
+			if ( $ambiguous_price ) {
+				return array(
+					'error'   => (string) $ambiguous_price['error'],
+					'message' => (string) $ambiguous_price['message'],
+					'hint'    => (string) $ambiguous_price['hint'],
+				);
 			}
 		}
 		$changes = is_array( $changes ) ? $this->normalize_product_changes( $changes ) : array();
@@ -693,20 +1064,166 @@ class PressArk_Handler_WooCommerce extends PressArk_Handler_Base {
 
 		$resolved = array();
 		foreach ( $ids as $product_id ) {
-			$resolved[] = array(
-				'post_id' => $product_id,
-				'changes' => $changes,
+			$resolved[] = $this->enrich_wc_bulk_product_update( $product_id, $changes );
+		}
+
+		return array_merge(
+			array(
+				'products'  => $resolved,
+				'scope'     => $scope,
+				'status'    => $status,
+				'limit'     => $limit,
+				'offset'    => $offset,
+				'truncated' => $truncated,
+				'search'    => $search_term,
+			),
+			$this->summarize_wc_bulk_product_updates( $resolved )
+		);
+	}
+
+	private function enrich_wc_bulk_product_update( int $post_id, array $changes ): array {
+		$product_update = array(
+			'post_id'                 => $post_id,
+			'changes'                 => $changes,
+			'type'                    => 'unknown',
+			'price_affecting_changes' => $this->is_wc_price_affecting_change_set( $changes ),
+		);
+
+		$product = wc_get_product( $post_id );
+		if ( ! $product ) {
+			return $product_update;
+		}
+
+		return array_merge( $product_update, $this->get_wc_bulk_product_target_context( $product, $changes ) );
+	}
+
+	private function get_wc_bulk_product_target_context( $product, array $changes = array() ): array {
+		$type            = (string) $product->get_type();
+		$price_affecting = $this->is_wc_price_affecting_change_set( $changes );
+		$warning_flags   = array();
+		$warnings        = array();
+		$context         = array(
+			'name'                    => (string) $product->get_name(),
+			'type'                    => $type,
+			'status'                  => (string) $product->get_status(),
+			'price_affecting_changes' => $price_affecting,
+		);
+
+		if ( 'variable' === $type ) {
+			$context['variation_count'] = count( $product->get_children() );
+			if ( $price_affecting ) {
+				$warning_flags[] = 'variable_parent_price_edit';
+				$warnings[]      = __( 'Variable parent targeted in a bulk price edit. This updates the parent record only and does not update child variation prices.', 'pressark' );
+				$warnings[]      = __( 'Use bulk_edit_variations or edit individual variations if variation prices need to change.', 'pressark' );
+			}
+		} elseif ( 'grouped' === $type ) {
+			$context['child_count'] = count( $product->get_children() );
+			if ( $price_affecting ) {
+				$warning_flags[] = 'grouped_parent_price_edit';
+				$warnings[]      = __( 'Grouped parent targeted in a bulk price edit. Grouped child product prices may still need separate updates.', 'pressark' );
+			}
+		} elseif ( 'external' === $type && $price_affecting ) {
+			$warning_flags[] = 'external_product_price_edit';
+			$warnings[]      = __( 'External product targeted in a bulk price edit. Confirm the customer-visible price and outbound link behavior after the write.', 'pressark' );
+		}
+
+		if ( ! empty( $warning_flags ) ) {
+			$context['warning_flags'] = array_values( array_unique( $warning_flags ) );
+		}
+		if ( ! empty( $warnings ) ) {
+			$context['warnings'] = array_values( array_unique( $warnings ) );
+		}
+
+		return $context;
+	}
+
+	private function summarize_wc_bulk_product_updates( array $products ): array {
+		$matched_product_types  = array();
+		$warning_flags          = array();
+		$warnings               = array();
+		$price_affecting_change = false;
+
+		foreach ( $products as $product_update ) {
+			$type = sanitize_key( (string) ( $product_update['type'] ?? 'unknown' ) );
+			if ( '' === $type ) {
+				$type = 'unknown';
+			}
+
+			if ( ! isset( $matched_product_types[ $type ] ) ) {
+				$matched_product_types[ $type ] = 0;
+			}
+			$matched_product_types[ $type ]++;
+
+			if ( ! empty( $product_update['price_affecting_changes'] ) ) {
+				$price_affecting_change = true;
+			}
+			if ( ! empty( $product_update['warning_flags'] ) ) {
+				$warning_flags = array_merge( $warning_flags, array_map( 'strval', (array) $product_update['warning_flags'] ) );
+			}
+			if ( ! empty( $product_update['warnings'] ) ) {
+				$warnings = array_merge( $warnings, array_map( 'strval', (array) $product_update['warnings'] ) );
+			}
+		}
+
+		ksort( $matched_product_types );
+
+		$summary = array(
+			'matched_product_types' => $matched_product_types,
+		);
+		if ( $price_affecting_change ) {
+			$summary['price_affecting_changes'] = true;
+		}
+		if ( ! empty( $warning_flags ) ) {
+			$summary['warning_flags'] = array_values( array_unique( $warning_flags ) );
+		}
+		if ( ! empty( $warnings ) ) {
+			$summary['warnings'] = array_values( array_unique( $warnings ) );
+		}
+
+		return $summary;
+	}
+
+	private function format_wc_bulk_product_error_detail( array $product_result, string $message, int $fallback_index ): string {
+		$post_id = (int) ( $product_result['post_id'] ?? $fallback_index );
+		$name    = (string) ( $product_result['name'] ?? '' );
+		$type    = (string) ( $product_result['type'] ?? '' );
+
+		if ( '' !== $name && '' !== $type ) {
+			return sprintf(
+				/* translators: 1: product ID 2: product name 3: product type 4: error message */
+				__( '#%1$d (%2$s, %3$s): %4$s', 'pressark' ),
+				$post_id,
+				$name,
+				$type,
+				$message
 			);
 		}
 
-		return array(
-			'products'  => $resolved,
-			'scope'     => $scope,
-			'status'    => $status,
-			'limit'     => $limit,
-			'offset'    => $offset,
-			'truncated' => $truncated,
-			'search'    => $search_term,
+		if ( '' !== $name ) {
+			return sprintf(
+				/* translators: 1: product ID 2: product name 3: error message */
+				__( '#%1$d (%2$s): %3$s', 'pressark' ),
+				$post_id,
+				$name,
+				$message
+			);
+		}
+
+		if ( '' !== $type ) {
+			return sprintf(
+				/* translators: 1: product ID 2: product type 3: error message */
+				__( '#%1$d (%2$s): %3$s', 'pressark' ),
+				$post_id,
+				$type,
+				$message
+			);
+		}
+
+		return sprintf(
+			/* translators: 1: product ID 2: error message */
+			__( '#%1$d: %2$s', 'pressark' ),
+			$post_id,
+			$message
 		);
 	}
 
@@ -2717,13 +3234,24 @@ class PressArk_Handler_WooCommerce extends PressArk_Handler_Base {
 		$err = $this->require_wc();
 		if ( $err ) return $err;
 
+		$ambiguous_price = $this->ambiguous_wc_price_write_response( $params );
+		if ( $ambiguous_price ) {
+			return $ambiguous_price;
+		}
+
 		$params = $this->normalize_variation_params( $params );
-		$var_id    = intval( $params['variation_id'] ?? 0 );
-		$variation = wc_get_product( $var_id );
+		$var_id           = intval( $params['variation_id'] ?? 0 );
+		$variation        = wc_get_product( $var_id );
 		if ( ! $variation || ! $variation->is_type( 'variation' ) ) {
 			return array( 'success' => false, 'message' => __( 'Variation not found.', 'pressark' ) );
 		}
-		$changes = array();
+		$changes          = array();
+		$had_sale_schedule = (bool) $variation->get_date_on_sale_from() || (bool) $variation->get_date_on_sale_to();
+		$clear_sale        = ! empty( $params['clear_sale'] )
+			|| ( array_key_exists( 'sale_price', $params ) && '' === (string) $params['sale_price'] );
+		if ( $clear_sale ) {
+			$params['sale_price'] = '';
+		}
 		if ( isset( $params['price_delta'] ) && ! isset( $params['regular_price'] ) ) {
 			$current_price = (float) $variation->get_regular_price();
 			if ( $current_price <= 0 ) {
@@ -2750,7 +3278,14 @@ class PressArk_Handler_WooCommerce extends PressArk_Handler_Base {
 		}
 		if ( isset( $params['sale_price'] ) ) {
 			$variation->set_sale_price( $params['sale_price'] );
-			$changes[] = 'sale price';
+			$changes[] = $clear_sale ? 'sale price (cleared)' : 'sale price';
+		}
+		if ( $clear_sale ) {
+			$variation->set_date_on_sale_from( null );
+			$variation->set_date_on_sale_to( null );
+			if ( $had_sale_schedule ) {
+				$changes[] = 'sale schedule (cleared)';
+			}
 		}
 		if ( isset( $params['stock_quantity'] ) ) {
 			$variation->set_stock_quantity( intval( $params['stock_quantity'] ) );
@@ -2787,6 +3322,11 @@ class PressArk_Handler_WooCommerce extends PressArk_Handler_Base {
 	public function create_variation( array $params ): array {
 		$err = $this->require_wc();
 		if ( $err ) return $err;
+
+		$ambiguous_price = $this->ambiguous_wc_price_write_response( $params );
+		if ( $ambiguous_price ) {
+			return $ambiguous_price;
+		}
 
 		$params = $this->normalize_variation_params( $params );
 		$product_id = absint( $params['product_id'] ?? 0 );
@@ -2882,6 +3422,11 @@ class PressArk_Handler_WooCommerce extends PressArk_Handler_Base {
 		$err = $this->require_wc();
 		if ( $err ) return $err;
 
+		$ambiguous_price = $this->ambiguous_wc_price_write_response( $params );
+		if ( $ambiguous_price ) {
+			return $ambiguous_price;
+		}
+
 		$product_id = absint( $params['product_id'] ?? 0 );
 		if ( ! $product_id ) return array( 'error' => __( 'product_id is required.', 'pressark' ) );
 
@@ -2898,7 +3443,14 @@ class PressArk_Handler_WooCommerce extends PressArk_Handler_Base {
 		$updated   = 0;
 		$errors    = array();
 		$changes   = $params['changes'] ?? array();
+		if ( is_array( $changes ) ) {
+			$ambiguous_price = $this->ambiguous_wc_price_write_response( $changes );
+			if ( $ambiguous_price ) {
+				return $ambiguous_price;
+			}
+		}
 		$changes   = is_array( $changes ) ? $this->normalize_variation_changes( $changes ) : array();
+		$clear_sale = $this->is_legacy_clear_sale_request( $changes );
 
 		foreach ( $children as $var_id ) {
 			$variation = wc_get_product( $var_id );
@@ -2936,15 +3488,15 @@ class PressArk_Handler_WooCommerce extends PressArk_Handler_Base {
 				}
 
 				// Clear sale price.
-				if ( ! empty( $changes['clear_sale'] ) ) {
+				if ( $clear_sale ) {
 					$variation->set_sale_price( '' );
 					$variation->set_date_on_sale_from( null );
 					$variation->set_date_on_sale_to( null );
 				}
 
 				// Scheduled sale dates.
-				if ( isset( $changes['sale_from'] ) ) $variation->set_date_on_sale_from( $changes['sale_from'] ?: null );
-				if ( isset( $changes['sale_to'] ) )   $variation->set_date_on_sale_to( $changes['sale_to'] ?: null );
+				if ( ! $clear_sale && isset( $changes['sale_from'] ) ) $variation->set_date_on_sale_from( $changes['sale_from'] ?: null );
+				if ( ! $clear_sale && isset( $changes['sale_to'] ) )   $variation->set_date_on_sale_to( $changes['sale_to'] ?: null );
 
 				// Stock.
 				if ( isset( $changes['stock_status'] ) ) {
@@ -4376,11 +4928,12 @@ class PressArk_Handler_WooCommerce extends PressArk_Handler_Base {
 
 	private function normalize_price_and_stock_aliases( array $data ): array {
 		$alias_map = array(
-			'price'         => 'regular_price',
-			'product_price' => 'regular_price',
-			'stock'         => 'stock_quantity',
-			'inventory'     => 'stock_quantity',
-			'qty'           => 'stock_quantity',
+			'stock'            => 'stock_quantity',
+			'inventory'        => 'stock_quantity',
+			'qty'              => 'stock_quantity',
+			'clear_sale_price' => 'clear_sale',
+			'remove_sale'      => 'clear_sale',
+			'end_sale'         => 'clear_sale',
 		);
 
 		foreach ( $alias_map as $alias => $canonical ) {
@@ -4394,6 +4947,50 @@ class PressArk_Handler_WooCommerce extends PressArk_Handler_Base {
 		}
 
 		return $data;
+	}
+
+	private function detect_ambiguous_wc_price_write( array $data ): ?array {
+		$ambiguous_fields = array();
+		foreach ( array( 'price', 'product_price' ) as $field ) {
+			if ( array_key_exists( $field, $data ) ) {
+				$ambiguous_fields[] = $field;
+			}
+		}
+
+		if ( empty( $ambiguous_fields ) ) {
+			return null;
+		}
+
+		$field_labels = array_map(
+			static function ( string $field ): string {
+				return '"' . $field . '"';
+			},
+			$ambiguous_fields
+		);
+
+		return array(
+			'code'    => 'ambiguous_price_field',
+			'message' => sprintf(
+				/* translators: %s: comma-separated unexpected field names */
+				__( 'Unexpected WooCommerce price field(s): %s. Do not use plain price for WooCommerce writes.', 'pressark' ),
+				implode( ', ', $field_labels )
+			),
+			'hint'    => __( 'Choose one explicit field instead: regular_price for the base price, sale_price for a sale amount, or clear_sale=true to remove a sale. clear_sale is the canonical sale-removal path.', 'pressark' ),
+		);
+	}
+
+	private function ambiguous_wc_price_write_response( array $data ): ?array {
+		$issue = $this->detect_ambiguous_wc_price_write( $data );
+		if ( null === $issue ) {
+			return null;
+		}
+
+		return array(
+			'success' => false,
+			'error'   => (string) ( $issue['code'] ?? 'ambiguous_price_field' ),
+			'message' => (string) ( $issue['message'] ?? __( 'Do not use plain price for WooCommerce writes.', 'pressark' ) ),
+			'hint'    => (string) ( $issue['hint'] ?? '' ),
+		);
 	}
 
 	private function normalize_wc_decimal_value( $value ) {
@@ -4497,6 +5094,265 @@ class PressArk_Handler_WooCommerce extends PressArk_Handler_Base {
 
 	// ── Preview Methods ─────────────────────────────────────────────────
 
+	private function is_legacy_clear_sale_request( array $changes ): bool {
+		return ! empty( $changes['clear_sale'] )
+			|| ( array_key_exists( 'sale_price', $changes ) && '' === (string) $changes['sale_price'] );
+	}
+
+	private function normalize_wc_price_for_write( $price ): string {
+		$normalized = wc_format_decimal( wc_clean( $price ) );
+		if ( '' === $normalized ) {
+			return '';
+		}
+
+		return wc_format_decimal( max( 0, (float) $normalized ) );
+	}
+
+	private function format_wc_sale_datetime( $sale_date ): string {
+		if ( ! $sale_date || ! is_object( $sale_date ) || ! method_exists( $sale_date, 'getTimestamp' ) ) {
+			return '';
+		}
+
+		return wp_date( DATE_ATOM, $sale_date->getTimestamp() );
+	}
+
+	private function format_wc_sale_timestamp( ?int $timestamp ): string {
+		if ( empty( $timestamp ) ) {
+			return '';
+		}
+
+		return wp_date( DATE_ATOM, $timestamp );
+	}
+
+	private function parse_wc_sale_timestamp( $value ) {
+		if ( '' === (string) $value ) {
+			return null;
+		}
+
+		$timestamp = wc_string_to_timestamp( sanitize_text_field( (string) $value ) );
+		return $timestamp ? (int) $timestamp : false;
+	}
+
+	private function project_wc_on_sale( string $regular_price, string $sale_price, ?int $sale_from_ts, ?int $sale_to_ts ): bool {
+		if ( '' === $sale_price || '' === $regular_price || (float) $regular_price <= (float) $sale_price ) {
+			return false;
+		}
+
+		if ( null !== $sale_from_ts && $sale_from_ts > time() ) {
+			return false;
+		}
+
+		if ( null !== $sale_to_ts && $sale_to_ts < time() ) {
+			return false;
+		}
+
+		return true;
+	}
+
+	private function is_wc_price_affecting_change_set( array $changes ): bool {
+		foreach ( array( 'regular_price', 'sale_price', 'clear_sale', 'sale_from', 'sale_to', 'price_delta', 'price_adjust_pct' ) as $field ) {
+			if ( array_key_exists( $field, $changes ) ) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	private function get_wc_product_pricing_state( $product ): array {
+		$sale_from = $product->get_date_on_sale_from();
+		$sale_to   = $product->get_date_on_sale_to();
+
+		return array(
+			'regular_price' => (string) $product->get_regular_price(),
+			'sale_price'    => (string) $product->get_sale_price(),
+			'price'         => (string) $product->get_price(),
+			'on_sale'       => (bool) $product->is_on_sale(),
+			'sale_from'     => $this->format_wc_sale_datetime( $sale_from ),
+			'sale_to'       => $this->format_wc_sale_datetime( $sale_to ),
+		);
+	}
+
+	private function get_wc_product_state_snapshot( $product ): array {
+		$pricing_state = $this->get_wc_product_pricing_state( $product );
+
+		$state = array(
+			'id'             => (int) $product->get_id(),
+			'name'           => $product->get_name(),
+			'type'           => $product->get_type(),
+			'status'         => $product->get_status(),
+			'sku'            => $product->get_sku(),
+			'regular_price'  => $pricing_state['regular_price'],
+			'sale_price'     => $pricing_state['sale_price'],
+			'price'          => $pricing_state['price'],
+			'on_sale'        => $pricing_state['on_sale'],
+			'sale_from'      => $pricing_state['sale_from'],
+			'sale_to'        => $pricing_state['sale_to'],
+			'stock_status'   => $product->get_stock_status(),
+			'stock_quantity' => $product->get_stock_quantity(),
+			'manage_stock'   => $product->get_manage_stock(),
+		);
+
+		if ( $product->is_type( 'variable' ) ) {
+			$state['variation_count'] = count( $product->get_children() );
+		} elseif ( $product->is_type( 'grouped' ) ) {
+			$state['child_count'] = count( $product->get_children() );
+		}
+
+		return $state;
+	}
+
+	private function project_wc_product_pricing_state( $product, array $changes ): array {
+		$clear_sale      = $this->is_legacy_clear_sale_request( $changes );
+		$regular_price   = (string) $product->get_regular_price();
+		$sale_price      = (string) $product->get_sale_price();
+		$current_price   = (string) $product->get_price();
+		$current_sale_from = $product->get_date_on_sale_from();
+		$current_sale_to   = $product->get_date_on_sale_to();
+		$sale_from_ts      = $current_sale_from ? $current_sale_from->getTimestamp() : null;
+		$sale_to_ts        = $current_sale_to ? $current_sale_to->getTimestamp() : null;
+
+		if ( array_key_exists( 'regular_price', $changes ) ) {
+			$regular_price = $this->normalize_wc_price_for_write( $changes['regular_price'] );
+		} elseif ( isset( $changes['price_delta'] ) ) {
+			$base_price = (float) $product->get_regular_price();
+			if ( $base_price <= 0 ) {
+				$base_price = (float) $product->get_price();
+			}
+			$regular_price = wc_format_decimal( max( 0, round( $base_price + (float) $changes['price_delta'], wc_get_price_decimals() ) ) );
+		} elseif ( isset( $changes['price_adjust_pct'] ) ) {
+			$base_price = (float) $product->get_regular_price();
+			if ( $base_price <= 0 ) {
+				$base_price = (float) $product->get_price();
+			}
+			if ( $base_price > 0 ) {
+				$regular_price = wc_format_decimal( max( 0, round( $base_price * ( 1 + ( (float) $changes['price_adjust_pct'] / 100 ) ), wc_get_price_decimals() ) ) );
+			}
+		}
+
+		if ( $clear_sale ) {
+			$sale_price   = '';
+			$sale_from_ts = null;
+			$sale_to_ts   = null;
+		} else {
+			if ( array_key_exists( 'sale_price', $changes ) ) {
+				$sale_price = $this->normalize_wc_price_for_write( $changes['sale_price'] );
+			}
+			if ( array_key_exists( 'sale_from', $changes ) ) {
+				$sale_from_ts = $this->parse_wc_sale_timestamp( $changes['sale_from'] );
+				$sale_from_ts = false === $sale_from_ts ? null : $sale_from_ts;
+			}
+			if ( array_key_exists( 'sale_to', $changes ) ) {
+				$sale_to_ts = $this->parse_wc_sale_timestamp( $changes['sale_to'] );
+				$sale_to_ts = false === $sale_to_ts ? null : $sale_to_ts;
+			}
+		}
+
+		$on_sale = $this->project_wc_on_sale( $regular_price, $sale_price, $sale_from_ts, $sale_to_ts );
+		$price   = $on_sale ? $sale_price : $regular_price;
+		if ( '' === $price ) {
+			$price = $current_price;
+		}
+
+		return array(
+			'regular_price' => $regular_price,
+			'sale_price'    => $sale_price,
+			'price'         => $price,
+			'on_sale'       => $on_sale,
+			'sale_from'     => $this->format_wc_sale_timestamp( $sale_from_ts ),
+			'sale_to'       => $this->format_wc_sale_timestamp( $sale_to_ts ),
+		);
+	}
+
+	private function summarize_wc_product_pricing_state( array $pricing_state ): string {
+		return sprintf(
+			'regular_price=%1$s, sale_price=%2$s, price=%3$s, on_sale=%4$s, sale_from=%5$s, sale_to=%6$s',
+			$this->preview_wc_pricing_value( $pricing_state['regular_price'] ?? '' ),
+			$this->preview_wc_pricing_value( $pricing_state['sale_price'] ?? '' ),
+			$this->preview_wc_pricing_value( $pricing_state['price'] ?? '' ),
+			$this->preview_wc_pricing_value( $pricing_state['on_sale'] ?? false ),
+			$this->preview_wc_pricing_value( $pricing_state['sale_from'] ?? '' ),
+			$this->preview_wc_pricing_value( $pricing_state['sale_to'] ?? '' )
+		);
+	}
+
+	private function preview_wc_pricing_value( $value ): string {
+		if ( is_bool( $value ) ) {
+			return $value ? 'true' : 'false';
+		}
+
+		if ( null === $value ) {
+			return '(empty)';
+		}
+
+		$string = is_scalar( $value ) ? (string) $value : wp_json_encode( $value );
+		return '' !== $string ? $string : '(empty)';
+	}
+
+	private function preview_wc_sale_schedule_from_state( array $pricing_state ): string {
+		$window    = array();
+		$sale_from = (string) ( $pricing_state['sale_from'] ?? '' );
+		$sale_to   = (string) ( $pricing_state['sale_to'] ?? '' );
+
+		if ( '' !== $sale_from ) {
+			$window[] = 'from ' . $sale_from;
+		}
+		if ( '' !== $sale_to ) {
+			$window[] = 'to ' . $sale_to;
+		}
+
+		return ! empty( $window ) ? implode( ' ', $window ) : '(empty)';
+	}
+
+	private function summarize_wc_product_pricing_preview_state( array $pricing_state ): string {
+		return sprintf(
+			'regular_price=%1$s, sale_price=%2$s, price=%3$s, on_sale=%4$s, sale_schedule=%5$s',
+			$this->preview_wc_pricing_value( $pricing_state['regular_price'] ?? '' ),
+			$this->preview_wc_pricing_value( $pricing_state['sale_price'] ?? '' ),
+			$this->preview_wc_pricing_value( $pricing_state['price'] ?? '' ),
+			$this->preview_wc_pricing_value( $pricing_state['on_sale'] ?? false ),
+			$this->preview_wc_sale_schedule_from_state( $pricing_state )
+		);
+	}
+
+	private function append_wc_pricing_preview_summary( array &$preview_changes, array $before_pricing_state, array $after_pricing_state ): void {
+		$preview_changes[] = array(
+			'field'  => 'Customer-visible pricing',
+			'before' => $this->summarize_wc_product_pricing_preview_state( $before_pricing_state ),
+			'after'  => $this->summarize_wc_product_pricing_preview_state( $after_pricing_state ),
+		);
+	}
+
+	private function format_sale_schedule_preview_value( $sale_from, $sale_to ): string {
+		$window = array();
+		if ( $sale_from ) {
+			$window[] = 'from ' . wp_date( DATE_ATOM, $sale_from->getTimestamp() );
+		}
+		if ( $sale_to ) {
+			$window[] = 'to ' . wp_date( DATE_ATOM, $sale_to->getTimestamp() );
+		}
+
+		return ! empty( $window ) ? implode( ' ', $window ) : '(empty)';
+	}
+
+	private function append_clear_sale_preview_changes( array &$preview_changes, $product ): void {
+		$preview_changes[] = array(
+			'field'  => 'Regular price (preserved)',
+			'before' => '' !== $product->get_regular_price() ? $product->get_regular_price() : '(empty)',
+			'after'  => '' !== $product->get_regular_price() ? $product->get_regular_price() : '(empty)',
+		);
+		$preview_changes[] = array(
+			'field'  => 'Sale price',
+			'before' => '' !== $product->get_sale_price() ? $product->get_sale_price() : '(empty)',
+			'after'  => '(cleared)',
+		);
+		$preview_changes[] = array(
+			'field'  => 'Sale schedule',
+			'before' => $this->format_sale_schedule_preview_value( $product->get_date_on_sale_from(), $product->get_date_on_sale_to() ),
+			'after'  => '(cleared)',
+		);
+	}
+
 	/**
 	 * Preview for edit_product.
 	 */
@@ -4514,11 +5370,16 @@ class PressArk_Handler_WooCommerce extends PressArk_Handler_Base {
 			return $this->default_preview( 'edit_product', $params );
 		}
 
+		$clear_sale = $this->is_legacy_clear_sale_request( $changes );
+		$price_affecting = $this->is_wc_price_affecting_change_set( $changes );
+
 		$preview = array(
 			'post_title' => $product->get_name(),
 			'post_id'    => $post_id,
 			'changes'    => array(),
 		);
+		$before_pricing_state = $price_affecting ? $this->get_wc_product_pricing_state( $product ) : array();
+		$after_pricing_state  = $price_affecting ? $this->project_wc_product_pricing_state( $product, $changes ) : array();
 
 		$field_map = array(
 			'name'              => 'get_name',
@@ -4528,21 +5389,37 @@ class PressArk_Handler_WooCommerce extends PressArk_Handler_Base {
 			'sale_price'        => 'get_sale_price',
 		);
 
-		foreach ( $changes as $key => $value ) {
-			if ( 'price_delta' === $key || 'price_adjust_pct' === $key ) {
-				$current_price = (float) $product->get_regular_price();
-				if ( $current_price <= 0 ) {
-					$current_price = (float) $product->get_price();
-				}
-				$after_price = 'price_delta' === $key
-					? round( $current_price + (float) $value, wc_get_price_decimals() )
-					: round( $current_price * ( 1 + ( (float) $value / 100 ) ), wc_get_price_decimals() );
+		if ( $price_affecting ) {
+			$preview['pricing_state'] = array(
+				'before' => $before_pricing_state,
+				'after'  => $after_pricing_state,
+			);
+			$this->append_wc_pricing_preview_summary( $preview['changes'], $before_pricing_state, $after_pricing_state );
+		}
 
+		if ( $clear_sale ) {
+			$this->append_clear_sale_preview_changes( $preview['changes'], $product );
+		}
+
+		foreach ( $changes as $key => $value ) {
+			if ( 'clear_sale' === $key ) {
+				continue;
+			}
+
+			if ( 'price_delta' === $key || 'price_adjust_pct' === $key ) {
 				$preview['changes'][] = array(
 					'field'  => 'Regular price',
-					'before' => '' !== $product->get_regular_price() ? $product->get_regular_price() : '(empty)',
-					'after'  => (string) $after_price,
+					'before' => $this->preview_wc_pricing_value( $product->get_regular_price() ),
+					'after'  => $this->preview_wc_pricing_value( $after_pricing_state['regular_price'] ?? '' ),
 				);
+				continue;
+			}
+
+			if ( in_array( $key, array( 'sale_from', 'sale_to' ), true ) ) {
+				continue;
+			}
+
+			if ( $clear_sale && 'sale_price' === $key ) {
 				continue;
 			}
 
@@ -4587,12 +5464,22 @@ class PressArk_Handler_WooCommerce extends PressArk_Handler_Base {
 			'summary' => sprintf( __( '%1$d product(s) will be updated.', 'pressark' ), count( $products ) ),
 			'changes' => array(),
 		);
+		if ( ! empty( $resolution['matched_product_types'] ) ) {
+			$preview['matched_product_types'] = (array) $resolution['matched_product_types'];
+		}
 
 		foreach ( array_slice( $products, 0, 5 ) as $product_update ) {
 			$product = wc_get_product( absint( $product_update['post_id'] ?? 0 ) );
 			if ( ! $product ) {
 				continue;
 			}
+			$product_context = $this->get_wc_bulk_product_target_context( $product, (array) ( $product_update['changes'] ?? array() ) );
+			$product_label   = sprintf(
+				/* translators: 1: WooCommerce product ID, 2: WooCommerce product type slug. */
+				__( 'Product #%1$d (%2$s)', 'pressark' ),
+				$product->get_id(),
+				$product_context['type'] ?? $product->get_type()
+			);
 
 			$item_preview = $this->preview_edit_product(
 				array(
@@ -4603,10 +5490,113 @@ class PressArk_Handler_WooCommerce extends PressArk_Handler_Base {
 			);
 
 			$preview['changes'][] = array(
-				/* translators: %d: WooCommerce product ID. */
-				'field'  => sprintf( __( 'Product #%d', 'pressark' ), $product->get_id() ),
+				'field'  => $product_label,
 				'before' => $product->get_name(),
 				'after'  => $product->get_name(),
+			);
+			if ( isset( $product_context['variation_count'] ) ) {
+				$preview['changes'][] = array(
+					'field'  => __( 'Variation count', 'pressark' ),
+					'before' => (int) $product_context['variation_count'],
+					'after'  => (int) $product_context['variation_count'],
+				);
+			}
+			if ( isset( $product_context['child_count'] ) ) {
+				$preview['changes'][] = array(
+					'field'  => __( 'Grouped child count', 'pressark' ),
+					'before' => (int) $product_context['child_count'],
+					'after'  => (int) $product_context['child_count'],
+				);
+			}
+			foreach ( (array) ( $product_context['warnings'] ?? array() ) as $warning ) {
+				$preview['changes'][] = array(
+					'field'  => __( 'Pricing scope warning', 'pressark' ),
+					'before' => __( 'No special product-type warning', 'pressark' ),
+					'after'  => $warning,
+				);
+			}
+
+			foreach ( (array) ( $item_preview['changes'] ?? array() ) as $change ) {
+				if ( ! is_array( $change ) ) {
+					continue;
+				}
+				$preview['changes'][] = $change;
+			}
+		}
+
+		$preview_notes = array();
+		if ( ! empty( $resolution['warnings'] ) ) {
+			$preview_notes[] = implode( ' ', array_map( 'strval', (array) $resolution['warnings'] ) );
+		}
+		if ( ! empty( $resolution['truncated'] ) ) {
+			$preview_notes[] = __( 'Only the first batch of matching products is shown in this preview.', 'pressark' );
+		}
+		if ( ! empty( $preview_notes ) ) {
+			$preview['note'] = implode( ' ', array_values( array_unique( $preview_notes ) ) );
+		}
+
+		return $preview;
+	}
+
+	/**
+	 * Preview for bulk_edit_variations.
+	 */
+	public function preview_bulk_edit_variations( array $params, array $action ): array {
+		if ( ! class_exists( 'WooCommerce' ) ) {
+			return $this->default_preview( 'bulk_edit_variations', $params );
+		}
+
+		$product_id = absint( $params['product_id'] ?? ( $action['product_id'] ?? 0 ) );
+		$parent     = wc_get_product( $product_id );
+		if ( ! $parent || ! $parent->is_type( 'variable' ) ) {
+			return $this->default_preview( 'bulk_edit_variations', $params );
+		}
+
+		$children = $parent->get_children();
+		if ( empty( $children ) ) {
+			return array(
+				'changes' => array(
+					array(
+						'field'  => __( 'Bulk variation update', 'pressark' ),
+						'before' => __( 'No matching variations', 'pressark' ),
+						'after'  => __( 'No changes resolved.', 'pressark' ),
+					),
+				),
+			);
+		}
+
+		$changes = $params['changes'] ?? ( $action['changes'] ?? array() );
+		$changes = is_array( $changes ) ? $this->normalize_variation_changes( $changes ) : array();
+		$preview = array(
+			'title'   => __( 'Bulk variation update', 'pressark' ),
+			/* translators: %1$d: number of variations that will be updated. */
+			'summary' => sprintf( __( '%1$d variation(s) will be updated.', 'pressark' ), count( $children ) ),
+			'changes' => array(),
+		);
+
+		foreach ( array_slice( $children, 0, 5 ) as $variation_id ) {
+			$variation = wc_get_product( $variation_id );
+			if ( ! $variation ) {
+				continue;
+			}
+
+			$item_preview = $this->preview_edit_variation(
+				array_merge(
+					array(
+						'variation_id' => (int) $variation_id,
+					),
+					$changes
+				),
+				array(
+					'variation_id' => (int) $variation_id,
+				)
+			);
+
+			$preview['changes'][] = array(
+				/* translators: %d: WooCommerce variation ID. */
+				'field'  => sprintf( __( 'Variation #%d', 'pressark' ), $variation->get_id() ),
+				'before' => $variation->get_name(),
+				'after'  => $variation->get_name(),
 			);
 
 			foreach ( (array) ( $item_preview['changes'] ?? array() ) as $change ) {
@@ -4617,8 +5607,8 @@ class PressArk_Handler_WooCommerce extends PressArk_Handler_Base {
 			}
 		}
 
-		if ( ! empty( $resolution['truncated'] ) ) {
-			$preview['note'] = __( 'Only the first batch of matching products is shown in this preview.', 'pressark' );
+		if ( count( $children ) > 5 ) {
+			$preview['note'] = __( 'Only the first 5 variations are shown in this preview.', 'pressark' );
 		}
 
 		return $preview;
@@ -4796,23 +5786,83 @@ class PressArk_Handler_WooCommerce extends PressArk_Handler_Base {
 	 * Preview for edit_variation.
 	 */
 	public function preview_edit_variation( array $params, array $action ): array {
-		$params  = $this->normalize_variation_params( $params );
-		$action  = $this->normalize_variation_params( $action );
-		$ev_id   = intval( $params['variation_id'] ?? ( $action['variation_id'] ?? 0 ) );
-		$changes = array();
-		$fields  = array( 'regular_price', 'sale_price', 'stock_quantity', 'stock_status', 'status' );
+		$params = $this->normalize_variation_params( $params );
+		$action = $this->normalize_variation_params( $action );
+		$ev_id  = intval( $params['variation_id'] ?? ( $action['variation_id'] ?? 0 ) );
 
-		foreach ( $fields as $evf ) {
-			if ( isset( $params[ $evf ] ) || isset( $action[ $evf ] ) ) {
-				$changes[] = array(
-					'field'  => ucfirst( str_replace( '_', ' ', $evf ) ),
-					'before' => "Variation #{$ev_id}",
-					'after'  => (string) ( $params[ $evf ] ?? $action[ $evf ] ?? '' ),
-				);
+		if ( ! class_exists( 'WooCommerce' ) ) {
+			return $this->default_preview( 'edit_variation', $params );
+		}
+
+		$variation = wc_get_product( $ev_id );
+		if ( ! $variation || ! $variation->is_type( 'variation' ) ) {
+			return $this->default_preview( 'edit_variation', $params );
+		}
+
+		$changes = array();
+		foreach ( array( 'regular_price', 'sale_price', 'clear_sale', 'price_delta', 'price_adjust_pct', 'stock_quantity', 'stock_status', 'status' ) as $field ) {
+			if ( array_key_exists( $field, $action ) ) {
+				$changes[ $field ] = $action[ $field ];
+			}
+			if ( array_key_exists( $field, $params ) ) {
+				$changes[ $field ] = $params[ $field ];
 			}
 		}
 
-		return array( 'changes' => $changes );
+		$clear_sale = $this->is_legacy_clear_sale_request( $changes );
+		$preview    = array(
+			'post_title' => $variation->get_name(),
+			'post_id'    => $ev_id,
+			'changes'    => array(),
+		);
+		$field_map  = array(
+			'regular_price'  => 'get_regular_price',
+			'sale_price'     => 'get_sale_price',
+			'stock_quantity' => 'get_stock_quantity',
+			'stock_status'   => 'get_stock_status',
+			'status'         => 'get_status',
+		);
+
+		if ( $clear_sale ) {
+			$this->append_clear_sale_preview_changes( $preview['changes'], $variation );
+		}
+
+		foreach ( $changes as $key => $value ) {
+			if ( 'clear_sale' === $key ) {
+				continue;
+			}
+
+			if ( 'price_delta' === $key || 'price_adjust_pct' === $key ) {
+				$current_price = (float) $variation->get_regular_price();
+				if ( $current_price <= 0 ) {
+					$current_price = (float) $variation->get_price();
+				}
+				$after_price = 'price_delta' === $key
+					? round( $current_price + (float) $value, wc_get_price_decimals() )
+					: round( $current_price * ( 1 + ( (float) $value / 100 ) ), wc_get_price_decimals() );
+
+				$preview['changes'][] = array(
+					'field'  => 'Regular price',
+					'before' => '' !== $variation->get_regular_price() ? $variation->get_regular_price() : '(empty)',
+					'after'  => (string) $after_price,
+				);
+				continue;
+			}
+
+			if ( $clear_sale && 'sale_price' === $key ) {
+				continue;
+			}
+
+			$getter  = $field_map[ $key ] ?? null;
+			$current = $getter ? $variation->$getter() : '';
+			$preview['changes'][] = array(
+				'field'  => ucfirst( str_replace( '_', ' ', $key ) ),
+				'before' => ( null !== $current && '' !== (string) $current ) ? (string) $current : '(empty)',
+				'after'  => is_bool( $value ) ? ( $value ? 'true' : 'false' ) : (string) $value,
+			);
+		}
+
+		return $preview;
 	}
 
 	/**

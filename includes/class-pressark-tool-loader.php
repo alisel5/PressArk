@@ -113,9 +113,11 @@ class PressArk_Tool_Loader {
 		string $strategy = 'filtered'
 	): array {
 		$options['tier'] = $tier;
+		$sticky_groups   = $this->normalize_groups( $loaded_groups );
+		$options['sticky_groups'] = $sticky_groups;
 
 		$required_groups = $this->normalize_groups(
-			array_merge( self::BASE_GROUPS, $loaded_groups )
+			array_merge( self::BASE_GROUPS, $sticky_groups )
 		);
 		$candidate_groups = array_values( array_diff(
 			$this->normalize_groups( (array) ( $options['candidate_groups'] ?? array() ) ),
@@ -141,7 +143,7 @@ class PressArk_Tool_Loader {
 				'loaded_tool_schemas' => $tool_set['schemas'],
 				'conversation'        => (array) ( $options['conversation_messages'] ?? array() ),
 				'tool_results'        => (array) ( $options['tool_results'] ?? array() ),
-				'deferred_candidates' => array(),
+				'deferred_candidates' => (array) ( $tool_set['deferred_candidates'] ?? array() ),
 			) );
 			$hydration  = $budget_manager->plan_group_hydration(
 				$required_groups,
@@ -157,6 +159,10 @@ class PressArk_Tool_Loader {
 			$tool_set['group_costs']     = $group_costs;
 			$tool_set['hydration_plan']  = $hydration;
 			$tool_set['deferred_groups'] = (array) ( $hydration['deferred_groups'] ?? array() );
+			$tool_set['deferred_candidates'] = $this->merge_deferred_candidate_rows(
+				(array) ( $tool_set['deferred_candidates'] ?? array() ),
+				(array) ( $tool_set['deferred_groups'] ?? array() )
+			);
 		}
 
 		return $this->finalize_tool_set_budget( $tool_set, $options );
@@ -173,16 +179,40 @@ class PressArk_Tool_Loader {
 	 */
 	public function expand( array $current, string $group, array $options = array() ): array {
 		$groups = $this->normalize_groups( (array) ( $current['groups'] ?? array() ) );
+		$current_tool_names = $this->normalize_tool_names( (array) ( $current['tool_names'] ?? array() ) );
 
-		if ( in_array( $group, $groups, true ) || ! PressArk_Operation_Registry::is_valid_group( $group ) ) {
+		if ( ! PressArk_Operation_Registry::is_valid_group( $group ) ) {
 			return $current;
 		}
 
-		$groups[]  = $group;
+		$group_already_loaded = in_array( $group, $groups, true );
+		if ( ! $group_already_loaded ) {
+			$groups[] = $group;
+		}
+
+		if ( $group_already_loaded ) {
+			$group_tool_names = $this->catalog->get_tool_names_for_groups( array( $group ) );
+			$missing_deferred = array_values( array_filter(
+				$this->normalize_tool_names( $group_tool_names ),
+				static function ( string $tool_name ) use ( $current_tool_names ): bool {
+					return PressArk_Operation_Registry::is_deferred_tool( $tool_name )
+						&& ! in_array( $tool_name, $current_tool_names, true );
+				}
+			) );
+			if ( empty( $missing_deferred ) ) {
+				return $current;
+			}
+		}
+
 		$tool_set  = $this->build_tool_set(
 			$groups,
 			(string) ( $current['strategy'] ?? 'filtered' ),
-			$this->merge_state_options( $options, $current )
+			array_merge(
+				$this->merge_state_options( $options, $current ),
+				array(
+					'sticky_groups' => $groups,
+				)
+			)
 		);
 		$deferred  = array_values( array_filter(
 			(array) ( $current['deferred_groups'] ?? array() ),
@@ -190,7 +220,11 @@ class PressArk_Tool_Loader {
 				return $group !== (string) ( $candidate['group'] ?? '' );
 			}
 		) );
-		$tool_set['deferred_groups'] = $deferred;
+		$tool_set['deferred_groups']     = $deferred;
+		$tool_set['deferred_candidates'] = $this->merge_deferred_candidate_rows(
+			(array) ( $tool_set['deferred_candidates'] ?? array() ),
+			$deferred
+		);
 
 		return $tool_set;
 	}
@@ -206,20 +240,28 @@ class PressArk_Tool_Loader {
 	 * @return array Updated result.
 	 */
 	public function expand_tools( array $current, array $tool_names, array $options = array() ): array {
-		$groups          = $this->normalize_groups( (array) ( $current['groups'] ?? array() ) );
-		$has_woo         = class_exists( 'WooCommerce' );
-		$has_elementor   = class_exists( '\\Elementor\\Plugin' );
-		$changed         = false;
+		$groups             = $this->normalize_groups( (array) ( $current['groups'] ?? array() ) );
+		$requested_tool_names = $this->normalize_tool_names( $tool_names );
+		$current_tool_lookup = array_flip( $this->normalize_tool_names( (array) ( $current['tool_names'] ?? array() ) ) );
+		$has_woo            = class_exists( 'WooCommerce' );
+		$has_elementor      = class_exists( '\\Elementor\\Plugin' );
+		$changed            = false;
 
-		foreach ( $tool_names as $name ) {
+		foreach ( $requested_tool_names as $name ) {
 			$group = $this->catalog->find_group_for_tool( $name );
-			if ( ! $group || in_array( $group, $groups, true ) ) {
+			if ( ! $group ) {
 				continue;
 			}
 			if ( 'woocommerce' === $group && ! $has_woo ) {
 				continue;
 			}
 			if ( 'elementor' === $group && ! $has_elementor ) {
+				continue;
+			}
+			if ( ! isset( $current_tool_lookup[ $name ] ) ) {
+				$changed = true;
+			}
+			if ( in_array( $group, $groups, true ) ) {
 				continue;
 			}
 			$groups[] = $group;
@@ -233,7 +275,13 @@ class PressArk_Tool_Loader {
 		$tool_set = $this->build_tool_set(
 			$groups,
 			(string) ( $current['strategy'] ?? 'filtered' ),
-			$this->merge_state_options( $options, $current )
+			array_merge(
+				$this->merge_state_options( $options, $current ),
+				array(
+					'sticky_groups'      => $groups,
+					'explicit_tool_names' => $requested_tool_names,
+				)
+			)
 		);
 		$tool_set['deferred_groups'] = array_values( array_filter(
 			(array) ( $current['deferred_groups'] ?? array() ),
@@ -241,6 +289,10 @@ class PressArk_Tool_Loader {
 				return ! in_array( (string) ( $candidate['group'] ?? '' ), $groups, true );
 			}
 		) );
+		$tool_set['deferred_candidates'] = $this->merge_deferred_candidate_rows(
+			(array) ( $tool_set['deferred_candidates'] ?? array() ),
+			(array) ( $tool_set['deferred_groups'] ?? array() )
+		);
 
 		return $tool_set;
 	}
@@ -304,10 +356,11 @@ class PressArk_Tool_Loader {
 		foreach ( $schemas as $schema ) {
 			$tool_names[] = $schema['function']['name'] ?? '';
 		}
+		$descriptors = PressArk_Tools::get_prompt_snippets( $tool_names );
 
 		return array(
 			'schemas'                => $schemas,
-			'descriptors'            => '',
+			'descriptors'            => $descriptors,
 			'capability_map'         => '',
 			'capability_maps'        => array(),
 			'capability_map_variant' => '',
@@ -328,6 +381,7 @@ class PressArk_Tool_Loader {
 				array()
 			),
 			'deferred_groups'        => array(),
+			'deferred_candidates'    => array(),
 			'hydration_plan'         => array(),
 			'budget'                 => array(),
 		);
@@ -341,13 +395,27 @@ class PressArk_Tool_Loader {
 	 * @return array
 	 */
 	private function build_tool_set( array $groups, string $strategy, array $options = array() ): array {
-		$groups               = $this->normalize_groups( $groups );
-		$candidate_tool_names = array_values( array_unique( array_merge(
+		$groups                   = $this->normalize_groups( $groups );
+		$sticky_groups            = $this->normalize_groups( (array) ( $options['sticky_groups'] ?? array() ) );
+		$explicit_tool_names      = $this->normalize_tool_names( (array) ( $options['explicit_tool_names'] ?? array() ) );
+		$already_loaded_tool_names = $this->normalize_tool_names( (array) ( $options['already_loaded_tool_names'] ?? array() ) );
+		$candidate_tool_names     = array_values( array_unique( array_merge(
 			$this->catalog->get_tool_names_for_groups( $groups ),
-			$this->get_always_load_tool_names()
+			$this->catalog->get_tool_names_for_groups( $sticky_groups ),
+			$this->get_always_load_tool_names(),
+			$explicit_tool_names,
+			$already_loaded_tool_names
 		) ) );
-		$effective_groups     = $groups;
-		$permission_surface   = array();
+		$loading_plan             = $this->classify_tool_names_by_loading_intent(
+			$candidate_tool_names,
+			$sticky_groups,
+			$explicit_tool_names,
+			$already_loaded_tool_names,
+			$options
+		);
+		$candidate_tool_names     = (array) ( $loading_plan['selected_tool_names'] ?? array() );
+		$effective_groups         = $groups;
+		$permission_surface       = array();
 
 		if ( class_exists( 'PressArk_Permission_Service' ) ) {
 			$visibility           = PressArk_Permission_Service::evaluate_tool_set(
@@ -373,10 +441,11 @@ class PressArk_Tool_Loader {
 
 		$schemas = $this->catalog->get_schemas( $candidate_tool_names );
 		$maps    = $this->catalog->get_capability_maps( $effective_groups, $candidate_tool_names );
+		$descriptors = PressArk_Tools::get_prompt_snippets( $candidate_tool_names );
 
 		return array(
 			'schemas'                => $schemas,
-			'descriptors'            => '',
+			'descriptors'            => $descriptors,
 			'capability_map'         => $maps['full'] ?? '',
 			'capability_maps'        => $maps,
 			'capability_map_variant' => 'full',
@@ -397,6 +466,7 @@ class PressArk_Tool_Loader {
 				$permission_surface
 			),
 			'deferred_groups'        => array(),
+			'deferred_candidates'    => (array) ( $loading_plan['deferred_candidates'] ?? array() ),
 			'hydration_plan'         => array(),
 			'budget'                 => array(),
 		);
@@ -412,6 +482,9 @@ class PressArk_Tool_Loader {
 	private function merge_state_options( array $options, array $current ): array {
 		if ( ! isset( $options['discovered_tool_names'] ) && ! empty( $current['discovered_tool_names'] ) ) {
 			$options['discovered_tool_names'] = (array) $current['discovered_tool_names'];
+		}
+		if ( ! isset( $options['already_loaded_tool_names'] ) && ! empty( $current['tool_names'] ) ) {
+			$options['already_loaded_tool_names'] = (array) $current['tool_names'];
 		}
 
 		return $options;
@@ -451,6 +524,10 @@ class PressArk_Tool_Loader {
 		$discovered_lookup = array_flip( $discovered_tools );
 		$blocked_lookup   = array_flip( $blocked_tools );
 		$rows             = array();
+		$always_loaded_tools = array();
+		$auto_loaded_tools = array();
+		$deferred_loaded_tools = array();
+		$deferred_available_tools = array();
 
 		foreach ( array_merge( $loaded_tool_names, $discovered_tools, $searchable_tools, $blocked_tools ) as $tool_name ) {
 			$tool_name = sanitize_key( (string) $tool_name );
@@ -463,12 +540,27 @@ class PressArk_Tool_Loader {
 				: ( isset( $discovered_lookup[ $tool_name ] )
 					? 'discovered'
 					: ( isset( $blocked_lookup[ $tool_name ] ) ? 'blocked' : 'searchable' ) );
+			$loading_intent = PressArk_Operation_Registry::get_loading_intent( $tool_name );
+
+			if ( 'loaded' === $state ) {
+				if ( 'always_load' === $loading_intent ) {
+					$always_loaded_tools[] = $tool_name;
+				} elseif ( 'deferred' === $loading_intent ) {
+					$deferred_loaded_tools[] = $tool_name;
+				} else {
+					$auto_loaded_tools[] = $tool_name;
+				}
+			} elseif ( 'deferred' === $loading_intent && 'blocked' !== $state ) {
+				$deferred_available_tools[] = $tool_name;
+			}
 
 			$rows[ $tool_name ] = array(
-				'name'   => $tool_name,
-				'group'  => $this->catalog->find_group_for_tool( $tool_name ),
-				'state'  => $state,
-				'loaded' => isset( $loaded_lookup[ $tool_name ] ),
+				'name'           => $tool_name,
+				'group'          => $this->catalog->find_group_for_tool( $tool_name ),
+				'state'          => $state,
+				'schema_state'   => $state,
+				'loading_intent' => $loading_intent,
+				'loaded'         => isset( $loaded_lookup[ $tool_name ] ),
 			);
 		}
 
@@ -488,6 +580,10 @@ class PressArk_Tool_Loader {
 			'visible_tool_count'  => count( $visible_tools ),
 			'loaded_tools'        => $loaded_tool_names,
 			'loaded_tool_count'   => count( $loaded_tool_names ),
+			'always_loaded_tools' => array_values( array_unique( $always_loaded_tools ) ),
+			'auto_loaded_tools'   => array_values( array_unique( $auto_loaded_tools ) ),
+			'deferred_loaded_tools' => array_values( array_unique( $deferred_loaded_tools ) ),
+			'deferred_available_tools' => array_values( array_unique( $deferred_available_tools ) ),
 			'searchable_tools'    => $searchable_tools,
 			'searchable_tool_count' => count( $searchable_tools ),
 			'discovered_tools'    => $discovered_tools,
@@ -567,7 +663,7 @@ class PressArk_Tool_Loader {
 			'loaded_tool_schemas' => (array) ( $tool_set['schemas'] ?? array() ),
 			'conversation'        => (array) ( $options['conversation_messages'] ?? array() ),
 			'tool_results'        => (array) ( $options['tool_results'] ?? array() ),
-			'deferred_candidates' => (array) ( $tool_set['deferred_groups'] ?? array() ),
+			'deferred_candidates' => (array) ( $tool_set['deferred_candidates'] ?? $tool_set['deferred_groups'] ?? array() ),
 		) );
 		$variant         = $budget_manager->choose_support_variant( $capability_maps, $base_ledger );
 		$capability_map  = '' !== $variant ? (string) ( $capability_maps[ $variant ] ?? '' ) : '';
@@ -585,7 +681,7 @@ class PressArk_Tool_Loader {
 			'loaded_tool_schemas' => (array) ( $tool_set['schemas'] ?? array() ),
 			'conversation'        => (array) ( $options['conversation_messages'] ?? array() ),
 			'tool_results'        => (array) ( $options['tool_results'] ?? array() ),
-			'deferred_candidates' => (array) ( $tool_set['deferred_groups'] ?? array() ),
+			'deferred_candidates' => (array) ( $tool_set['deferred_candidates'] ?? $tool_set['deferred_groups'] ?? array() ),
 		) );
 
 		return $tool_set;
@@ -609,6 +705,11 @@ class PressArk_Tool_Loader {
 			$this->catalog->get_tool_names_for_groups( array( $group ) ),
 			$current_tool_names
 		) );
+		$group_tool_names = $this->filter_tool_names_by_loading_intent(
+			$group_tool_names,
+			array( $group ),
+			$this->normalize_groups( (array) ( $options['sticky_groups'] ?? array() ) )
+		);
 
 		if ( class_exists( 'PressArk_Permission_Service' ) && ! empty( $group_tool_names ) ) {
 			$visibility       = PressArk_Permission_Service::evaluate_tool_set(
@@ -637,19 +738,211 @@ class PressArk_Tool_Loader {
 	 * @return string[]
 	 */
 	private function get_always_load_tool_names(): array {
-		$always = self::UNIVERSAL_TOOLS;
+		$always = PressArk_Operation_Registry::tool_names_by_loading_intent( 'always_load' );
 
-		foreach ( PressArk_Operation_Registry::all() as $op ) {
-			if ( ! $op->is_always_load() ) {
+		foreach ( self::UNIVERSAL_TOOLS as $fallback_tool ) {
+			if ( PressArk_Operation_Registry::exists( $fallback_tool )
+				&& PressArk_Operation_Registry::is_always_load_tool( $fallback_tool )
+			) {
 				continue;
 			}
-			if ( in_array( $op->name, array( 'discover_tools', 'load_tools', 'load_tool_group' ), true ) ) {
-				continue;
-			}
-			$always[] = $op->name;
+
+			$always[] = $fallback_tool;
 		}
 
-		return array_values( array_unique( $always ) );
+		$always = array_values( array_filter(
+			array_unique( $always ),
+			static function ( string $tool_name ): bool {
+				$operation = PressArk_Operation_Registry::resolve( $tool_name );
+				if ( ! $operation ) {
+					return true;
+				}
+				if ( 'woocommerce' === $operation->requires ) {
+					return class_exists( 'WooCommerce' );
+				}
+				if ( 'elementor' === $operation->requires ) {
+					return class_exists( '\\Elementor\\Plugin' );
+				}
+
+				return true;
+			}
+		) );
+
+		return array_values( $always );
+	}
+
+	/**
+	 * Apply per-operation loading intent before permission and budget planning.
+	 *
+	 * - always_load: always included
+	 * - deferred: hidden from the initial surface unless the group/tool was
+	 *   explicitly loaded earlier in the conversation
+	 * - auto: preserve current group-scoped behavior
+	 *
+	 * @param string[] $tool_names         Candidate tool names.
+	 * @param string[] $loaded_groups      Groups in the current build.
+	 * @param string[] $sticky_groups      Explicitly loaded/persisted groups.
+	 * @param string[] $explicit_tool_names Explicitly requested tools.
+	 * @return string[]
+	 */
+	private function filter_tool_names_by_loading_intent(
+		array $tool_names,
+		array $loaded_groups,
+		array $sticky_groups = array(),
+		array $explicit_tool_names = array()
+	): array {
+		unset( $loaded_groups );
+
+		$classification = $this->classify_tool_names_by_loading_intent(
+			$tool_names,
+			$sticky_groups,
+			$explicit_tool_names
+		);
+
+		return (array) ( $classification['selected_tool_names'] ?? array() );
+	}
+
+	/**
+	 * Classify candidate tools using the registry loading contract first.
+	 *
+	 * @param string[] $tool_names                Candidate tool names.
+	 * @param string[] $sticky_groups             Explicitly loaded groups.
+	 * @param string[] $explicit_tool_names       Explicit tool-name loads.
+	 * @param string[] $already_loaded_tool_names Previously hydrated tools.
+	 * @param array    $options                   Loader context.
+	 * @return array<string,mixed>
+	 */
+	private function classify_tool_names_by_loading_intent(
+		array $tool_names,
+		array $sticky_groups = array(),
+		array $explicit_tool_names = array(),
+		array $already_loaded_tool_names = array(),
+		array $options = array()
+	): array {
+		$sticky_groups             = $this->normalize_groups( $sticky_groups );
+		$explicit_tool_names       = $this->normalize_tool_names( $explicit_tool_names );
+		$already_loaded_tool_names = $this->normalize_tool_names( $already_loaded_tool_names );
+		$selected_tool_names       = array();
+		$always_load_tool_names    = array();
+		$auto_tool_names           = array();
+		$deferred_tool_names       = array();
+
+		foreach ( $this->normalize_tool_names( $tool_names ) as $tool_name ) {
+			if ( in_array( $tool_name, array( 'discover_tools', 'load_tools', 'load_tool_group' ), true ) ) {
+				$selected_tool_names[] = $tool_name;
+				$always_load_tool_names[] = $tool_name;
+				continue;
+			}
+
+			$operation = PressArk_Operation_Registry::resolve( $tool_name );
+			if ( ! $operation ) {
+				$selected_tool_names[] = $tool_name;
+				$auto_tool_names[]     = $tool_name;
+				continue;
+			}
+
+			$intent = PressArk_Operation_Registry::get_loading_intent( $tool_name );
+			if ( 'always_load' === $intent ) {
+				$selected_tool_names[] = $tool_name;
+				$always_load_tool_names[] = $tool_name;
+				continue;
+			}
+
+			if ( 'deferred' !== $intent ) {
+				$selected_tool_names[] = $tool_name;
+				$auto_tool_names[]     = $tool_name;
+				continue;
+			}
+
+			$should_load_deferred = in_array( $tool_name, $explicit_tool_names, true )
+				|| in_array( $tool_name, $already_loaded_tool_names, true )
+				|| in_array( sanitize_key( $operation->group ), $sticky_groups, true );
+
+			if ( $should_load_deferred ) {
+				$selected_tool_names[] = $tool_name;
+				continue;
+			}
+
+			$deferred_tool_names[] = $tool_name;
+		}
+
+		return array(
+			'selected_tool_names'    => array_values( array_unique( $selected_tool_names ) ),
+			'always_load_tool_names' => array_values( array_unique( $always_load_tool_names ) ),
+			'auto_tool_names'        => array_values( array_unique( $auto_tool_names ) ),
+			'deferred_tool_names'    => array_values( array_unique( $deferred_tool_names ) ),
+			'deferred_candidates'    => $this->build_deferred_tool_candidates( $deferred_tool_names, $options ),
+		);
+	}
+
+	/**
+	 * Build budget-friendly deferred tool candidate rows.
+	 *
+	 * @param string[] $tool_names Deferred tool names.
+	 * @param array    $options    Loader context.
+	 * @return array<int,array<string,mixed>>
+	 */
+	private function build_deferred_tool_candidates( array $tool_names, array $options = array() ): array {
+		$budget_manager = $options['budget_manager'] ?? null;
+		$candidates     = array();
+
+		foreach ( $this->normalize_tool_names( $tool_names ) as $tool_name ) {
+			$tokens = 0;
+			if ( $budget_manager instanceof PressArk_Token_Budget_Manager ) {
+				$tokens = $budget_manager->estimate_schema_tokens(
+					$this->catalog->get_schemas( array( $tool_name ) )
+				);
+			}
+
+			$candidates[] = array(
+				'name'           => $tool_name,
+				'tokens'         => $tokens,
+				'type'           => 'tool',
+				'loading_intent' => PressArk_Operation_Registry::get_loading_intent( $tool_name ),
+			);
+		}
+
+		return $candidates;
+	}
+
+	/**
+	 * Merge deferred group/tool rows while preserving their original shape.
+	 *
+	 * @param array ...$candidate_sets Deferred candidate lists.
+	 * @return array<int,array<string,mixed>>
+	 */
+	private function merge_deferred_candidate_rows( array ...$candidate_sets ): array {
+		$merged = array();
+
+		foreach ( $candidate_sets as $candidate_set ) {
+			foreach ( $candidate_set as $candidate ) {
+				if ( ! is_array( $candidate ) ) {
+					continue;
+				}
+
+				$name = sanitize_text_field(
+					(string) ( $candidate['name'] ?? $candidate['group'] ?? $candidate['uri'] ?? '' )
+				);
+				$type = sanitize_key(
+					(string) ( $candidate['type'] ?? ( isset( $candidate['group'] ) ? 'group' : 'tool' ) )
+				);
+				if ( '' === $name ) {
+					continue;
+				}
+
+				$key = $type . ':' . $name;
+				if ( ! isset( $candidate['name'] ) && 'group' !== $type ) {
+					$candidate['name'] = $name;
+				}
+				if ( ! isset( $candidate['type'] ) ) {
+					$candidate['type'] = $type;
+				}
+
+				$merged[ $key ] = $candidate;
+			}
+		}
+
+		return array_values( $merged );
 	}
 
 	/**

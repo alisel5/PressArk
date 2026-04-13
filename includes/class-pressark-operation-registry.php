@@ -42,6 +42,9 @@ class PressArk_Operation_Registry {
 	/** @var array<string, string[]>|null Cached group → tool names index. */
 	private static ?array $group_index = null;
 
+	/** @var PressArk_Handler_Registry|null Shared handler registry for fast permission probes. */
+	private static ?PressArk_Handler_Registry $permission_registry = null;
+
 	// ── Public API ──────────────────────────────────────────────────
 
 	/**
@@ -79,6 +82,13 @@ class PressArk_Operation_Registry {
 		if ( 'manage_webhooks' === $name ) {
 			$action = $args['action'] ?? 'list';
 			return 'list' === $action ? 'read' : 'confirm';
+		}
+
+		if ( class_exists( 'PressArk_Tools' ) ) {
+			$tool = PressArk_Tools::get_tool( $name );
+			if ( is_object( $tool ) && method_exists( $tool, 'is_readonly' ) && $tool->is_readonly() ) {
+				return 'read';
+			}
 		}
 
 		$op = self::resolve( $name );
@@ -136,6 +146,13 @@ class PressArk_Operation_Registry {
 		}
 		if ( 'manage_webhooks' === $name ) {
 			return 'list' === ( $args['action'] ?? 'list' );
+		}
+
+		if ( class_exists( 'PressArk_Tools' ) ) {
+			$tool = PressArk_Tools::get_tool( $name );
+			if ( is_object( $tool ) && method_exists( $tool, 'is_concurrency_safe' ) ) {
+				return (bool) $tool->is_concurrency_safe();
+			}
 		}
 
 		$op = self::resolve( $name );
@@ -329,6 +346,73 @@ class PressArk_Operation_Registry {
 	}
 
 	/**
+	 * Get authoritative provider schema data for an operation.
+	 *
+	 * Returns null for legacy/unported tools that still rely on the legacy
+	 * flat param definitions in PressArk_Tools.
+	 *
+	 * @since 5.6.0
+	 * @param string $name Tool name (or alias).
+	 * @return array<string,mixed>|null
+	 */
+	public static function get_authoritative_provider_schema_data( string $name ): ?array {
+		$op = self::resolve( $name );
+		if ( ! $op ) {
+			return null;
+		}
+
+		$parameters = $op->get_provider_parameter_schema();
+		if ( ! is_array( $parameters ) ) {
+			return null;
+		}
+
+		$metadata = $op->get_provider_metadata();
+
+		return array(
+			'name'           => $op->name,
+			'label'          => (string) ( $metadata['label'] ?? '' ),
+			'description'    => self::build_provider_description( $op, $metadata ),
+			'search_hint'    => (string) ( $metadata['search_hint'] ?? '' ),
+			'model_guidance' => (array) ( $metadata['model_guidance'] ?? array() ),
+			'parameters'     => $parameters,
+		);
+	}
+
+	/**
+	 * Get authoritative discovery metadata for an operation.
+	 *
+	 * @since 5.6.0
+	 * @param string $name Tool name (or alias).
+	 * @return array<string,mixed>|null
+	 */
+	public static function get_authoritative_discovery_metadata( string $name ): ?array {
+		return self::get_discovery_metadata( $name );
+	}
+
+	/**
+	 * Build a provider-facing function schema from the authoritative contract.
+	 *
+	 * @since 5.6.0
+	 * @param string $name Tool name (or alias).
+	 * @return array<string,mixed>|null
+	 */
+	public static function build_authoritative_provider_schema( string $name ): ?array {
+		$data = self::get_authoritative_provider_schema_data( $name );
+		if ( ! is_array( $data ) ) {
+			return null;
+		}
+
+		return array(
+			'type'     => 'function',
+			'function' => array(
+				'name'        => (string) $data['name'],
+				'description' => (string) $data['description'],
+				'parameters'  => $data['parameters'],
+			),
+		);
+	}
+
+	/**
 	 * Get the authoritative parameter contract for a tool when available.
 	 *
 	 * @since 5.5.0
@@ -381,6 +465,36 @@ class PressArk_Operation_Registry {
 	}
 
 	/**
+	 * Run the fast pre-execution permission hook for a tool.
+	 *
+	 * Mirrors Claude Code's checkPermissions pattern by returning a
+	 * lightweight allow|ask|block decision before execution begins.
+	 *
+	 * @since 5.6.0
+	 * @param string $name    Tool name (or alias).
+	 * @param array  $params  Tool parameters.
+	 * @param array  $context Lightweight execution context.
+	 * @return array{allowed: bool, behavior: string, reason: string, ui_action: string}
+	 */
+	public static function check_permissions( string $name, array $params = array(), array $context = array() ): array {
+		$op = self::resolve( $name );
+		if ( ! $op ) {
+			return array(
+				'allowed'   => true,
+				'behavior'  => 'allow',
+				'reason'    => '',
+				'ui_action' => 'none',
+			);
+		}
+
+		if ( ! is_callable( $op->check_permissions ) ) {
+			return self::evaluate_permissions( $op->name, $params, $context );
+		}
+
+		return $op->check_permissions( $params, $context );
+	}
+
+	/**
 	 * Get the cache TTL hint for a tool.
 	 *
 	 * @since 5.3.0
@@ -429,6 +543,52 @@ class PressArk_Operation_Registry {
 	}
 
 	/**
+	 * Get the canonical loading intent for a tool.
+	 *
+	 * @since 5.6.0
+	 * @param string $name Tool name (or alias).
+	 * @return string 'auto'|'always_load'|'deferred'
+	 */
+	public static function get_loading_intent( string $name ): string {
+		$op = self::resolve( $name );
+		return $op ? $op->get_loading_intent() : 'auto';
+	}
+
+	/**
+	 * Whether a tool should always be hydrated when visible.
+	 *
+	 * @since 5.6.0
+	 */
+	public static function is_always_load_tool( string $name ): bool {
+		return 'always_load' === self::get_loading_intent( $name );
+	}
+
+	/**
+	 * Whether a tool should remain searchable until explicitly hydrated.
+	 *
+	 * @since 5.6.0
+	 */
+	public static function is_deferred_tool( string $name ): bool {
+		return 'deferred' === self::get_loading_intent( $name );
+	}
+
+	/**
+	 * Get compact discovery metadata for a tool.
+	 *
+	 * @since 5.6.0
+	 * @param string $name Tool name (or alias).
+	 * @return array<string,mixed>|null
+	 */
+	public static function get_discovery_metadata( string $name ): ?array {
+		$op = self::resolve( $name );
+		if ( ! $op ) {
+			return null;
+		}
+
+		return $op->get_discovery_metadata();
+	}
+
+	/**
 	 * Get the search hint for a tool.
 	 *
 	 * @since 5.3.0
@@ -436,8 +596,31 @@ class PressArk_Operation_Registry {
 	 * @return string Search keywords (empty string = none).
 	 */
 	public static function get_search_hint( string $name ): string {
-		$op = self::resolve( $name );
-		return $op ? $op->search_hint : '';
+		$metadata = self::get_discovery_metadata( $name );
+		return is_array( $metadata ) ? (string) ( $metadata['search_hint'] ?? '' ) : '';
+	}
+
+	/**
+	 * List canonical tool names by loading intent.
+	 *
+	 * @since 5.6.0
+	 * @param string $intent Loading intent to filter by.
+	 * @return string[]
+	 */
+	public static function tool_names_by_loading_intent( string $intent ): array {
+		self::ensure_booted();
+		$intent = sanitize_key( $intent );
+		$names  = array();
+
+		foreach ( self::$operations as $name => $operation ) {
+			if ( $intent !== $operation->get_loading_intent() ) {
+				continue;
+			}
+
+			$names[] = sanitize_key( (string) $name );
+		}
+
+		return array_values( array_filter( array_unique( $names ) ) );
 	}
 
 	/**
@@ -535,6 +718,7 @@ class PressArk_Operation_Registry {
 		self::$aliases       = array();
 		self::$virtual_groups = array();
 		self::$group_index   = null;
+		self::$permission_registry = null;
 		self::$booted        = false;
 	}
 
@@ -881,18 +1065,18 @@ class PressArk_Operation_Registry {
 
 		// ── WooCommerce — writes ────────────────────────────────
 		self::register_all( array(
-			array( 'edit_product',         'woocommerce', 'confirm', 'woo', 'edit_product',         'none', 'woocommerce', 'Update a product: 30+ fields via WC object model' ),
-			array( 'create_product',       'woocommerce', 'confirm', 'woo', 'create_product',       'none', 'woocommerce', 'Create product: simple, variable, grouped, or external' ),
-			array( 'bulk_edit_products',   'woocommerce', 'confirm', 'woo', 'bulk_edit_products',   'none', 'woocommerce', 'Bulk update multiple products at once' ),
+			array( 'edit_product',         'woocommerce', 'confirm', 'woo', 'edit_product',         'none', 'woocommerce', 'Update a product with explicit WooCommerce pricing fields and 30+ other fields; use clear_sale to remove a sale' ),
+			array( 'create_product',       'woocommerce', 'confirm', 'woo', 'create_product',       'none', 'woocommerce', 'Create product with explicit regular_price and/or sale_price fields' ),
+			array( 'bulk_edit_products',   'woocommerce', 'confirm', 'woo', 'bulk_edit_products',   'none', 'woocommerce', 'Bulk update multiple products with explicit WooCommerce pricing fields; use clear_sale to remove a sale' ),
 			array( 'update_order',         'woocommerce', 'confirm', 'woo', 'update_order',         'none', 'woocommerce', 'Update order status or add a note' ),
 			array( 'manage_coupon',        'woocommerce', 'confirm', 'woo', 'manage_coupon',        'none', 'woocommerce', 'Create, edit, delete, or list coupons' ),
 			array( 'email_customer',       'woocommerce', 'confirm', 'woo', 'email_customer',       'none', 'woocommerce', 'Send personalized email to a customer' ),
 			array( 'moderate_review',      'woocommerce', 'confirm', 'woo', 'moderate_review',      'none', 'woocommerce', 'Approve, reject, spam, trash, or reply to a review' ),
 			array( 'reply_review',         'woocommerce', 'confirm', 'woo', 'reply_review',         'none', 'woocommerce', 'Reply to a product review as the current admin user' ),
 			array( 'bulk_reply_reviews',   'woocommerce', 'confirm', 'woo', 'bulk_reply_reviews',   'none', 'woocommerce', 'Reply to multiple product reviews in one confirmable action' ),
-			array( 'edit_variation',       'woocommerce', 'confirm', 'woo', 'edit_variation',       'none', 'woocommerce', 'Edit a product variation: price, stock, status' ),
-			array( 'create_variation',     'woocommerce', 'confirm', 'woo', 'create_variation',     'none', 'woocommerce', 'Create a new variation with attributes and pricing' ),
-			array( 'bulk_edit_variations', 'woocommerce', 'confirm', 'woo', 'bulk_edit_variations', 'none', 'woocommerce', 'Bulk edit all variations: prices, stock, status' ),
+			array( 'edit_variation',       'woocommerce', 'confirm', 'woo', 'edit_variation',       'none', 'woocommerce', 'Edit a variation with explicit regular_price, sale_price, or clear_sale; use clear_sale to remove a sale' ),
+			array( 'create_variation',     'woocommerce', 'confirm', 'woo', 'create_variation',     'none', 'woocommerce', 'Create a new variation with attributes and explicit pricing fields' ),
+			array( 'bulk_edit_variations', 'woocommerce', 'confirm', 'woo', 'bulk_edit_variations', 'none', 'woocommerce', 'Bulk edit all variations with explicit WooCommerce pricing fields; use clear_sale to remove a sale' ),
 			array( 'create_refund',        'woocommerce', 'confirm', 'woo', 'create_refund',        'none', 'woocommerce', 'Issue full or partial refund for an order' ),
 			array( 'create_order',         'woocommerce', 'confirm', 'woo', 'create_order',         'none', 'woocommerce', 'Create manual order with addresses and line items' ),
 			array( 'trigger_wc_email',     'woocommerce', 'confirm', 'woo', 'trigger_wc_email',     'none', 'woocommerce', 'Trigger any WooCommerce email programmatically' ),
@@ -1278,6 +1462,8 @@ class PressArk_Operation_Registry {
 				'parameter_contract' => self::bulk_edit_products_parameter_contract(),
 				'model_guidance'     => array(
 					'Use the products array when each product needs different changes; use scope plus one shared changes object only when every match gets the same update.',
+					'Do not send plain price for WooCommerce writes. Choose regular_price, sale_price, or clear_sale.',
+					'To remove a sale, use clear_sale=true. Do not emulate sale removal with empty sale_price.',
 				),
 				'read_invalidation' => array(
 					'scope'  => 'target_posts',
@@ -1288,6 +1474,8 @@ class PressArk_Operation_Registry {
 					'read_tool'    => 'get_product',
 					'read_args'    => array(),
 					'check_fields' => array( 'name', 'regular_price', 'sale_price', 'stock_quantity', 'stock_status', 'status', 'manage_stock' ),
+					'computed_pricing_check' => true,
+					'pricing_state_fields'   => array( 'regular_price', 'sale_price', 'price', 'on_sale', 'sale_from', 'sale_to' ),
 					'intensity'    => 'thorough',
 					'nudge'        => true,
 				),
@@ -1298,6 +1486,10 @@ class PressArk_Operation_Registry {
 				'interrupt'     => 'block',
 				'tags'          => array( 'woocommerce', 'products', 'write' ),
 				'parameter_contract' => self::edit_product_parameter_contract(),
+				'model_guidance'     => array(
+					'Do not send plain price for WooCommerce writes. Choose regular_price, sale_price, or clear_sale.',
+					'To remove a sale, use clear_sale=true. Do not emulate sale removal with empty sale_price.',
+				),
 				'read_invalidation' => array(
 					'scope'  => 'target_posts',
 					'reason' => 'Product edits stale prior reads of the affected product and any lists that contained it.',
@@ -1307,6 +1499,8 @@ class PressArk_Operation_Registry {
 					'read_tool'    => 'get_product',
 					'read_args'    => array(),
 					'check_fields' => array( 'name', 'regular_price', 'sale_price', 'stock_quantity', 'stock_status', 'status', 'manage_stock' ),
+					'computed_pricing_check' => true,
+					'pricing_state_fields'   => array( 'regular_price', 'sale_price', 'price', 'on_sale', 'sale_from', 'sale_to' ),
 					'intensity'    => 'thorough',
 					'nudge'        => true,
 				),
@@ -1318,6 +1512,9 @@ class PressArk_Operation_Registry {
 				'tags'          => array( 'woocommerce', 'products', 'write' ),
 				'idempotent'    => false,
 				'parameter_contract' => self::create_product_parameter_contract(),
+				'model_guidance'     => array(
+					'Do not send plain price for WooCommerce writes. Choose regular_price or sale_price explicitly.',
+				),
 				'read_invalidation' => array(
 					'scope'  => 'site',
 					'reason' => 'New products can stale prior catalog reads, store summaries, and site snapshots.',
@@ -1328,6 +1525,78 @@ class PressArk_Operation_Registry {
 					'read_args'    => array(),
 					'check_fields' => array( 'name', 'status', 'type' ),
 					'intensity'    => 'thorough',
+					'nudge'        => true,
+				),
+			),
+
+			'edit_variation' => array(
+				'search_hint'   => 'edit update variation price stock status',
+				'interrupt'     => 'block',
+				'tags'          => array( 'woocommerce', 'variations', 'write' ),
+				'parameter_contract' => self::edit_variation_parameter_contract(),
+				'model_guidance'     => array(
+					'Do not send plain price for WooCommerce writes. Choose regular_price, sale_price, or clear_sale.',
+					'To remove a sale, use clear_sale=true. Do not emulate sale removal with empty sale_price.',
+				),
+				'read_invalidation' => array(
+					'scope'  => 'target_posts',
+					'reason' => 'Variation edits stale prior reads of that variation and its parent product pricing.',
+				),
+				'verification'  => array(
+					'strategy'     => 'none',
+					'read_tool'    => '',
+					'read_args'    => array(),
+					'check_fields' => array(),
+					'intensity'    => 'light',
+					'nudge'        => true,
+				),
+			),
+
+			'create_variation' => array(
+				'search_hint'   => 'create new variation attributes price stock',
+				'interrupt'     => 'block',
+				'tags'          => array( 'woocommerce', 'variations', 'write' ),
+				'idempotent'    => false,
+				'parameter_contract' => self::create_variation_parameter_contract(),
+				'model_guidance'     => array(
+					'Do not send plain price for WooCommerce writes. Choose regular_price or sale_price explicitly.',
+				),
+				'read_invalidation' => array(
+					'scope'  => 'target_posts',
+					'reason' => 'New variations stale prior reads of the parent product and variation lists.',
+				),
+				'verification'  => array(
+					'strategy'     => 'none',
+					'read_tool'    => '',
+					'read_args'    => array(),
+					'check_fields' => array(),
+					'intensity'    => 'light',
+					'nudge'        => true,
+				),
+			),
+
+			'bulk_edit_variations' => array(
+				'search_hint'   => 'bulk update variations price stock status',
+				'interrupt'     => 'cancel',
+				'resumable'     => true,
+				'output_policy' => 'compact',
+				'tags'          => array( 'woocommerce', 'bulk', 'variations' ),
+				'idempotent'    => false,
+				'parameter_contract' => self::bulk_edit_variations_parameter_contract(),
+				'model_guidance'     => array(
+					'Do not send plain price for WooCommerce writes. Choose regular_price, sale_price, or clear_sale.',
+					'To remove a sale, use clear_sale=true. Do not emulate sale removal with empty sale_price.',
+				),
+				'read_invalidation' => array(
+					'scope'  => 'target_posts',
+					'reason' => 'Bulk variation edits stale prior reads of the affected variations and their parent product pricing.',
+				),
+				'verification'  => array(
+					'strategy'     => 'none',
+					'read_tool'    => '',
+					'read_args'    => array(),
+					'check_fields' => array(),
+					'intensity'    => 'light',
 					'nudge'        => true,
 				),
 			),
@@ -2023,6 +2292,19 @@ class PressArk_Operation_Registry {
 	 *
 	 * @since 5.5.0
 	 */
+	private static function edit_content_root_change_aliases(): array {
+		return array(
+			'post_id'                 => array( 'changes.post_id' ),
+			'changes.content'         => array( 'content', 'post_content' ),
+			'changes.title'           => array( 'title', 'post_title' ),
+			'changes.excerpt'         => array( 'excerpt', 'post_excerpt' ),
+			'changes.status'          => array( 'status', 'post_status', 'changes.post_status' ),
+			'changes.scheduled_date'  => array( 'scheduled_date', 'post_date', 'changes.post_date' ),
+			'changes.sticky'          => array( 'sticky' ),
+			'changes.post_format'     => array( 'post_format', 'format' ),
+		);
+	}
+
 	private static function edit_content_parameter_contract(): array {
 		return array(
 			'type'       => 'object',
@@ -2109,9 +2391,7 @@ class PressArk_Operation_Registry {
 					'message'      => 'changes.scheduled_date only applies when changes.status is future.',
 				),
 			),
-			'compatibility_aliases' => array(
-				'post_id' => array( 'changes.post_id' ),
-			),
+			'compatibility_aliases' => self::edit_content_root_change_aliases(),
 		);
 	}
 
@@ -2561,10 +2841,11 @@ class PressArk_Operation_Registry {
 			'catalog_visibility'=> array( 'type' => 'string', 'description' => 'Catalog visibility.', 'enum' => array( 'visible', 'catalog', 'search', 'hidden' ) ),
 			'purchase_note'     => array( 'type' => 'string', 'description' => 'Post-purchase note.' ),
 			'menu_order'        => array( 'type' => 'integer', 'description' => 'Menu order.', 'minimum' => 0 ),
-			'regular_price'     => array( 'type' => array( 'string', 'number' ), 'description' => 'Regular price.' ),
-			'sale_price'        => array( 'type' => array( 'string', 'number' ), 'description' => 'Sale price.' ),
-			'sale_from'         => array( 'type' => 'string', 'description' => 'Sale start date/time.' ),
-			'sale_to'           => array( 'type' => 'string', 'description' => 'Sale end date/time.' ),
+			'regular_price'     => array( 'type' => array( 'string', 'number' ), 'description' => 'Regular/base price. Use this explicit field instead of plain price.' ),
+			'sale_price'        => array( 'type' => array( 'string', 'number' ), 'description' => 'Sale price amount only. Use this explicit field to set or change a sale amount. Do not use it to remove a sale; use clear_sale=true instead.' ),
+			'clear_sale'        => array( 'type' => 'boolean', 'description' => 'Canonical sale-removal operation. True removes the current sale price, clears any sale schedule, and preserves the regular price.' ),
+			'sale_from'         => array( 'type' => 'string', 'description' => 'Sale start date/time for an active sale. Do not send this when clear_sale=true.' ),
+			'sale_to'           => array( 'type' => 'string', 'description' => 'Sale end date/time for an active sale. Do not send this when clear_sale=true.' ),
 			'price_delta'       => array( 'type' => 'number', 'description' => 'Relative price change added to the current regular price.' ),
 			'price_adjust_pct'  => array( 'type' => 'number', 'description' => 'Relative percentage applied to the current regular price.' ),
 			'sku'               => array( 'type' => 'string', 'description' => 'SKU.' ),
@@ -2622,6 +2903,18 @@ class PressArk_Operation_Registry {
 		);
 	}
 
+	private static function pick_change_properties( array $properties, array $fields ): array {
+		$subset = array();
+
+		foreach ( $fields as $field ) {
+			if ( isset( $properties[ $field ] ) ) {
+				$subset[ $field ] = $properties[ $field ];
+			}
+		}
+
+		return $subset;
+	}
+
 	/**
 	 * Compatibility aliases used inside a product changes object.
 	 *
@@ -2629,8 +2922,8 @@ class PressArk_Operation_Registry {
 	 */
 	private static function product_change_object_aliases(): array {
 		return array(
-			'regular_price'  => array( 'price' ),
 			'stock_quantity' => array( 'stock' ),
+			'clear_sale'     => array( 'clear_sale_price', 'remove_sale', 'end_sale' ),
 		);
 	}
 
@@ -2651,6 +2944,21 @@ class PressArk_Operation_Registry {
 					'fields'  => array( 'regular_price', 'price_delta', 'price_adjust_pct' ),
 					'mode'    => 'at_most_one',
 					'message' => 'Use at most one price driver: regular_price, price_delta, or price_adjust_pct.',
+				),
+				array(
+					'fields'  => array( 'sale_price', 'clear_sale' ),
+					'mode'    => 'at_most_one',
+					'message' => 'Use sale_price to set/change a sale amount or clear_sale to remove the sale, not both.',
+				),
+				array(
+					'fields'  => array( 'clear_sale', 'sale_from' ),
+					'mode'    => 'at_most_one',
+					'message' => 'sale_from only applies when setting or updating a sale, not when clear_sale=true.',
+				),
+				array(
+					'fields'  => array( 'clear_sale', 'sale_to' ),
+					'mode'    => 'at_most_one',
+					'message' => 'sale_to only applies when setting or updating a sale, not when clear_sale=true.',
 				),
 				array(
 					'fields'  => array( 'stock_quantity', 'stock_adjust' ),
@@ -2674,11 +2982,11 @@ class PressArk_Operation_Registry {
 
 		foreach ( array_keys( self::product_change_properties() ) as $field ) {
 			$paths = array( $field );
-			if ( 'regular_price' === $field ) {
-				$paths[] = 'price';
-			}
 			if ( 'stock_quantity' === $field ) {
 				$paths[] = 'stock';
+			}
+			if ( 'clear_sale' === $field ) {
+				$paths = array_merge( $paths, array( 'clear_sale_price', 'remove_sale', 'end_sale' ) );
 			}
 			$aliases[ 'changes.' . $field ] = array_values( array_unique( $paths ) );
 		}
@@ -2716,6 +3024,7 @@ class PressArk_Operation_Registry {
 	private static function create_product_parameter_contract(): array {
 		$shared = self::product_change_properties();
 		unset( $shared['name'], $shared['status'] );
+		unset( $shared['clear_sale'] );
 
 		return array(
 			'type'       => 'object',
@@ -2755,7 +3064,9 @@ class PressArk_Operation_Registry {
 					'message' => 'Use either stock_quantity or stock_adjust, not both.',
 				),
 			),
-			'compatibility_aliases' => self::product_change_object_aliases(),
+			'compatibility_aliases' => array(
+				'stock_quantity' => array( 'stock' ),
+			),
 		);
 	}
 
@@ -2770,11 +3081,11 @@ class PressArk_Operation_Registry {
 		);
 		foreach ( array_keys( self::product_change_properties() ) as $field ) {
 			$paths = array( $field );
-			if ( 'regular_price' === $field ) {
-				$paths[] = 'price';
-			}
 			if ( 'stock_quantity' === $field ) {
 				$paths[] = 'stock';
+			}
+			if ( 'clear_sale' === $field ) {
+				$paths = array_merge( $paths, array( 'clear_sale_price', 'remove_sale', 'end_sale' ) );
 			}
 			$item_aliases[ 'changes.' . $field ] = array_values( array_unique( $paths ) );
 		}
@@ -2854,6 +3165,159 @@ class PressArk_Operation_Registry {
 					'message'      => 'search only applies when scope is matching.',
 				),
 			),
+		);
+	}
+
+	private static function variation_edit_properties(): array {
+		return self::pick_change_properties(
+			self::product_change_properties(),
+			array( 'regular_price', 'sale_price', 'clear_sale', 'price_delta', 'price_adjust_pct', 'stock_quantity', 'stock_status', 'status' )
+		);
+	}
+
+	private static function variation_edit_root_aliases(): array {
+		$aliases = array(
+			'variation_id' => array( 'id' ),
+		);
+
+		foreach ( array_keys( self::variation_edit_properties() ) as $field ) {
+			$paths = array( $field );
+			if ( 'stock_quantity' === $field ) {
+				$paths[] = 'stock';
+			}
+			if ( 'clear_sale' === $field ) {
+				$paths = array_merge( $paths, array( 'clear_sale_price', 'remove_sale', 'end_sale' ) );
+			}
+			$aliases[ $field ] = array_values( array_unique( $paths ) );
+		}
+
+		return $aliases;
+	}
+
+	private static function edit_variation_parameter_contract(): array {
+		return array(
+			'type'       => 'object',
+			'strict'     => true,
+			'properties' => array_merge(
+				array(
+					'variation_id' => array(
+						'type'        => 'integer',
+						'description' => 'WooCommerce variation ID.',
+						'minimum'     => 1,
+					),
+				),
+				self::variation_edit_properties()
+			),
+			'required'   => array( 'variation_id' ),
+			'one_of'     => array(
+				array(
+					'fields'  => array( 'regular_price', 'price_delta', 'price_adjust_pct' ),
+					'mode'    => 'at_most_one',
+					'message' => 'Use at most one price driver: regular_price, price_delta, or price_adjust_pct.',
+				),
+				array(
+					'fields'  => array( 'sale_price', 'clear_sale' ),
+					'mode'    => 'at_most_one',
+					'message' => 'Use sale_price to set/change a sale amount or clear_sale to remove the sale, not both.',
+				),
+			),
+			'compatibility_aliases' => self::variation_edit_root_aliases(),
+		);
+	}
+
+	private static function create_variation_properties(): array {
+		return array_merge(
+			array(
+				'product_id'  => array(
+					'type'        => 'integer',
+					'description' => 'Parent variable product ID.',
+					'minimum'     => 1,
+				),
+				'attributes'  => array(
+					'type'                 => 'object',
+					'description'          => 'Variation attribute map keyed by attribute slug or taxonomy name.',
+					'minProperties'        => 1,
+					'additionalProperties' => true,
+				),
+			),
+			self::pick_change_properties(
+				self::product_change_properties(),
+				array( 'regular_price', 'sale_price', 'sku', 'stock_quantity', 'manage_stock', 'stock_status', 'weight', 'length', 'width', 'height', 'virtual', 'downloadable', 'backorders', 'status' )
+			)
+		);
+	}
+
+	private static function create_variation_parameter_contract(): array {
+		return array(
+			'type'       => 'object',
+			'strict'     => true,
+			'properties' => self::create_variation_properties(),
+			'required'   => array( 'product_id', 'attributes' ),
+			'compatibility_aliases' => array(
+				'stock_quantity' => array( 'stock' ),
+			),
+		);
+	}
+
+	private static function variation_bulk_change_properties(): array {
+		return self::pick_change_properties(
+			self::product_change_properties(),
+			array( 'regular_price', 'sale_price', 'clear_sale', 'sale_from', 'sale_to', 'price_delta', 'price_adjust_pct', 'stock_status', 'manage_stock', 'status' )
+		);
+	}
+
+	private static function variation_bulk_change_aliases(): array {
+		return array(
+			'clear_sale' => array( 'clear_sale_price', 'remove_sale', 'end_sale' ),
+		);
+	}
+
+	private static function variation_bulk_change_schema( string $description ): array {
+		return array(
+			'type'          => 'object',
+			'description'   => $description,
+			'minProperties' => 1,
+			'strict'        => true,
+			'properties'    => self::variation_bulk_change_properties(),
+			'one_of'        => array(
+				array(
+					'fields'  => array( 'regular_price', 'price_delta', 'price_adjust_pct' ),
+					'mode'    => 'at_most_one',
+					'message' => 'Use at most one price driver: regular_price, price_delta, or price_adjust_pct.',
+				),
+				array(
+					'fields'  => array( 'sale_price', 'clear_sale' ),
+					'mode'    => 'at_most_one',
+					'message' => 'Use sale_price to set/change a sale amount or clear_sale to remove the sale, not both.',
+				),
+				array(
+					'fields'  => array( 'clear_sale', 'sale_from' ),
+					'mode'    => 'at_most_one',
+					'message' => 'sale_from only applies when setting or updating a sale, not when clear_sale=true.',
+				),
+				array(
+					'fields'  => array( 'clear_sale', 'sale_to' ),
+					'mode'    => 'at_most_one',
+					'message' => 'sale_to only applies when setting or updating a sale, not when clear_sale=true.',
+				),
+			),
+			'compatibility_aliases' => self::variation_bulk_change_aliases(),
+		);
+	}
+
+	private static function bulk_edit_variations_parameter_contract(): array {
+		return array(
+			'type'       => 'object',
+			'strict'     => true,
+			'properties' => array(
+				'product_id' => array(
+					'type'        => 'integer',
+					'description' => 'Parent variable product ID.',
+					'minimum'     => 1,
+				),
+				'changes'    => self::variation_bulk_change_schema( 'Shared changes applied to every variation.' ),
+			),
+			'required'   => array( 'product_id', 'changes' ),
 		);
 	}
 
@@ -3143,8 +3607,120 @@ class PressArk_Operation_Registry {
 				$op->apply_contract( $contract );
 			}
 
+			if ( ! is_callable( $op->check_permissions ) ) {
+				$op->check_permissions = static function ( array $params, array $context = array() ) use ( $name ): array {
+					return self::evaluate_permissions( $name, $params, $context );
+				};
+			}
+
 			self::register( $op );
 		}
+	}
+
+	/**
+	 * Delegate a tool permission probe to the owning handler.
+	 *
+	 * @since 5.6.0
+	 */
+	private static function evaluate_permissions( string $name, array $params, array $context ): array {
+		$op = self::resolve( $name );
+		if ( ! $op ) {
+			return array(
+				'allowed'   => true,
+				'behavior'  => 'allow',
+				'reason'    => '',
+				'ui_action' => 'none',
+			);
+		}
+
+		return self::permission_registry()->check_permissions( $op, $params, $context );
+	}
+
+	/**
+	 * Lazily build the lightweight handler registry used for permission probes.
+	 *
+	 * @since 5.6.0
+	 */
+	private static function permission_registry(): PressArk_Handler_Registry {
+		if ( null === self::$permission_registry ) {
+			self::$permission_registry = new PressArk_Handler_Registry( new PressArk_Action_Logger() );
+		}
+
+		return self::$permission_registry;
+	}
+
+	/**
+	 * Build the provider-facing tool description from operation metadata.
+	 *
+	 * @since 5.6.0
+	 * @param array<string,mixed> $metadata Provider/discovery metadata.
+	 */
+	private static function build_provider_description( PressArk_Operation $op, array $metadata ): string {
+		$description = trim( (string) ( $metadata['description'] ?? '' ) );
+		$guidance    = array_merge(
+			self::contract_guidance_lines( $op->get_parameter_contract() ),
+			(array) ( $metadata['model_guidance'] ?? array() )
+		);
+		$guidance    = array_values( array_unique( array_filter( array_map(
+			array( self::class, 'normalize_guidance_line' ),
+			$guidance
+		) ) ) );
+
+		if ( empty( $guidance ) ) {
+			return $description;
+		}
+
+		return trim( $description . ' Guidance: ' . implode( ' ', array_slice( $guidance, 0, 3 ) ) );
+	}
+
+	/**
+	 * Surface contract messages that still matter when provider schemas omit
+	 * some higher-order validation clauses for transport compatibility.
+	 *
+	 * @since 5.6.0
+	 * @param array<string,mixed>|null $contract Parameter contract.
+	 * @return string[]
+	 */
+	private static function contract_guidance_lines( ?array $contract ): array {
+		if ( ! is_array( $contract ) ) {
+			return array();
+		}
+
+		$lines = array();
+
+		foreach ( (array) ( $contract['one_of'] ?? array() ) as $group ) {
+			$message = sanitize_text_field( (string) ( $group['message'] ?? '' ) );
+			if ( '' !== $message ) {
+				$lines[] = $message;
+			}
+		}
+
+		foreach ( (array) ( $contract['dependencies'] ?? array() ) as $rule ) {
+			$message = sanitize_text_field( (string) ( $rule['message'] ?? '' ) );
+			if ( '' !== $message ) {
+				$lines[] = $message;
+			}
+		}
+
+		return $lines;
+	}
+
+	/**
+	 * Normalize tool guidance for provider descriptions.
+	 *
+	 * @since 5.6.0
+	 */
+	private static function normalize_guidance_line( string $line ): string {
+		$line = sanitize_text_field( $line );
+		if ( '' === $line ) {
+			return '';
+		}
+
+		if ( ! preg_match( '/[.!?]$/', $line ) ) {
+			$line .= '.';
+		}
+
+		return $line;
 	}
 
 	/**

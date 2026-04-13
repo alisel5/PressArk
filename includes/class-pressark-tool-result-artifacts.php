@@ -111,7 +111,7 @@ class PressArk_Tool_Result_Artifacts {
 
 		foreach ( array_keys( $items ) as $index ) {
 			$item = $items[ $index ];
-			if ( $item['artifactized'] || ! $item['eligible'] || $item['inline_tokens'] < $this->single_inline_threshold( $item['priority'] ) ) {
+			if ( $item['artifactized'] || ! $item['eligible'] || $item['inline_tokens'] < $this->single_inline_threshold( $item['priority'], $item['tool_name'] ) ) {
 				continue;
 			}
 
@@ -603,9 +603,16 @@ class PressArk_Tool_Result_Artifacts {
 		return (bool) apply_filters( 'pressark_tool_result_should_artifactize', $default, $tool_name, $result, $inline_tokens, $priority );
 	}
 
-	private function single_inline_threshold( int $priority ): int {
+	private function single_inline_threshold( int $priority, string $tool_name = '' ): int {
 		$default = $priority >= 3 ? self::PRIORITY_INLINE_THRESHOLD : self::DEFAULT_INLINE_THRESHOLD;
-		return (int) apply_filters( 'pressark_tool_result_inline_threshold', $default, $priority );
+		$policy  = self::output_policy_for( $tool_name );
+		$value   = match ( $policy ) {
+			'large'   => min( $default, self::PRIORITY_INLINE_THRESHOLD ),
+			'compact' => $default + 300,
+			default   => $default,
+		};
+
+		return (int) apply_filters( 'pressark_tool_result_inline_threshold', $value, $priority, $tool_name, $policy );
 	}
 
 	private function turn_inline_budget(): int {
@@ -635,10 +642,18 @@ class PressArk_Tool_Result_Artifacts {
 		if ( in_array( $tool_name, self::PHASE_ONE_TOOLS, true ) ) {
 			return 3;
 		}
-		if ( 'large' === PressArk_Operation_Registry::get_output_policy( $tool_name ) ) {
+		if ( 'large' === self::output_policy_for( $tool_name ) ) {
 			return 2;
 		}
 		return self::looks_large( $result ) ? 2 : 0;
+	}
+
+	private static function output_policy_for( string $tool_name ): string {
+		if ( ! class_exists( 'PressArk_Operation_Registry' ) ) {
+			return 'standard';
+		}
+
+		return sanitize_key( PressArk_Operation_Registry::get_output_policy( $tool_name ) ?: 'standard' );
 	}
 
 	private static function looks_large( array $result ): bool {

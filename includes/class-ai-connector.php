@@ -17,6 +17,7 @@ class PressArk_AI_Connector {
 	private array $active_request_options = array();
 	private array $last_routing_decision = array();
 	private array $last_request_snapshot = array();
+	private array $last_context_metrics = array();
 
 	/**
 	 * Whether the current Gemini model is a "thinking" model.
@@ -55,6 +56,7 @@ class PressArk_AI_Connector {
 
 	// Cache-control marker for Anthropic prompt caching.
 	private const CACHE_TYPE = 'ephemeral';
+	private const SYSTEM_PROMPT_DYNAMIC_BOUNDARY = '__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__';
 
 	// Providers that require explicit cache_control in API calls.
 	// OpenAI/DeepSeek/Gemini cache automatically on stable prefixes.
@@ -314,6 +316,246 @@ PROMPT;
 	}
 
 	/**
+	 * Return context-collection metrics for the most recent request.
+	 */
+	public function get_last_context_metrics(): array {
+		return $this->last_context_metrics;
+	}
+
+	/**
+	 * v5.6.0: Memoized context with cache boundaries (Claude Code pattern:
+	 * getUserContext memoized, system-reminder in user turn).
+	 *
+	 * Injects stable optional context as the first user turn and keeps the
+	 * dynamic system prompt explicitly separated from the stable context prefix.
+	 *
+	 * @return array{messages:array,system_prompt:string,metrics:array}
+	 */
+	private function prepare_request_context( array $messages, string $system_prompt ): array {
+		$this->last_context_metrics = array();
+
+		if ( ! $this->should_inject_context_collector() || ! class_exists( 'PressArk_Context_Collector' ) ) {
+			return array(
+				'messages'      => $messages,
+				'system_prompt' => $system_prompt,
+				'metrics'       => array(),
+			);
+		}
+
+		$scope   = $this->resolve_context_scope();
+		$user_id = max( 0, (int) ( $scope['user_id'] ?? 0 ) );
+
+		if ( $user_id <= 0 ) {
+			return array(
+				'messages'      => $messages,
+				'system_prompt' => $system_prompt,
+				'metrics'       => array(),
+			);
+		}
+
+		$collector      = new PressArk_Context_Collector();
+		$user_context   = $collector->get_user_context( (int) ( $scope['chat_id'] ?? 0 ), $user_id );
+		$system_context = $collector->get_system_context();
+		$prepared       = $this->enforce_context_token_budget( $user_context, $system_context );
+		$prepared_msgs  = $messages;
+
+		if ( ! empty( $prepared['user_context'] ) && ! $this->has_context_meta_message( $prepared_msgs ) ) {
+			array_unshift(
+				$prepared_msgs,
+				array(
+					'role'    => 'user',
+					'content' => $this->build_user_context_message( (array) $prepared['user_context'] ),
+					'is_meta' => true, // Internal only; stripped before provider payloads.
+				)
+			);
+		}
+
+		$prepared_system_prompt = trim( $system_prompt );
+		$stable_system_text     = $this->format_context( (array) $prepared['system_context'] );
+
+		if ( '' !== $stable_system_text && '' !== $prepared_system_prompt ) {
+			$prepared_system_prompt = $stable_system_text
+				. "\n\n"
+				. self::SYSTEM_PROMPT_DYNAMIC_BOUNDARY
+				. "\n"
+				. $prepared_system_prompt;
+		} elseif ( '' !== $stable_system_text ) {
+			$prepared_system_prompt = $stable_system_text;
+		} elseif ( '' !== $prepared_system_prompt ) {
+			$prepared_system_prompt = self::SYSTEM_PROMPT_DYNAMIC_BOUNDARY . "\n" . $prepared_system_prompt;
+		}
+
+		$metrics = array(
+			'context_used'          => ! empty( $prepared['user_context'] ) || ! empty( $prepared['system_context'] ),
+			'context_tokens'        => max( 0, (int) ( $prepared['metrics']['total_tokens'] ?? 0 ) ),
+			'user_context_tokens'   => max( 0, (int) ( $prepared['metrics']['user_tokens'] ?? 0 ) ),
+			'system_context_tokens' => max( 0, (int) ( $prepared['metrics']['system_tokens'] ?? 0 ) ),
+			'context_truncated'     => ! empty( $prepared['metrics']['truncated'] ),
+			'chat_id'               => max( 0, (int) ( $scope['chat_id'] ?? 0 ) ),
+			'user_id'               => $user_id,
+		);
+
+		$this->last_context_metrics = array_filter(
+			$metrics,
+			static function ( $value ) {
+				return ! ( is_bool( $value ) ? false === $value : ( is_int( $value ) ? 0 === $value : '' === (string) $value ) );
+			}
+		);
+
+		return array(
+			'messages'      => $prepared_msgs,
+			'system_prompt' => $prepared_system_prompt,
+			'metrics'       => $this->last_context_metrics,
+		);
+	}
+
+	private function should_inject_context_collector(): bool {
+		$phase = sanitize_key( (string) ( $this->active_request_options['phase'] ?? '' ) );
+		return ! in_array( $phase, array( 'classification', 'memory_selection', 'summarize' ), true );
+	}
+
+	private function resolve_context_scope(): array {
+		$trace = class_exists( 'PressArk_Activity_Trace' )
+			? PressArk_Activity_Trace::current_context()
+			: array();
+
+		return array(
+			'chat_id' => max(
+				0,
+				(int) (
+					$this->active_request_options['chat_id']
+					?? $trace['chat_id']
+					?? 0
+				)
+			),
+			'user_id' => max(
+				0,
+				(int) (
+					$this->active_request_options['user_id']
+					?? $trace['user_id']
+					?? ( function_exists( 'get_current_user_id' ) ? get_current_user_id() : 0 )
+				)
+			),
+		);
+	}
+
+	private function enforce_context_token_budget( array $user_context, array $system_context ): array {
+		$user_context = $this->sanitize_context_entries( $user_context );
+		$system_context = $this->sanitize_context_entries( $system_context );
+		$truncated    = false;
+
+		if ( ! empty( $user_context['pressark_md'] ) && mb_strlen( (string) $user_context['pressark_md'] ) > 1000 ) {
+			$user_context['pressark_md'] = mb_substr( (string) $user_context['pressark_md'], 0, 1000 ) . '...';
+			$truncated                   = true;
+		}
+
+		$metrics = $this->measure_context_tokens( $user_context, $system_context );
+
+		if ( $metrics['user_tokens'] > 300 || $metrics['system_tokens'] > 50 || $metrics['total_tokens'] > 350 ) {
+			if ( ! empty( $user_context['pressark_md'] ) ) {
+				$user_context['pressark_md'] = mb_substr( (string) $user_context['pressark_md'], 0, 500 ) . '...';
+				$truncated                   = true;
+			}
+			$metrics = $this->measure_context_tokens( $user_context, $system_context );
+			error_log(
+				sprintf(
+					'PressArk: Context token budget exceeded (%d tokens). Truncated memoized context to 500 chars.',
+					(int) $metrics['total_tokens']
+				)
+			);
+		}
+
+		$metrics['truncated'] = $truncated;
+
+		return array(
+			'user_context'   => $user_context,
+			'system_context' => $system_context,
+			'metrics'        => $metrics,
+		);
+	}
+
+	private function sanitize_context_entries( array $context ): array {
+		$clean = array();
+
+		foreach ( $context as $key => $value ) {
+			if ( is_array( $value ) || is_object( $value ) ) {
+				$value = wp_json_encode( $value, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES );
+			}
+
+			if ( ! is_scalar( $value ) ) {
+				continue;
+			}
+
+			$text = trim( (string) $value );
+			if ( '' === $text ) {
+				continue;
+			}
+
+			$clean[ (string) $key ] = $text;
+		}
+
+		return $clean;
+	}
+
+	private function measure_context_tokens( array $user_context, array $system_context ): array {
+		$user_text   = $this->build_user_context_message( $user_context );
+		$system_text = $this->format_context( $system_context );
+
+		return array(
+			'user_tokens'   => $this->estimate_text_tokens( $user_text ),
+			'system_tokens' => $this->estimate_text_tokens( $system_text ),
+			'total_tokens'  => $this->estimate_text_tokens( trim( $user_text . "\n" . $system_text ) ),
+		);
+	}
+
+	private function has_context_meta_message( array $messages ): bool {
+		$first = $messages[0] ?? array();
+		if ( ! is_array( $first ) ) {
+			return false;
+		}
+
+		return 'user' === ( $first['role'] ?? '' )
+			&& ! empty( $first['is_meta'] )
+			&& is_string( $first['content'] ?? null )
+			&& str_contains( (string) $first['content'], '<system-reminder>' );
+	}
+
+	private function build_user_context_message( array $context ): string {
+		if ( empty( $context ) ) {
+			return '';
+		}
+
+		return '<system-reminder>' . "\n"
+			. 'As you answer, you can use this context:' . "\n"
+			. $this->format_context( $context ) . "\n"
+			. 'IMPORTANT: Only use if highly relevant.' . "\n"
+			. '</system-reminder>';
+	}
+
+	private function format_context( array $context ): string {
+		$blocks = array();
+
+		foreach ( $context as $key => $value ) {
+			if ( is_array( $value ) || is_object( $value ) ) {
+				$value = wp_json_encode( $value, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES );
+			}
+
+			if ( ! is_scalar( $value ) ) {
+				continue;
+			}
+
+			$text = trim( (string) $value );
+			if ( '' === $text ) {
+				continue;
+			}
+
+			$blocks[] = '# ' . (string) $key . "\n" . $text;
+		}
+
+		return implode( "\n", $blocks );
+	}
+
+	/**
 	 * Prepare a streaming execution request with a fresh runtime contract.
 	 *
 	 * Streaming rounds do not pass through send_message_raw(), so they must
@@ -338,21 +580,22 @@ PROMPT;
 		$is_byok         = $this->get_tracker()->is_byok();
 		$options         = $this->normalize_request_options( $tools, $options, $deep_mode, $model_pinned, $is_byok );
 		$runtime_options = $this->resolve_request_runtime_options( $tools, $options, $this->provider, $this->model );
+		$augmented_system_prompt = $this->augment_system_prompt( $system_prompt, $runtime_options, $tools );
 
 		$this->active_request_options = $runtime_options;
 		$this->record_request_snapshot(
 			$messages,
 			$tools,
 			$system_prompt,
-			$system_prompt,
+			$augmented_system_prompt,
 			$runtime_options,
 			$this->provider,
 			$this->model
 		);
 
 		return 'anthropic' === $this->provider
-			? $this->build_anthropic_request( $messages, $tools, $system_prompt )
-			: $this->build_openai_request( $messages, $tools, $system_prompt );
+			? $this->build_anthropic_request( $messages, $tools, $augmented_system_prompt )
+			: $this->build_openai_request( $messages, $tools, $augmented_system_prompt );
 	}
 
 	/**
@@ -525,6 +768,8 @@ PROMPT;
 	 * @return array{message: string, actions: array|null, error: string|null}
 	 */
 	public function send_message( string $user_message, string $context, array $conversation = array(), bool $deep_mode = false ): array {
+		$this->active_request_options = array();
+		$this->last_context_metrics   = array();
 		// BYOK override — use user's own key and provider
 		if ( $this->get_tracker()->is_byok() ) {
 			return $this->send_byok( $user_message, $context, $conversation );
@@ -608,6 +853,8 @@ PROMPT;
 	 * Send using user's own API key and provider (BYOK mode).
 	 */
 	private function send_byok( string $user_message, string $context, array $conversation ): array {
+		$this->active_request_options = array();
+		$this->last_context_metrics   = array();
 		$system_content = self::SYSTEM_PROMPT_BASE . "\n\n" . $context;
 
 		$result = $this->with_byok_context( function () use ( $user_message, $system_content, $conversation ) {
@@ -631,6 +878,8 @@ PROMPT;
 	 * "hello" do not pay for the full WordPress agent stack.
 	 */
 	public function send_lightweight_chat( string $user_message, array $conversation = array(), bool $deep_mode = false ): array {
+		$this->active_request_options = array();
+		$this->last_context_metrics   = array();
 		$canned = $this->canned_lightweight_chat_response( $user_message );
 		if ( null !== $canned ) {
 			return $this->attach_routing_decision( $canned );
@@ -735,6 +984,8 @@ PROMPT;
 	 * @return array{message: string, actions: array|null, error: string|null}
 	 */
 	public function send_scanner_followup( string $scanner_results, string $scanner_type, array $conversation ): array {
+		$this->active_request_options = array();
+		$this->last_context_metrics   = array();
 		$followup = sprintf(
 			"Here are the %s scan results. Present them in a clear, readable format with the score prominently shown, then list each check/issue. Use symbols: ✅ for pass/good, ⚠️ for warning, ❌ for fail/issue. If there are suggested fixes or products that need attention, mention them. Keep it concise.\n\nResults:\n%s",
 			$scanner_type,
@@ -802,6 +1053,8 @@ PROMPT;
 	 * @return array{message: string, actions: array|null, error: string|null}
 	 */
 	private function send_minimal_followup( string $followup, string $system_content, array $conversation ): array {
+		$this->active_request_options = array();
+		$this->last_context_metrics   = array();
 		$minimal_history = array_slice( $conversation, -4 );
 
 		return $this->with_byok_context( function () use ( $followup, $system_content, $minimal_history ) {
@@ -867,15 +1120,36 @@ PROMPT;
 	 * Send to OpenAI-compatible APIs (OpenRouter, OpenAI, DeepSeek, Gemini).
 	 */
 	private function send_openai_compatible( string $user_message, string $system_content, array $conversation ): array {
-		$messages   = array();
-		$messages[] = array(
-			'role'    => 'system',
-			'content' => $system_content,
-		);
+		$conversation_messages = array();
 
 		// History is now managed by PressArk_History_Manager BEFORE reaching this method.
 		// Do NOT slice here — the history has already been compressed and budgeted.
 		foreach ( $conversation as $msg ) {
+			$role = isset( $msg['role'] ) ? sanitize_text_field( $msg['role'] ) : 'user';
+			if ( in_array( $role, array( 'user', 'assistant' ), true ) ) {
+				$conversation_messages[] = array(
+					'role'    => $role,
+					'content' => $msg['content'] ?? '',
+				);
+			}
+		}
+
+		// Add current user message.
+		$conversation_messages[] = array(
+			'role'    => 'user',
+			'content' => $user_message,
+		);
+		$prepared              = $this->prepare_request_context( $conversation_messages, $system_content );
+		$conversation_messages = (array) ( $prepared['messages'] ?? $conversation_messages );
+		$system_content        = (string) ( $prepared['system_prompt'] ?? $system_content );
+		$messages              = array(
+			array(
+				'role'    => 'system',
+				'content' => $system_content,
+			),
+		);
+
+		foreach ( $conversation_messages as $msg ) {
 			$role = isset( $msg['role'] ) ? sanitize_text_field( $msg['role'] ) : 'user';
 			if ( in_array( $role, array( 'user', 'assistant' ), true ) ) {
 				$messages[] = array(
@@ -884,12 +1158,6 @@ PROMPT;
 				);
 			}
 		}
-
-		// Add current user message.
-		$messages[] = array(
-			'role'    => 'user',
-			'content' => $user_message,
-		);
 
 		// v6.0.0: Proxy mode — route through the bank proxy.
 		if ( self::is_proxy_mode() ) {
@@ -1001,6 +1269,9 @@ PROMPT;
 			'role'    => 'user',
 			'content' => $user_message,
 		);
+		$prepared       = $this->prepare_request_context( $messages, $system_content );
+		$messages       = (array) ( $prepared['messages'] ?? $messages );
+		$system_content = (string) ( $prepared['system_prompt'] ?? $system_content );
 
 		$body = array(
 			'model'      => $this->normalize_model_for_provider(),
@@ -1125,13 +1396,15 @@ Diagnostic reads are not a write plan. Do not propose a fix just because a tool 
 For security scans, inspect the latest scan output before considering fix_security. Only propose fix IDs explicitly supported by current auto-fixable findings. If the scan shows none, stop after reporting.
 
 If a tool response is too large (exceeds the 10,000-token limit), do NOT repeat the same call. Instead: use "limit" to reduce result count, use "search"/"filter" to narrow scope, use "mode":"light" for compact output, use "offset" to paginate, or request specific "fields". Always start with the smallest request and expand only if needed.
+If a tool call fails, or a verification read contradicts your last step, do NOT repeat the same write blindly. Re-read the current state, identify what was wrong, and choose a materially different next action or stop and explain the constraint.
+For WooCommerce pricing writes, if two price-affecting attempts on the same product stay uncertain, stop retrying price writes and explain/escalate from the latest observed pricing state.
 
 Site mode (from context): menus="wp_navigation" → FSE nav tools; menus="wp_nav_menus" → classic menu tools. theme_type="fse" → theme.json styles; theme_type="classic" → Customizer. builder="elementor" → elementor_* tools; builder="site_editor" → blocks + templates.
 
 ## Post-Write Verification
 After a write action is approved and applied:
 - Content edits → re-read the target to confirm the change is live before reporting success.
-- Product changes → re-read the product to verify updated fields.
+- Product changes → re-read the product to verify updated fields. For price or sale writes, verify regular_price, sale_price, active price, on_sale, and sale dates.
 - Settings changes → re-read the setting to confirm the new value.
 - Never say "Done! Updated X" without evidence from a follow-up read.
 - Exception: bulk operations on 5+ items — trust the action result count.
@@ -1183,8 +1456,10 @@ ELEMENTOR;
 ## WooCommerce Rules
 
 Products: ALWAYS use edit_product — never edit_content or update_meta on products. WC's object model keeps price lookups, stock caches, and hooks in sync. Use create_product for new products (simple, variable, grouped, external).
-When the admin is editing a product, "this product", "that product", or a product request with no other clear target refers to the current editor product ID from context. For plain price changes, map "price" to regular_price unless the user explicitly asked for a sale price.
-Broad catalog changes should prefer bulk_edit_products with scope="all" or scope="matching" plus shared changes, instead of enumerating products one by one. For relative price changes like "add 10 USD" or "raise prices by 5%", use changes.price_delta or changes.price_adjust_pct.
+When the admin is editing a product, "this product", "that product", or a product request with no other clear target refers to the current editor product ID from context. Do NOT use plain "price" for WooCommerce writes. For products, variations, and bulk WooCommerce writes, choose the explicit field that matches intent: regular_price for the base price, sale_price for a sale amount, or clear_sale=true to remove a sale.
+For product price or sale changes, call get_product first unless the latest verified product read is already in context. When the user says remove/end/clear a sale, preserve regular_price and use clear_sale=true. Empty sale_price is legacy compatibility only and must not be the planned strategy. Never set a price to 0 unless the user explicitly wants a free product. After save, trust the returned/read-back pricing state (regular_price, sale_price, active price, on_sale, sale_from, sale_to) instead of assuming the submitted fields became customer-visible.
+If two price-affecting writes on the same product remain uncertain, stop retrying WooCommerce price writes for that product and explain/escalate instead of issuing a third similar write.
+Broad catalog changes should prefer bulk_edit_products with scope="all" or scope="matching" plus shared changes, instead of enumerating products one by one. For relative price changes like "add 10 USD" or "raise prices by 5%", use changes.price_delta or changes.price_adjust_pct. Bulk results include per-product product types; if variable parents are hit, do not claim their child variation prices were updated. Use bulk_edit_variations when child variation prices need changing.
 
 Product-led content: when the user asks for a blog post, page, email, or CTA about a product and the product is unspecified or random, first pick a real product with get_random_content(post_type="product") or another WooCommerce read. If that result already includes the real URL plus enough product grounding to write accurately, you may draft from it directly; otherwise call get_product before drafting. Never invent product facts from brand/site profile alone.
 
@@ -1309,8 +1584,8 @@ FSEPROMPT;
 	/**
 	 * Check if the current model supports native tool/function calling.
 	 *
-	 * Models that don't (e.g. DeepSeek V3 via OpenRouter) fall back to the
-	 * legacy text-based action path instead of the multi-round agentic loop.
+	 * Models that don't (for example some BYOK text models) stay on the
+	 * multi-round agent loop and use prompted JSON tool calling instead.
 	 *
 	 * @param bool $deep_mode Whether deep mode is active (may upgrade model).
 	 * @return bool
@@ -1594,7 +1869,7 @@ FSEPROMPT;
 			static function ( array $tool ): string {
 				return sanitize_key( (string) ( $tool['function']['name'] ?? $tool['name'] ?? '' ) );
 			},
-			(array) ( $body['tools'] ?? array() )
+			$tools
 		) ) );
 
 		$this->last_request_snapshot = array(
@@ -1646,6 +1921,7 @@ FSEPROMPT;
 				return ! ( is_array( $value ) ? empty( $value ) : false === $value || 0 === $value || '' === (string) $value );
 			} ),
 			'allowed_tools'       => array_slice( $tool_names, 0, 24 ),
+			'context'             => $this->last_context_metrics,
 		);
 	}
 
@@ -1738,16 +2014,116 @@ AUTOMATION;
 	}
 
 	/**
-	 * Format tool definitions into a compact readable list for the system prompt.
+	 * Format tool definitions into a compact JSON catalog for prompted tool calling.
 	 */
 	private function format_tools_for_prompt( array $tools ): string {
-		$lines = array();
+		$formatted = array();
 		foreach ( $tools as $tool ) {
 			$name = $tool['function']['name']        ?? $tool['name']        ?? '';
 			$desc = $tool['function']['description'] ?? $tool['description'] ?? '';
-			$lines[] = "- **{$name}**: {$desc}";
+			$formatted[] = array(
+				'name'        => sanitize_key( (string) $name ),
+				'description' => sanitize_text_field( (string) $desc ),
+				'parameters'  => is_array( $tool['function']['parameters'] ?? null )
+					? (array) $tool['function']['parameters']
+					: (array) ( $tool['parameters'] ?? array() ),
+			);
 		}
-		return implode( "\n", $lines );
+		return (string) wp_json_encode( $formatted, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES );
+	}
+
+	private function model_supports_native_tools_for_request( string $provider, string $model ): bool {
+		$tracker = $this->get_tracker();
+
+		return $tracker->is_byok()
+			? PressArk_Model_Policy::supports_tools_byok( $provider, $model )
+			: PressArk_Model_Policy::supports_tools_bundled( $model, $provider );
+	}
+
+	private function current_tool_transport_mode(): string {
+		$transport = $this->last_request_snapshot['transport_contract']['tool_choice']['transport']
+			?? $this->active_request_options['transport_contract']['tool_choice']['transport']
+			?? '';
+
+		return sanitize_key( (string) $transport );
+	}
+
+	private function is_prompted_tool_transport_active(): bool {
+		return 'prompted' === $this->current_tool_transport_mode();
+	}
+
+	private function normalize_tool_calls_for_prompted_transcript( array $tool_calls ): array {
+		$normalized = array();
+
+		foreach ( $tool_calls as $call ) {
+			if ( ! is_array( $call ) ) {
+				continue;
+			}
+
+			$function  = is_array( $call['function'] ?? null ) ? $call['function'] : array();
+			$name      = sanitize_key( (string) ( $function['name'] ?? $call['name'] ?? '' ) );
+			$arguments = $function['arguments'] ?? $call['arguments'] ?? array();
+
+			if ( is_string( $arguments ) ) {
+				$decoded   = json_decode( $arguments, true );
+				$arguments = JSON_ERROR_NONE === json_last_error() && is_array( $decoded ) ? $decoded : array();
+			}
+
+			if ( '' === $name || ! is_array( $arguments ) ) {
+				continue;
+			}
+
+			$normalized[] = array(
+				'id'        => sanitize_text_field( (string) ( $call['id'] ?? '' ) ),
+				'name'      => $name,
+				'arguments' => $arguments,
+			);
+		}
+
+		return $normalized;
+	}
+
+	private function format_prompted_assistant_tool_message( array $message ): string {
+		$parts      = array();
+		$content    = trim( (string) ( $message['content'] ?? '' ) );
+		$tool_calls = $this->normalize_tool_calls_for_prompted_transcript( (array) ( $message['tool_calls'] ?? array() ) );
+
+		if ( '' !== $content ) {
+			$parts[] = $content;
+		}
+
+		if ( ! empty( $tool_calls ) ) {
+			$parts[] = 'Tool calls JSON: ' . wp_json_encode( $tool_calls, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES );
+		}
+
+		return trim( implode( "\n\n", $parts ) );
+	}
+
+	private function format_prompted_tool_result_message( array $message ): string {
+		$payload = array(
+			'tool_call_id' => sanitize_text_field( (string) ( $message['tool_call_id'] ?? '' ) ),
+			'result'       => $message['content'] ?? '',
+		);
+
+		return 'Tool result JSON: ' . wp_json_encode( $payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES );
+	}
+
+	private function build_prompted_tool_results_message( array $tool_results ): array {
+		$payload = array();
+
+		foreach ( $tool_results as $tr ) {
+			$payload[] = array(
+				'tool_call_id' => sanitize_text_field( (string) ( $tr['tool_use_id'] ?? '' ) ),
+				'result'       => $tr['result'] ?? '',
+			);
+		}
+
+		return array(
+			'role'    => 'user',
+			'content' => 'Use these tool results to continue the task.' . "\n"
+				. 'Tool results JSON: '
+				. wp_json_encode( $payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES ),
+		);
 	}
 
 	/**
@@ -1856,19 +2232,20 @@ AUTOMATION;
 	 * @return array<string,mixed>
 	 */
 	private function resolve_tool_choice_contract( array $tools, array $options, string $provider, string $model ): array {
-		$has_tools = ! empty( $tools );
-		$requested = sanitize_key(
+		$has_tools                 = ! empty( $tools );
+		$requested                 = sanitize_key(
 			(string) (
 				$options['requested_tool_choice']
 				?? $options['tool_choice']
 				?? ( $has_tools ? 'restricted_auto' : 'text_only' )
 			)
 		);
-		$transport_supported = $this->provider_supports_tool_choice( $provider, $model );
-		$downgraded          = false;
-		$reason              = '';
-		$transport           = 'omitted';
-		$effective           = 'text_only';
+		$native_supported         = $this->model_supports_native_tools_for_request( $provider, $model );
+		$transport_supported      = $native_supported && $this->provider_supports_tool_choice( $provider, $model );
+		$downgraded               = false;
+		$reason                   = '';
+		$transport                = 'omitted';
+		$effective                = 'text_only';
 
 		if ( ! $has_tools ) {
 			if ( in_array( $requested, array( 'required', 'any', 'restricted_auto' ), true ) ) {
@@ -1876,28 +2253,28 @@ AUTOMATION;
 				$reason     = 'no_tools_exposed';
 			}
 		} elseif ( 'text_only' === $requested ) {
-			if ( $transport_supported ) {
-				$effective = 'text_only';
-				$transport = 'none';
-			} else {
-				$effective  = 'restricted_auto';
-				$transport  = 'omitted';
-				$downgraded = true;
-				$reason     = 'provider_cannot_disable_tools';
-			}
+			$effective = 'text_only';
+			$transport = 'none';
 		} elseif ( in_array( $requested, array( 'required', 'any' ), true ) ) {
 			if ( $transport_supported ) {
 				$effective = 'required';
 				$transport = 'anthropic' === $provider ? 'any' : 'required';
-			} else {
+			} elseif ( $native_supported ) {
 				$effective  = 'restricted_auto';
 				$transport  = 'omitted';
 				$downgraded = true;
 				$reason     = 'provider_cannot_require_tools';
+			} else {
+				$effective  = 'restricted_auto';
+				$transport  = 'prompted';
+				$downgraded = true;
+				$reason     = 'model_lacks_native_tools';
 			}
 		} else {
 			$effective = 'restricted_auto';
-			$transport = $transport_supported ? 'auto' : 'omitted';
+			$transport = $native_supported
+				? ( $transport_supported ? 'auto' : 'omitted' )
+				: 'prompted';
 		}
 
 		return array(
@@ -2261,9 +2638,10 @@ AUTOMATION;
 	 *
 	 * @param string $system_prompt Base prompt/context.
 	 * @param array  $options       Normalized request options.
+	 * @param array  $tools         Tool definitions for the active request.
 	 * @return string
 	 */
-	private function augment_system_prompt( string $system_prompt, array $options ): string {
+	private function augment_system_prompt( string $system_prompt, array $options, array $tools = array() ): string {
 		$parts = array();
 
 		if ( ! empty( $options['phase'] ) ) {
@@ -2309,6 +2687,17 @@ AUTOMATION;
 					$compiled_schema,
 					JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES
 				);
+		}
+
+		$tool_contract = is_array( $options['transport_contract']['tool_choice'] ?? null )
+			? (array) $options['transport_contract']['tool_choice']
+			: array();
+		if ( ! empty( $tools )
+			&& ! empty( $options['requires_tools'] )
+			&& 'prompted' === ( $tool_contract['transport'] ?? '' )
+		) {
+			$parts[] = 'Native tool transport is unavailable for this model. When a tool is needed, reply with JSON only using {"tool":"name","arguments":{...}} for one call or {"tool_calls":[{"tool":"name","arguments":{...}}]} for multiple parallel calls. Do not wrap the JSON in markdown and do not add extra prose.';
+			$parts[] = 'Available tools JSON: ' . $this->format_tools_for_prompt( $tools );
 		}
 
 		if ( empty( $parts ) ) {
@@ -2470,6 +2859,7 @@ AUTOMATION;
 	): array {
 		$model_pinned = 'auto' !== get_option( 'pressark_model', 'auto' );
 		$this->last_request_snapshot = array();
+		$this->last_context_metrics  = array();
 
 		$do_work = function () use ( $messages, $tools, $system_prompt, $deep_mode, $options, $model_pinned ) {
 			$is_byok = $this->get_tracker()->is_byok();
@@ -2510,8 +2900,8 @@ AUTOMATION;
 				}
 			) );
 
-			$attempt_options      = $runtime_options;
-			$attempt_system_prompt = $this->augment_system_prompt( $original_system_prompt, $attempt_options );
+			$attempt_options       = $runtime_options;
+			$attempt_system_prompt = $this->augment_system_prompt( $original_system_prompt, $attempt_options, $tools );
 
 			if ( empty( $this->api_key ) && ! self::is_proxy_mode() ) {
 				return $this->attach_routing_decision( array(
@@ -2548,7 +2938,7 @@ AUTOMATION;
 					$this->model = $candidate_model;
 					$candidate_options = $this->resolve_request_runtime_options( $tools, $options, $effective_provider, $candidate_model );
 					$this->active_request_options = $candidate_options;
-					$candidate_system_prompt = $this->augment_system_prompt( $original_system_prompt, $candidate_options );
+					$candidate_system_prompt = $this->augment_system_prompt( $original_system_prompt, $candidate_options, $tools );
 					$candidate_raw = $this->call_provider( $messages, $tools, $candidate_system_prompt );
 					$attempts++;
 					$candidate_failure = $this->classify_failure( $candidate_raw, $effective_provider, $candidate_options );
@@ -2702,14 +3092,18 @@ AUTOMATION;
 	/**
 	 * Build tool result messages to send back after tool execution.
 	 *
-	 * For Anthropic: ALL results in ONE user message with content array.
-	 * For OpenAI: Each result is a separate message with role 'tool'.
+	 * Native tool transport preserves provider-specific tool result shapes.
+	 * Prompted tool transport degrades to a plain-text user message.
 	 *
 	 * @param array  $tool_results Array of ['tool_use_id' => string, 'result' => mixed].
 	 * @param string $provider
 	 * @return array Single message or { __multi: true, messages: array }.
 	 */
 	public function build_tool_result_message( array $tool_results, string $provider ): array {
+		if ( $this->is_prompted_tool_transport_active() ) {
+			return $this->build_prompted_tool_results_message( $tool_results );
+		}
+
 		// Canonical transcript form keeps tool results as role=tool messages.
 		// Anthropic requests convert these back to tool_result blocks during
 		// request building so replay state can stay provider-neutral.
@@ -3316,6 +3710,10 @@ AUTOMATION;
 			$this->provider,
 			$this->model
 		);
+		$prepared        = $this->prepare_request_context( $messages, $system_prompt );
+		$messages        = (array) ( $prepared['messages'] ?? $messages );
+		$system_prompt   = (string) ( $prepared['system_prompt'] ?? $system_prompt );
+		$prompted_tools = 'prompted' === ( $runtime_options['provider_tool_choice'] ?? 'omitted' );
 		$api_messages   = array();
 		$api_messages[] = array(
 			'role'    => 'system',
@@ -3331,7 +3729,17 @@ AUTOMATION;
 
 		foreach ( $messages as $msg ) {
 			$role = $msg['role'] ?? 'user';
-			if ( in_array( $role, array( 'tool', 'assistant' ), true ) && isset( $msg['tool_calls'] ) ) {
+			if ( $prompted_tools && 'tool' === $role ) {
+				$api_messages[] = array(
+					'role'    => 'user',
+					'content' => $this->format_prompted_tool_result_message( $msg ),
+				);
+			} elseif ( $prompted_tools && 'assistant' === $role && isset( $msg['tool_calls'] ) ) {
+				$api_messages[] = array(
+					'role'    => 'assistant',
+					'content' => $this->format_prompted_assistant_tool_message( $msg ),
+				);
+			} elseif ( in_array( $role, array( 'tool', 'assistant' ), true ) && isset( $msg['tool_calls'] ) ) {
 				$api_messages[] = $msg;
 			} elseif ( 'tool' === $role ) {
 				$api_messages[] = $msg;
@@ -3376,7 +3784,10 @@ AUTOMATION;
 			);
 		}
 
-		if ( ! empty( $tools ) ) {
+		if ( ! empty( $tools )
+			&& 'text_only' !== ( $runtime_options['tool_choice'] ?? 'text_only' )
+			&& ! $prompted_tools
+		) {
 			$body['tools']       = $tools;
 			if ( 'omitted' !== ( $runtime_options['provider_tool_choice'] ?? 'omitted' ) ) {
 				$body['tool_choice'] = (string) $runtime_options['provider_tool_choice'];
@@ -3412,12 +3823,26 @@ AUTOMATION;
 			$this->provider,
 			$this->model
 		);
-		$api_messages = array();
+		$prepared        = $this->prepare_request_context( $messages, $system_prompt );
+		$messages        = (array) ( $prepared['messages'] ?? $messages );
+		$system_prompt   = (string) ( $prepared['system_prompt'] ?? $system_prompt );
+		$prompted_tools = 'prompted' === ( $runtime_options['provider_tool_choice'] ?? 'omitted' );
+		$api_messages   = array();
 
 		foreach ( $messages as $msg ) {
 			$role = $msg['role'] ?? 'user';
 
-			if ( 'tool' === $role ) {
+			if ( $prompted_tools && 'tool' === $role ) {
+				$api_messages[] = array(
+					'role'    => 'user',
+					'content' => $this->format_prompted_tool_result_message( $msg ),
+				);
+			} elseif ( $prompted_tools && 'assistant' === $role && ! empty( $msg['tool_calls'] ) && is_array( $msg['tool_calls'] ) ) {
+				$api_messages[] = array(
+					'role'    => 'assistant',
+					'content' => $this->format_prompted_assistant_tool_message( $msg ),
+				);
+			} elseif ( 'tool' === $role ) {
 				$tool_result_block = array(
 					'type'        => 'tool_result',
 					'tool_use_id' => $msg['tool_call_id'] ?? '',
@@ -3536,7 +3961,10 @@ AUTOMATION;
 			);
 		}
 
-		if ( ! empty( $anthropic_tools ) ) {
+		if ( ! empty( $anthropic_tools )
+			&& 'text_only' !== ( $runtime_options['tool_choice'] ?? 'text_only' )
+			&& ! $prompted_tools
+		) {
 			$last_idx = count( $anthropic_tools ) - 1;
 			$anthropic_tools[ $last_idx ]['cache_control'] = array( 'type' => self::CACHE_TYPE );
 			$body['tools'] = $anthropic_tools;

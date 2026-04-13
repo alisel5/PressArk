@@ -60,6 +60,48 @@ class PressArk_Pipeline {
 	}
 
 	/**
+	 * Reserve the full estimated execution budget.
+	 */
+	public function reserve_full(
+		int $user_id,
+		int $estimated_icus,
+		string $route = 'pending',
+		string $model = '',
+		int $estimated_tokens = 0
+	): array {
+		return $this->reservation->reserve(
+			$user_id,
+			max( 0, $estimated_icus ),
+			$route,
+			$this->tier,
+			$model,
+			max( 0, $estimated_tokens )
+		);
+	}
+
+	/**
+	 * Reserve a reduced budget for read-only planning.
+	 */
+	public function reserve_for_plan(
+		int $user_id,
+		int $estimated_icus,
+		string $model = '',
+		int $estimated_tokens = 0
+	): array {
+		$plan_icus   = max( 1, (int) ceil( max( 0, $estimated_icus ) * 0.3 ) );
+		$plan_tokens = max( 1, (int) ceil( max( 0, $estimated_tokens ) * 0.3 ) );
+
+		return $this->reservation->reserve(
+			$user_id,
+			$plan_icus,
+			'plan',
+			$this->tier,
+			$model,
+			$plan_tokens
+		);
+	}
+
+	/**
 	 * Release all acquired resources. Safe to call multiple times (idempotent).
 	 *
 	 * @param string $reason Failure reason (empty = normal cleanup).
@@ -83,12 +125,10 @@ class PressArk_Pipeline {
 	/**
 	 * Settle tokens from an execution result.
 	 *
-	 * Normalizes usage data from any result shape:
-	 * - Agent: input_tokens, output_tokens (top-level keys)
-	 * - Legacy: usage.prompt_tokens, usage.completion_tokens (nested keys)
-	 * - Async: same as agent
+	 * Prefers flat top-level token keys but preserves legacy nested usage
+	 * fallbacks so older execution routes still settle correctly.
 	 *
-	 * @param array  $result Raw result from agent/legacy/async.
+	 * @param array  $result Raw result from agent/async execution.
 	 * @param string $route  'agent' | 'legacy' | 'async'.
 	 * @return array Token status from reservation->settle().
 	 */
@@ -103,8 +143,13 @@ class PressArk_Pipeline {
 		                         ?? $result['usage']['completion_tokens'] ?? 0 );
 		$cache_read    = (int) ( $result['cache_read_tokens'] ?? 0 );
 		$cache_write   = (int) ( $result['cache_write_tokens'] ?? 0 );
+		$context_tokens = $this->resolve_context_tokens( $result );
+		$streamed_token_count = max( 0, (int) ( $result['streamed_token_count'] ?? 0 ) );
 
 		$raw_total = (int) ( $result['tokens_used'] ?? ( $input_tokens + $output_tokens ) );
+		if ( $raw_total <= 0 && $streamed_token_count > 0 ) {
+			$raw_total = $streamed_token_count;
+		}
 
 		$actual = array(
 			'settled_tokens'     => $raw_total,
@@ -112,6 +157,8 @@ class PressArk_Pipeline {
 			'output_tokens'      => $output_tokens,
 			'cache_read_tokens'  => $cache_read,
 			'cache_write_tokens' => $cache_write,
+			'context_tokens'     => $context_tokens,
+			'streamed_token_count' => $streamed_token_count,
 			'agent_rounds'       => (int) ( $result['agent_rounds'] ?? count( $result['steps'] ?? array() ) ),
 			'provider'           => ! empty( $result['provider'] )
 				? $result['provider']
@@ -123,6 +170,17 @@ class PressArk_Pipeline {
 		);
 
 		return $this->reservation->settle( $this->reservation_id, $actual, $this->tier );
+	}
+
+	private function resolve_context_tokens( array $result ): int {
+		if ( array_key_exists( 'context_tokens', $result ) ) {
+			return max( 0, (int) $result['context_tokens'] );
+		}
+
+		$inspector = is_array( $result['context_inspector'] ?? null ) ? (array) $result['context_inspector'] : array();
+		$footprint = is_array( $inspector['token_footprint'] ?? null ) ? (array) $inspector['token_footprint'] : array();
+
+		return max( 0, (int) ( $footprint['context_tokens'] ?? 0 ) );
 	}
 
 	// ── Usage Tracking ─────────────────────────────────────────────
@@ -152,6 +210,7 @@ class PressArk_Pipeline {
 				'route'             => $route,
 				'provider'          => $result['provider'] ?? '',
 				'cache_read_tokens' => (int) ( $result['cache_read_tokens'] ?? 0 ),
+				'context_tokens'    => $this->resolve_context_tokens( $result ),
 			)
 		);
 	}
@@ -219,6 +278,46 @@ class PressArk_Pipeline {
 		}
 
 		return $pending;
+	}
+
+	/**
+	 * Build a normalized frontend-facing permission response.
+	 *
+	 * @since 5.6.0
+	 */
+	public static function build_permission_response( array $permission ): array {
+		$behavior = sanitize_key( (string) ( $permission['behavior'] ?? 'ask' ) );
+		if ( ! in_array( $behavior, array( 'allow', 'ask', 'block' ), true ) ) {
+			$behavior = 'ask';
+		}
+
+		$ui_action = sanitize_key( (string) ( $permission['ui_action'] ?? '' ) );
+		$reason    = sanitize_text_field(
+			(string) (
+				$permission['reason']
+				?? $permission['message']
+				?? __( 'This action needs permission before it can run.', 'pressark' )
+			)
+		);
+
+		return array_filter(
+			array(
+				'type'              => 'permission_required',
+				'reply'             => $reason,
+				'message'           => $reason,
+				'actions_performed' => array(),
+				'pending_actions'   => array(),
+				'permission'        => $permission,
+				'permission_tool'   => sanitize_key( (string) ( $permission['tool_name'] ?? '' ) ),
+				'behavior'          => $behavior,
+				'ui_action'         => $ui_action,
+				'upgrade_prompt'    => 'upgrade_modal' === $ui_action,
+				'upgrade_url'       => esc_url_raw( (string) ( $permission['upgrade_url'] ?? pressark_get_upgrade_url() ) ),
+			),
+			static function ( $value ) {
+				return ! ( is_string( $value ) && '' === $value );
+			}
+		);
 	}
 
 	// ── Response Building ──────────────────────────────────────────
@@ -1173,6 +1272,8 @@ class PressArk_Pipeline {
 		switch ( sanitize_key( $route ) ) {
 			case 'agent':
 				return 'Agent route';
+			case 'plan':
+				return 'Plan mode';
 			case 'async':
 				return 'Async handoff';
 			case 'legacy':
@@ -1428,7 +1529,7 @@ class PressArk_Pipeline {
 		// Base fields present in ALL response shapes.
 		$data = array(
 			'type'              => $result['type'] ?? 'final_response',
-			'reply'             => $result['message'] ?? $result['reply'] ?? '',
+			'reply'             => $result['reply'] ?? $result['message'] ?? '',
 			'actions_performed' => $result['actions_performed'] ?? array(),
 			'pending_actions'   => $result['pending_actions'] ?? array(),
 			'usage'             => $this->tracker->get_usage_data(),
@@ -1449,8 +1550,13 @@ class PressArk_Pipeline {
 			'tokens_used',
 			'input_tokens',
 			'output_tokens',
+			'context_tokens',
+			'user_context_tokens',
+			'system_context_tokens',
 			'cache_read_tokens',
 			'cache_write_tokens',
+			'streamed_chunks',
+			'streamed_token_count',
 			'provider',
 			'model',
 			'routing_decision',
@@ -1466,6 +1572,27 @@ class PressArk_Pipeline {
 			'suggestions',
 			'approval_outcome',
 			'approval_receipt',
+			'permission',
+			'permission_tool',
+			'context_used',
+			'behavior',
+			'ui_action',
+			'upgrade_prompt',
+			'upgrade_url',
+			'status',
+			'plan_markdown',
+			'plan_steps',
+			'plan_artifact',
+			'plan_phase',
+			'approval_level',
+			'mode',
+			'planning_mode',
+			'permission_mode',
+			'can_execute',
+			'approve_endpoint',
+			'execute_endpoint',
+			'revise_endpoint',
+			'reject_endpoint',
 		) as $field ) {
 			if ( array_key_exists( $field, $result ) ) {
 				$data[ $field ] = $result[ $field ];
@@ -1485,12 +1612,12 @@ class PressArk_Pipeline {
 		}
 
 		// Steps for interactive, tool-capable paths.
-		if ( 'agent' === $route ) {
-			$data['steps'] = $result['steps'] ?? array();
+		if ( in_array( $route, array( 'agent', 'plan' ), true ) ) {
+			$data['steps'] = $result['plan_steps'] ?? $result['steps'] ?? array();
 		}
 
 		// Agent-only fields.
-		if ( 'agent' === $route ) {
+		if ( in_array( $route, array( 'agent', 'plan' ), true ) ) {
 			$data['checkpoint'] = $result['checkpoint'] ?? array();
 		}
 
@@ -1545,9 +1672,13 @@ class PressArk_Pipeline {
 	private function build_budget_response( array $budget, array $result, array $token_status ): array {
 		$raw_actual_tokens = (int) ( $token_status['raw_actual_tokens'] ?? $result['tokens_used'] ?? 0 );
 		$actual_icus       = (int) ( $token_status['actual_icus'] ?? $result['icu_spent'] ?? 0 );
+		$context_tokens    = max( 0, (int) ( $token_status['context_tokens'] ?? $result['context_tokens'] ?? 0 ) );
 
 		$budget['raw_actual_tokens'] = $raw_actual_tokens;
 		$budget['actual_icus']       = $actual_icus;
+		if ( $context_tokens > 0 ) {
+			$budget['context_tokens'] = $context_tokens;
+		}
 
 		foreach ( array(
 			'transport_mode',
@@ -1867,7 +1998,16 @@ class PressArk_Pipeline {
 	 * @param string $route  'agent' | 'legacy' | 'async'.
 	 * @return array{token_status: array, response: WP_REST_Response}
 	 */
-	public function finalize( array $result, string $route ): array {
+	public function finalize( array $result, string $route, string $mode = 'execute' ): array {
+		if ( ! empty( $result['streamed_chunks'] ) && empty( $result['streamed_token_count'] ) && is_array( $result['streamed_chunks'] ) ) {
+			$result['streamed_token_count'] = array_sum(
+				array_map(
+					static fn( $chunk ) => max( 0, (int) ( is_array( $chunk ) ? ( $chunk['token_count'] ?? 0 ) : 0 ) ),
+					$result['streamed_chunks']
+				)
+			);
+		}
+
 		PressArk_Activity_Trace::set_current_context(
 			array(
 				'correlation_id' => (string) ( $result['correlation_id'] ?? '' ),
@@ -1876,6 +2016,19 @@ class PressArk_Pipeline {
 				'route'          => $route,
 			)
 		);
+
+		$context_tokens = $this->resolve_context_tokens( $result );
+		if ( $context_tokens > 0 ) {
+			$result['context_used']   = true;
+			$result['context_tokens'] = $context_tokens;
+			PressArk_Activity_Trace::set_current_context(
+				array(
+					'context_tokens' => $context_tokens,
+				)
+			);
+		}
+
+		$result['mode'] = sanitize_key( $mode );
 
 		// [9] Settle reservation.
 		$token_status = $this->settle( $result, $route );

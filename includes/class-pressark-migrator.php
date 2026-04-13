@@ -17,7 +17,7 @@ class PressArk_Migrator {
 	/**
 	 * Highest schema version in the migration chain.
 	 */
-	const LATEST = 16;
+	const LATEST = 17;
 
 	/**
 	 * Option key where the current schema version is stored.
@@ -643,6 +643,14 @@ class PressArk_Migrator {
 		self::ensure_index( $events_table, 'idx_event_type_created', 'event_type, created_at' );
 		self::ensure_index( $events_table, 'idx_reason_created', 'reason, created_at' );
 
+		return true;
+	}
+
+	/**
+	 * v17: Add context-token telemetry to the local cost ledger.
+	 */
+	private static function migrate_to_17(): bool {
+		dbDelta( PressArk_Cost_Ledger::get_schema() );
 		return true;
 	}
 

@@ -55,6 +55,7 @@ class PressArk_Preview {
 	public function create_session( array $tool_calls, array $primary_args ): array {
 		$session_id = wp_generate_uuid4();
 		$user_id    = get_current_user_id();
+		$tool_calls = $this->normalize_preview_tool_calls( $tool_calls );
 
 		$layer = array(
 			'user_id'    => $user_id,
@@ -77,9 +78,12 @@ class PressArk_Preview {
 
 			switch ( $strategy ) {
 				case 'post_edit':
-					list( $draft_id, $entry ) = $this->stage_post_edit( $args );
+					list( $draft_id, $entry, $blueprint ) = $this->stage_post_edit( $args );
 					if ( $draft_id ) {
 						$layer['posts'][ $args['post_id'] ] = $draft_id;
+						if ( ! empty( $blueprint ) ) {
+							$layer['post_blueprints'][ $draft_id ] = $blueprint;
+						}
 						$diff[] = $entry;
 					}
 					break;
@@ -388,6 +392,49 @@ class PressArk_Preview {
 		return is_array( $tool_calls ) ? $tool_calls : array();
 	}
 
+	/**
+	 * Preview staging should use the same canonical params that execution and
+	 * verification consume, but keep the raw args as a compatibility fallback
+	 * when no stronger contract normalization applies.
+	 *
+	 * @since 5.6.0
+	 * @param array $tool_calls Raw previewable tool calls.
+	 * @return array<int, array<string, mixed>>
+	 */
+	private function normalize_preview_tool_calls( array $tool_calls ): array {
+		foreach ( $tool_calls as $index => $call ) {
+			if ( ! is_array( $call ) ) {
+				continue;
+			}
+
+			$name = sanitize_text_field( (string) ( $call['name'] ?? $call['type'] ?? '' ) );
+			if ( '' === $name ) {
+				continue;
+			}
+
+			$canonical = PressArk_Operation_Registry::resolve_alias( $name );
+			$args      = is_array( $call['arguments'] ?? null )
+				? $call['arguments']
+				: ( is_array( $call['params'] ?? null ) ? $call['params'] : array() );
+
+			$validation = PressArk_Operation_Registry::validate_input( $canonical, $args );
+			if ( ( $validation['valid'] ?? false ) && is_array( $validation['params'] ?? null ) ) {
+				$args = $validation['params'];
+			}
+
+			$call['name']      = $canonical;
+			$call['arguments'] = $args;
+			if ( isset( $call['type'] ) ) {
+				$call['type'] = $canonical;
+			}
+
+			unset( $call['params'] );
+			$tool_calls[ $index ] = $call;
+		}
+
+		return $tool_calls;
+	}
+
 	// ─── Elementor draft helper ──────────────────────────────────────────────
 
 	/**
@@ -436,15 +483,16 @@ class PressArk_Preview {
 	private function stage_post_edit( array $args ): array {
 		$post_id = isset( $args['post_id'] ) ? (int) $args['post_id'] : 0;
 		if ( $post_id <= 0 ) {
-			return array( null, null );
+			return array( null, null, array() );
 		}
 
 		$original = get_post( $post_id );
 		if ( ! $original ) {
-			return array( null, null );
+			return array( null, null, array() );
 		}
 
-		$fields = $args['fields'] ?? $args['changes'] ?? $args;
+		$fields    = $args['fields'] ?? $args['changes'] ?? $args;
+		$blueprint = $this->build_post_edit_blueprint( $fields, $original );
 
 		$new_data = array(
 			'post_status'  => 'auto-draft',
@@ -491,7 +539,56 @@ class PressArk_Preview {
 			);
 		}
 
-		return array( $draft_id, $diff_entry );
+		if ( isset( $blueprint['status'] ) && $blueprint['status'] !== $original->post_status ) {
+			$diff_entry['items'][] = array(
+				'field' => 'Status',
+				'old'   => $original->post_status,
+				'new'   => $blueprint['status'],
+			);
+		}
+
+		if ( isset( $blueprint['scheduled_date'] ) ) {
+			$old_schedule = 'future' === $original->post_status ? $original->post_date : '(none)';
+			if ( $blueprint['scheduled_date'] !== $old_schedule ) {
+				$diff_entry['items'][] = array(
+					'field' => 'Scheduled date',
+					'old'   => $old_schedule,
+					'new'   => $blueprint['scheduled_date'],
+				);
+			}
+		}
+
+		return array( $draft_id, $diff_entry, $blueprint );
+	}
+
+	/**
+	 * Capture edit-time status metadata that must survive preview keep/apply.
+	 *
+	 * @since 5.6.0
+	 * @param array   $fields   Requested edit fields.
+	 * @param WP_Post $original Original post being previewed.
+	 * @return array<string, string>
+	 */
+	private function build_post_edit_blueprint( array $fields, WP_Post $original ): array {
+		$blueprint = array();
+		$status    = $fields['status'] ?? $fields['post_status'] ?? null;
+
+		if ( null !== $status ) {
+			$status = sanitize_key( (string) $status );
+			if ( in_array( $status, array( 'publish', 'draft', 'private', 'pending', 'future' ), true ) ) {
+				$blueprint['status'] = $status;
+			}
+		}
+
+		$scheduled_date = $fields['scheduled_date'] ?? $fields['post_date'] ?? null;
+		if ( null !== $scheduled_date ) {
+			$scheduled_date = sanitize_text_field( (string) $scheduled_date );
+			if ( '' !== $scheduled_date && ( isset( $blueprint['status'] ) || 'future' === $original->post_status ) ) {
+				$blueprint['scheduled_date'] = $scheduled_date;
+			}
+		}
+
+		return $blueprint;
 	}
 
 	private function stage_meta_update( array $args ): array {
@@ -1102,11 +1199,46 @@ class PressArk_Preview {
 				// Copy draft content to original.
 				$draft = get_post( $draft_id );
 				if ( $draft ) {
+					$blueprint = $post_blueprints[ $draft_id ] ?? array();
 					// Check if this is an Elementor-only draft (widget edit).
 					// Elementor drafts have the preview marker and should NOT
 					// overwrite the original's title (which was appended with "(Preview)").
 					$is_elementor_draft = get_post_meta( $draft_id, '_pressark_preview_draft', true ) === '1'
 						&& ! empty( get_post_meta( $draft_id, '_elementor_data', true ) );
+
+					$edit_update_args = array( 'ID' => $original_id );
+					$should_edit_post = false;
+					$requested_status = sanitize_key( (string) ( $blueprint['status'] ?? '' ) );
+					$scheduled_date   = sanitize_text_field( (string) ( $blueprint['scheduled_date'] ?? '' ) );
+
+					if ( ! $is_elementor_draft ) {
+						$edit_update_args['post_title']   = $draft->post_title;
+						$edit_update_args['post_content'] = $draft->post_content;
+						$edit_update_args['post_excerpt'] = $draft->post_excerpt;
+						$should_edit_post                 = true;
+					}
+
+					if ( in_array( $requested_status, array( 'publish', 'draft', 'private', 'pending', 'future' ), true ) ) {
+						$edit_update_args['post_status'] = $requested_status;
+						$should_edit_post                = true;
+
+						if ( 'future' === $requested_status && '' !== $scheduled_date ) {
+							$edit_update_args['edit_date']     = true;
+							$edit_update_args['post_date']     = $scheduled_date;
+							$edit_update_args['post_date_gmt'] = get_gmt_from_date( $scheduled_date );
+						}
+					}
+
+					if ( $should_edit_post ) {
+						$edit_result = wp_update_post( $edit_update_args, true );
+						if ( is_wp_error( $edit_result ) ) {
+							$errors[] = 'Failed to update post #' . $original_id . ': ' . $edit_result->get_error_message();
+						}
+
+						// Skip the legacy title/content copy path once the canonical
+						// edit update above has already handled this post.
+						$is_elementor_draft = true;
+					}
 
 					if ( ! $is_elementor_draft ) {
 						// Standard content edit — copy title/content/excerpt.

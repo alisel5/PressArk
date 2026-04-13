@@ -279,6 +279,9 @@ WOOCOMMERCE KNOWLEDGE:
 - HPOS: orders in wc_orders table, NOT wp_posts. Use wc_get_orders(), $order->get_meta() — never get_post_meta() on orders
 - Stock: use wc_update_product_stock(), not direct meta. wc_product_meta_lookup for queries
 - Coupons: fixed_cart|percent|fixed_product. Shipping zones contain methods
+- For product price or sale edits, read the product first and preserve regular_price unless the user explicitly asked to change it
+- Do not use plain "price" for WooCommerce writes; choose regular_price, sale_price, or clear_sale=true explicitly
+- Removing a sale means clear_sale=true; empty sale_price is legacy compatibility only and should not be the normal strategy. Never set a price to 0 unless the user explicitly wants a free product
 - For product-led content, ground the draft on a real WooCommerce product read before writing
 - For product CTAs, use the real product permalink returned by WooCommerce data â€” never invent product URLs
 SKILL;

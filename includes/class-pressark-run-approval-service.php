@@ -677,7 +677,7 @@ class PressArk_Run_Approval_Service {
 		}
 
 		// Evaluate the read-back against the write intent.
-		$eval = PressArk_Verification::evaluate( $policy, $write_args, $readback_result );
+		$eval = PressArk_Verification::evaluate( $policy, $write_args, $readback_result, $result );
 
 		// Record in checkpoint.
 		$checkpoint->record_verification(

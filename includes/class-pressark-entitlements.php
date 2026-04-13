@@ -477,36 +477,69 @@ class PressArk_Entitlements {
 	 * @return array { allowed: bool, remaining?: int, error?: string, message?: string, ... }
 	 */
 	public static function check_group_usage( string $tier, string $group, string $tool_capability ): array {
-		// Pro+ users: always allowed.
-		if ( self::is_paid_tier( $tier ) ) {
-			return array( 'allowed' => true );
+		$check = self::check_capability_permission(
+			$tier,
+			$group,
+			$tool_capability,
+			get_current_user_id()
+		);
+
+		if ( ! empty( $check['allowed'] ) ) {
+			$response = array( 'allowed' => true );
+			if ( isset( $check['remaining'] ) ) {
+				$response['remaining'] = (int) $check['remaining'];
+			}
+			return $response;
 		}
 
-		// Read tools: always allowed for everyone.
-		if ( 'read' === $tool_capability ) {
-			return array( 'allowed' => true );
+		return self::denied_error(
+			$group,
+			$tier,
+			(int) ( $check['used'] ?? 0 ),
+			(int) ( $check['limit'] ?? 0 )
+		);
+	}
+
+	/**
+	 * Fast deterministic permission probe for a specific tool.
+	 *
+	 * v5.6.0: Pre-execution permission check (mirrors Claude Code
+	 * checkPermissions pattern).
+	 *
+	 * This is intentionally read-only: no API calls and no metadata writes.
+	 *
+	 * @since 5.6.0
+	 * @return array{allowed: bool, behavior: string, reason: string, ui_action: string}
+	 */
+	public static function check_tool_permission( string $tool_name, array $params, int $user_id ): array {
+		$tool_name  = sanitize_key( $tool_name );
+		$operation  = class_exists( 'PressArk_Operation_Registry' )
+			? PressArk_Operation_Registry::resolve( $tool_name )
+			: null;
+		$tier       = class_exists( 'PressArk_License' )
+			? ( new PressArk_License() )->get_tier()
+			: 'free';
+
+		if ( ! $operation ) {
+			return array(
+				'allowed'   => false,
+				'behavior'  => 'block',
+				'reason'    => __( 'This tool is not available right now.', 'pressark' ),
+				'ui_action' => 'none',
+				'tool_name' => $tool_name,
+			);
 		}
 
-		// Always-unlimited groups.
-		if ( in_array( $group, self::UNLIMITED_GROUPS, true ) ) {
-			return array( 'allowed' => true );
-		}
+		$capability = class_exists( 'PressArk_Operation_Registry' )
+			? PressArk_Operation_Registry::classify( $tool_name, $params )
+			: $operation->capability;
 
-		// Free tier: check weekly total across ALL groups.
-		$group_limit = (int) self::tier_value( $tier, 'group_limit' );
-		if ( $group_limit <= 0 ) {
-			return array( 'allowed' => true );
-		}
-
-		$total_used = self::get_total_usage();
-
-		if ( $total_used >= $group_limit ) {
-			return self::denied_error( $group, $tier, $total_used, $group_limit );
-		}
-
-		return array(
-			'allowed'   => true,
-			'remaining' => $group_limit - $total_used,
+		return self::check_capability_permission(
+			$tier,
+			(string) $operation->group,
+			(string) $capability,
+			$user_id,
+			$tool_name
 		);
 	}
 
@@ -851,6 +884,143 @@ class PressArk_Entitlements {
 		}
 
 		return $data;
+	}
+
+	/**
+	 * Read the current user's weekly usage snapshot without mutating storage.
+	 *
+	 * @since 5.6.0
+	 * @return array{week: string, groups: array<string,int>}
+	 */
+	private static function get_group_usage_snapshot( int $user_id ): array {
+		$current_week = gmdate( 'o-W' );
+
+		if ( $user_id <= 0 ) {
+			return array( 'week' => $current_week, 'groups' => array() );
+		}
+
+		$data = get_user_meta( $user_id, 'pressark_group_usage', true );
+		if ( ! is_array( $data ) || ( $data['week'] ?? '' ) !== $current_week ) {
+			return array( 'week' => $current_week, 'groups' => array() );
+		}
+
+		return array(
+			'week'   => $current_week,
+			'groups' => is_array( $data['groups'] ?? null ) ? $data['groups'] : array(),
+		);
+	}
+
+	/**
+	 * Compute total weekly usage from a snapshot.
+	 *
+	 * @since 5.6.0
+	 */
+	private static function total_usage_from_snapshot( array $usage ): int {
+		$total = 0;
+
+		foreach ( (array) ( $usage['groups'] ?? array() ) as $group => $count ) {
+			if ( in_array( $group, self::UNLIMITED_GROUPS, true ) ) {
+				continue;
+			}
+
+			$total += (int) $count;
+		}
+
+		return $total;
+	}
+
+	/**
+	 * Shared internal evaluator for read-only permission probes.
+	 *
+	 * @since 5.6.0
+	 */
+	private static function check_capability_permission(
+		string $tier,
+		string $group,
+		string $tool_capability,
+		int $user_id,
+		string $tool_name = ''
+	): array {
+		$tier = self::normalize_tier( $tier );
+
+		if ( self::is_paid_tier( $tier ) ) {
+			return array(
+				'allowed'   => true,
+				'behavior'  => 'allow',
+				'reason'    => '',
+				'ui_action' => 'none',
+				'tier'      => $tier,
+				'group'     => $group,
+				'tool_name' => $tool_name,
+			);
+		}
+
+		if ( 'read' === $tool_capability || in_array( $group, self::UNLIMITED_GROUPS, true ) ) {
+			return array(
+				'allowed'   => true,
+				'behavior'  => 'allow',
+				'reason'    => '',
+				'ui_action' => 'none',
+				'tier'      => $tier,
+				'group'     => $group,
+				'tool_name' => $tool_name,
+			);
+		}
+
+		$group_limit = (int) self::tier_value( $tier, 'group_limit' );
+		if ( $group_limit <= 0 ) {
+			return array(
+				'allowed'   => true,
+				'behavior'  => 'allow',
+				'reason'    => '',
+				'ui_action' => 'none',
+				'tier'      => $tier,
+				'group'     => $group,
+				'tool_name' => $tool_name,
+			);
+		}
+
+		$usage      = self::get_group_usage_snapshot( $user_id );
+		$total_used = self::total_usage_from_snapshot( $usage );
+		$remaining  = max( 0, $group_limit - $total_used );
+
+		if ( $total_used >= $group_limit ) {
+			$message = sprintf(
+				'You\'ve used all %d free tool actions this week. Your limit resets every Monday. Upgrade to Pro for unlimited access to all tools.',
+				$group_limit
+			);
+
+			return array(
+				'allowed'     => false,
+				'behavior'    => 'ask',
+				'reason'      => $message,
+				'message'     => $message,
+				'ui_action'   => 'upgrade_modal',
+				'error'       => 'entitlement_denied',
+				'basis'       => 'group_limit_exhausted',
+				'tier'        => $tier,
+				'group'       => $group,
+				'tool_name'   => $tool_name,
+				'used'        => $total_used,
+				'limit'       => $group_limit,
+				'remaining'   => 0,
+				'upgrade_url' => pressark_get_upgrade_url(),
+			);
+		}
+
+		return array(
+			'allowed'   => true,
+			'behavior'  => 'allow',
+			'reason'    => '',
+			'ui_action' => 'none',
+			'basis'     => 'weekly_remaining',
+			'tier'      => $tier,
+			'group'     => $group,
+			'tool_name' => $tool_name,
+			'used'      => $total_used,
+			'limit'     => $group_limit,
+			'remaining' => $remaining,
+		);
 	}
 
 	// ── Back-compat ────────────────────────────────────────────────

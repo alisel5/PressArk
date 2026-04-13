@@ -20,6 +20,20 @@ class PressArk_Execution_Ledger {
 
 	private const MAX_TASKS    = 8;
 	private const MAX_RECEIPTS = 12;
+	private const WC_PRICE_RETRY_LIMIT = 2;
+	private const WC_PRICE_RETRY_FIELDS = array(
+		'regular_price',
+		'sale_price',
+		'clear_sale',
+		'price_delta',
+		'price_adjust_pct',
+		'sale_from',
+		'sale_to',
+	);
+	private const WC_PRICE_RETRY_TOOLS = array(
+		'edit_product',
+		'bulk_edit_products',
+	);
 
 	/**
 	 * Valid task statuses.
@@ -125,6 +139,13 @@ class PressArk_Execution_Ledger {
 							$entry['summary']
 						);
 					}
+				}
+			}
+
+			if ( is_array( $receipt['retry_guard'] ?? null ) ) {
+				$retry_guard = self::sanitize_retry_guard( $receipt['retry_guard'] );
+				if ( ! empty( $retry_guard ) ) {
+					$entry['retry_guard'] = $retry_guard;
 				}
 			}
 
@@ -335,6 +356,11 @@ class PressArk_Execution_Ledger {
 		$tool_name = sanitize_key( $tool_name );
 		$target    = self::extract_target( $result, $args );
 		$receipt   = self::receipt_summary( $tool_name, $target, $result, $args );
+		$context   = $target;
+		$retry_guard = self::build_retry_guard_marker( $tool_name, $args, $result );
+		if ( ! empty( $retry_guard ) ) {
+			$context['retry_guard'] = $retry_guard;
+		}
 		if ( ! empty( $target['post_id'] ) ) {
 			$ledger['current_target'] = $target;
 		}
@@ -407,7 +433,7 @@ class PressArk_Execution_Ledger {
 			$ledger = self::mark_task_done( $ledger, 'fulfill_request', $receipt );
 		}
 
-		$ledger = self::append_receipt( $ledger, $tool_name, $receipt, $target );
+		$ledger = self::append_receipt( $ledger, $tool_name, $receipt, $context );
 		$ledger['updated_at'] = gmdate( 'c' );
 
 		return $ledger;
@@ -592,7 +618,28 @@ class PressArk_Execution_Ledger {
 			}
 		}
 
-		$is_complete = ! empty( $ledger['tasks'] ) && empty( $remaining_tasks );
+		$is_complete     = ! empty( $ledger['tasks'] ) && empty( $remaining_tasks );
+		$blocked_details = array();
+		foreach ( $blocked_tasks as $task ) {
+			$deps = array_values(
+				array_filter(
+					array_map(
+						'sanitize_key',
+						(array) ( $task['depends_on'] ?? array() )
+					)
+				)
+			);
+			if ( empty( $deps ) ) {
+				continue;
+			}
+
+			$blocked_details[] = array(
+				'key'          => sanitize_key( (string) ( $task['key'] ?? '' ) ),
+				'label'        => sanitize_text_field( (string) ( $task['label'] ?? '' ) ),
+				'depends_on'   => $deps,
+				'depends_text' => implode( ', ', $deps ),
+			);
+		}
 
 		return array(
 			'total_tasks'        => count( $ledger['tasks'] ),
@@ -613,6 +660,11 @@ class PressArk_Execution_Ledger {
 				fn( $task ) => sanitize_text_field( $task['label'] ?? '' ),
 				$blocked_tasks
 			) ) ),
+			'in_progress_labels' => array_values( array_filter( array_map(
+				fn( $task ) => sanitize_text_field( $task['label'] ?? '' ),
+				$in_progress
+			) ) ),
+			'blocked_details'    => $blocked_details,
 			'next_task_key'      => sanitize_key( $next_task['key'] ?? '' ),
 			'next_task_label'    => sanitize_text_field( $next_task['label'] ?? '' ),
 			'is_complete'        => $is_complete,
@@ -744,6 +796,85 @@ class PressArk_Execution_Ledger {
 		$ledger['updated_at'] = gmdate( 'c' );
 
 		return self::resolve_blocked( $ledger );
+	}
+
+	/**
+	 * Insert dynamically discovered tasks into an existing ledger.
+	 *
+	 * @param array $ledger Current ledger.
+	 * @param array $tasks  Task rows shaped like add_task() inputs.
+	 * @return array Updated ledger.
+	 */
+	public static function insert_dynamic_tasks( array $ledger, array $tasks ): array {
+		$ledger = self::sanitize( $ledger );
+
+		foreach ( $tasks as $task ) {
+			if ( ! is_array( $task ) ) {
+				continue;
+			}
+
+			$ledger = self::add_task(
+				$ledger,
+				(string) ( $task['key'] ?? '' ),
+				(string) ( $task['label'] ?? '' ),
+				(array) ( $task['depends_on'] ?? array() ),
+				is_array( $task['metadata'] ?? null ) ? (array) $task['metadata'] : array()
+			);
+		}
+
+		return self::resolve_blocked( $ledger );
+	}
+
+	/**
+	 * Mark a specific task completed.
+	 *
+	 * @param array  $ledger   Current ledger.
+	 * @param string $key      Task key.
+	 * @param string $evidence Optional evidence note.
+	 * @return array Updated ledger.
+	 */
+	public static function complete_task( array $ledger, string $key, string $evidence = '' ): array {
+		$ledger = self::sanitize( $ledger );
+		$key    = sanitize_key( $key );
+		if ( '' === $key ) {
+			return $ledger;
+		}
+
+		$ledger['updated_at'] = gmdate( 'c' );
+		return self::mark_task_done( $ledger, $key, $evidence );
+	}
+
+	/**
+	 * Complete the current in-progress task when it matches the allowed kinds.
+	 *
+	 * @param array    $ledger        Current ledger.
+	 * @param string[] $allowed_kinds Allowed task kinds. Empty means any kind.
+	 * @param string   $evidence      Optional evidence note.
+	 * @return array Updated ledger.
+	 */
+	public static function complete_current_task( array $ledger, array $allowed_kinds = array(), string $evidence = '' ): array {
+		$ledger        = self::resolve_blocked( $ledger );
+		$allowed_kinds = array_values( array_filter( array_map( 'sanitize_key', $allowed_kinds ) ) );
+
+		foreach ( $ledger['tasks'] as $task ) {
+			if ( 'in_progress' !== (string) ( $task['status'] ?? '' ) ) {
+				continue;
+			}
+
+			$kind = sanitize_key( (string) ( $task['metadata']['kind'] ?? '' ) );
+			if ( ! empty( $allowed_kinds ) && ! in_array( $kind, $allowed_kinds, true ) ) {
+				return $ledger;
+			}
+
+			$ledger = self::complete_task( $ledger, (string) ( $task['key'] ?? '' ), $evidence );
+			$next   = self::next_actionable_task( $ledger );
+			if ( $next && 'pending' === (string) ( $next['status'] ?? '' ) ) {
+				$ledger = self::mark_task_in_progress( $ledger, (string) ( $next['key'] ?? '' ) );
+			}
+			return $ledger;
+		}
+
+		return $ledger;
 	}
 
 	/**
@@ -892,6 +1023,93 @@ class PressArk_Execution_Ledger {
 			'data'             => array(
 				'existing_target' => $target,
 				'remaining_tasks' => self::task_labels( $ledger, 'pending' ),
+			),
+		);
+	}
+
+	/**
+	 * Block repeated non-converging WooCommerce pricing retries on the same product.
+	 *
+	 * After two uncertain price-affecting attempts in the current run, the next
+	 * price write for that same product is converted into a synthetic blocked
+	 * result so the model must explain/escalate instead of writing again.
+	 */
+	public static function maybe_block_wc_price_retry( array $ledger, string $tool_name, array $args = array() ): ?array {
+		$ledger  = self::sanitize( $ledger );
+		$attempt = self::build_retry_guard_marker( $tool_name, $args );
+		if ( empty( $attempt ) || 'wc_pricing' !== ( $attempt['kind'] ?? '' ) ) {
+			return null;
+		}
+
+		$matching = array();
+		foreach ( $ledger['receipts'] as $receipt ) {
+			$guard = is_array( $receipt['retry_guard'] ?? null ) ? $receipt['retry_guard'] : array();
+			if ( 'wc_pricing' !== ( $guard['kind'] ?? '' ) ) {
+				continue;
+			}
+			if ( ( $guard['target_key'] ?? '' ) !== ( $attempt['target_key'] ?? '' ) ) {
+				continue;
+			}
+
+			$status = sanitize_key(
+				(string) (
+					$receipt['evidence_receipt']['status']
+					?? $receipt['verification']['status']
+					?? ''
+				)
+			);
+			if ( 'uncertain' !== $status ) {
+				continue;
+			}
+
+			$matching[] = $receipt;
+		}
+
+		if ( count( $matching ) < self::WC_PRICE_RETRY_LIMIT ) {
+			return null;
+		}
+
+		$recent = array_slice( $matching, -self::WC_PRICE_RETRY_LIMIT );
+		$reason_parts = array();
+		foreach ( $recent as $receipt ) {
+			$evidence = sanitize_text_field(
+				(string) (
+					$receipt['evidence_receipt']['evidence']
+					?? $receipt['verification']['evidence']
+					?? $receipt['summary']
+					?? ''
+				)
+			);
+			if ( '' !== $evidence ) {
+				$reason_parts[] = $evidence;
+			}
+		}
+
+		$field_text = implode( ', ', array_map( 'sanitize_key', (array) ( $attempt['fields'] ?? array() ) ) );
+		$message    = sprintf(
+			'Blocked repeated WooCommerce pricing retry for product #%1$d after %2$d non-converging pricing attempt(s). Stop issuing another pricing write for %3$s and explain/escalate from the latest observed state instead.',
+			(int) ( $attempt['target_id'] ?? 0 ),
+			count( $matching ),
+			'' !== $field_text ? $field_text : 'the requested pricing fields'
+		);
+		if ( ! empty( $reason_parts ) ) {
+			$message .= ' Prior uncertain evidence: ' . implode( ' | ', array_slice( $reason_parts, -2 ) );
+		}
+
+		return array(
+			'success'       => false,
+			'retry_blocked' => true,
+			'error'         => 'wc_pricing_retry_limit',
+			'message'       => $message,
+			'guardrail'     => array(
+				'kind'                => 'wc_pricing_retry_limit',
+				'target_type'         => 'product',
+				'target_id'           => (int) ( $attempt['target_id'] ?? 0 ),
+				'target_key'          => sanitize_text_field( (string) ( $attempt['target_key'] ?? '' ) ),
+				'fields'              => array_values( array_map( 'sanitize_key', (array) ( $attempt['fields'] ?? array() ) ) ),
+				'uncertain_attempts'  => count( $matching ),
+				'attempt_limit'       => self::WC_PRICE_RETRY_LIMIT,
+				'prior_evidence'      => array_slice( $reason_parts, -2 ),
 			),
 		);
 	}
@@ -1322,14 +1540,17 @@ class PressArk_Execution_Ledger {
 	private static function append_receipt( array $ledger, string $tool, string $summary, array $target = array() ): array {
 		$tool    = sanitize_key( $tool );
 		$summary = sanitize_text_field( $summary );
+		$retry_guard = self::sanitize_retry_guard( $target['retry_guard'] ?? array() );
 
 		if ( '' === $tool && '' === $summary ) {
 			return $ledger;
 		}
 
-		foreach ( $ledger['receipts'] as $receipt ) {
-			if ( $receipt['tool'] === $tool && $receipt['summary'] === $summary ) {
-				return $ledger;
+		if ( empty( $retry_guard ) ) {
+			foreach ( $ledger['receipts'] as $receipt ) {
+				if ( $receipt['tool'] === $tool && $receipt['summary'] === $summary ) {
+					return $ledger;
+				}
 			}
 		}
 
@@ -1340,6 +1561,9 @@ class PressArk_Execution_Ledger {
 			'post_title' => sanitize_text_field( $target['post_title'] ?? '' ),
 			'url'        => esc_url_raw( $target['url'] ?? '' ),
 		);
+		if ( ! empty( $retry_guard ) ) {
+			$ledger['receipts'][ count( $ledger['receipts'] ) - 1 ]['retry_guard'] = $retry_guard;
+		}
 		if ( class_exists( 'PressArk_Evidence_Receipt' ) ) {
 			$op = class_exists( 'PressArk_Operation_Registry' ) ? PressArk_Operation_Registry::resolve( $tool ) : null;
 			if ( $op && $op->is_write() ) {
@@ -1392,8 +1616,138 @@ class PressArk_Execution_Ledger {
 		if ( empty( $target['post_id'] ) && ! empty( $args['post_id'] ) ) {
 			$target['post_id'] = absint( $args['post_id'] );
 		}
+		if ( empty( $target['post_id'] ) && ! empty( $args['product_id'] ) ) {
+			$target['post_id'] = absint( $args['product_id'] );
+		}
+		if ( empty( $target['post_id'] ) && ! empty( $args['products'] ) && is_array( $args['products'] ) ) {
+			foreach ( $args['products'] as $product_args ) {
+				if ( ! is_array( $product_args ) ) {
+					continue;
+				}
+				$product_id = absint( $product_args['post_id'] ?? 0 );
+				if ( $product_id > 0 ) {
+					$target['post_id'] = $product_id;
+					break;
+				}
+			}
+		}
 
 		return self::sanitize_target( $target );
+	}
+
+	private static function sanitize_retry_guard( $raw ): array {
+		if ( ! is_array( $raw ) ) {
+			return array();
+		}
+
+		$fields = array();
+		foreach ( (array) ( $raw['fields'] ?? array() ) as $field ) {
+			$field = sanitize_key( (string) $field );
+			if ( '' !== $field && in_array( $field, self::WC_PRICE_RETRY_FIELDS, true ) ) {
+				$fields[] = $field;
+			}
+		}
+
+		$kind       = sanitize_key( (string) ( $raw['kind'] ?? '' ) );
+		$target_key = sanitize_text_field( (string) ( $raw['target_key'] ?? '' ) );
+		$target_id  = absint( $raw['target_id'] ?? 0 );
+
+		if ( 'wc_pricing' !== $kind || '' === $target_key || $target_id <= 0 || empty( $fields ) ) {
+			return array();
+		}
+
+		return array(
+			'kind'       => $kind,
+			'target_key' => $target_key,
+			'target_id'  => $target_id,
+			'fields'     => array_values( array_unique( array_slice( $fields, 0, count( self::WC_PRICE_RETRY_FIELDS ) ) ) ),
+		);
+	}
+
+	private static function build_retry_guard_marker( string $tool_name, array $args, array $result = array() ): array {
+		$tool_name = sanitize_key( $tool_name );
+		if ( ! in_array( $tool_name, self::WC_PRICE_RETRY_TOOLS, true ) ) {
+			return array();
+		}
+
+		$fields = self::extract_wc_pricing_fields_from_args( $tool_name, $args );
+		if ( empty( $fields ) ) {
+			return array();
+		}
+
+		$target_id = self::extract_wc_pricing_target_id( $tool_name, $args, $result );
+		if ( $target_id <= 0 ) {
+			return array();
+		}
+
+		return array(
+			'kind'       => 'wc_pricing',
+			'target_key' => 'product:' . $target_id,
+			'target_id'  => $target_id,
+			'fields'     => $fields,
+		);
+	}
+
+	private static function extract_wc_pricing_fields_from_args( string $tool_name, array $args ): array {
+		$changes = array();
+
+		if ( 'edit_product' === $tool_name ) {
+			$changes = is_array( $args['changes'] ?? null ) ? $args['changes'] : array();
+		} elseif ( 'bulk_edit_products' === $tool_name ) {
+			$products = array_values(
+				array_filter(
+					(array) ( $args['products'] ?? array() ),
+					static fn( $item ) => is_array( $item )
+				)
+			);
+			if ( 1 !== count( $products ) ) {
+				return array();
+			}
+			$changes = is_array( $products[0]['changes'] ?? null ) ? $products[0]['changes'] : array();
+		}
+
+		$fields = array();
+		foreach ( array_keys( $changes ) as $field ) {
+			$field = sanitize_key( (string) $field );
+			if ( in_array( $field, self::WC_PRICE_RETRY_FIELDS, true ) ) {
+				$fields[] = $field;
+			}
+		}
+
+		return array_values( array_unique( $fields ) );
+	}
+
+	private static function extract_wc_pricing_target_id( string $tool_name, array $args, array $result = array() ): int {
+		if ( 'edit_product' === $tool_name ) {
+			return absint(
+				$args['post_id']
+				?? $result['post_id']
+				?? $result['data']['id']
+				?? 0
+			);
+		}
+
+		if ( 'bulk_edit_products' === $tool_name ) {
+			$products = array_values(
+				array_filter(
+					(array) ( $args['products'] ?? array() ),
+					static fn( $item ) => is_array( $item )
+				)
+			);
+			if ( 1 !== count( $products ) ) {
+				return 0;
+			}
+
+			return absint(
+				$products[0]['post_id']
+				?? $args['post_id']
+				?? $result['post_id']
+				?? $result['data']['id']
+				?? 0
+			);
+		}
+
+		return 0;
 	}
 
 	private static function looks_like_seo_write( array $args ): bool {

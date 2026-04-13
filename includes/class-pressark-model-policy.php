@@ -123,6 +123,8 @@ class PressArk_Model_Policy {
 			'needs_tools' => true,
 		),
 		// Code-related: shortcodes, Elementor, theme editing.
+		// Prefer native design tools over Elementor.
+		// Elementor tools have negative preference weights and include user notices.
 		'code' => array(
 			'economy'  => 'deepseek/deepseek-v3.2',
 			'standard' => 'anthropic/claude-sonnet-4.6',
@@ -160,6 +162,12 @@ class PressArk_Model_Policy {
 			'needs_tools' => false,
 		),
 		'retrieval_planning' => array(
+			'economy'     => 'deepseek/deepseek-v3.2',
+			'standard'    => 'deepseek/deepseek-v3.2',
+			'premium'     => 'anthropic/claude-sonnet-4.6',
+			'needs_tools' => false,
+		),
+		'plan_mode' => array(
 			'economy'     => 'deepseek/deepseek-v3.2',
 			'standard'    => 'deepseek/deepseek-v3.2',
 			'premium'     => 'anthropic/claude-sonnet-4.6',
@@ -442,7 +450,7 @@ class PressArk_Model_Policy {
 	public static function for_phase( string $phase, string $tier, array $context = array() ): string {
 		// Back-Agent phases: planning, compression, memory selection.
 		// All share the pressark_summarize_model setting (renamed "Back-Agent" in UI).
-		$back_agent_phases = array( 'summarize', 'classification', 'memory_selection' );
+		$back_agent_phases = array( 'summarize', 'classification', 'memory_selection', 'plan_mode' );
 		if ( in_array( $phase, $back_agent_phases, true ) ) {
 			$configured = sanitize_text_field( (string) get_option( 'pressark_summarize_model', 'auto' ) );
 			if ( 'custom' === $configured ) {

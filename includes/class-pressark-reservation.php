@@ -109,6 +109,7 @@ class PressArk_Reservation {
 				'settled_icus'           => (int) ( $resolved['icu_total'] ?? 0 ),
 				'actual_icus'            => (int) ( $resolved['icu_total'] ?? 0 ),
 				'actual_tokens'          => (int) ( $actual_usage['settled_tokens'] ?? 0 ),
+				'context_tokens'         => max( 0, (int) ( $actual_usage['context_tokens'] ?? 0 ) ),
 				'model_class'            => (string) ( $resolved['model_class'] ?? '' ),
 				'model_multiplier_input' => (int) ( $resolved['multiplier']['input'] ?? 0 ),
 				'model_multiplier_output'=> (int) ( $resolved['multiplier']['output'] ?? 0 ),
@@ -144,6 +145,7 @@ class PressArk_Reservation {
 				'actual_icus'      => (int) ( $bank_status['actual_icus'] ?? $settle_payload['actual_icus'] ?? 0 ),
 				'raw_actual_tokens' => $raw_actual_tokens,
 				'actual_tokens'    => (int) ( $bank_status['actual_tokens'] ?? $settle_payload['actual_tokens'] ?? 0 ),
+				'context_tokens'   => (int) ( $settle_payload['context_tokens'] ?? 0 ),
 				'settlement_delta' => $settlement_delta,
 			)
 		);
@@ -181,7 +183,7 @@ class PressArk_Reservation {
 	}
 
 	private function estimate_usage( string $message, array $conversation, string $tier ): array {
-		$lightweight_chat = PressArk_Agent::is_lightweight_chat_request( $message, $conversation );
+		$lightweight_chat = strlen( $message ) < 240 && count( $conversation ) < 3;
 		$input_chars      = strlen( $message );
 		$history          = array_slice( $conversation, $lightweight_chat ? -4 : -10 );
 

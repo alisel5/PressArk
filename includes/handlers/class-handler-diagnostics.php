@@ -11,6 +11,90 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 class PressArk_Handler_Diagnostics extends PressArk_Handler_Base {
 
+	/**
+	 * Fast pre-execution permission probe for diagnostics-domain tools.
+	 *
+	 * @since 5.6.0
+	 */
+	public function check_permissions( string $tool_name, array $params, array $context = array() ): array {
+		$post_id = $this->permission_post_id( $params );
+
+		switch ( $tool_name ) {
+			case 'store_health':
+				return $this->permission_require_wc(
+					$tool_name,
+					$params,
+					$context,
+					'manage_woocommerce',
+					null,
+					__( 'You do not have permission to view store diagnostics.', 'pressark' )
+				);
+
+			case 'page_audit':
+				return $this->permission_require_capability(
+					$tool_name,
+					$params,
+					$context,
+					'read_post',
+					$post_id,
+					__( 'You do not have permission to audit this post.', 'pressark' )
+				);
+
+			case 'inspect_hooks':
+			case 'measure_page_speed':
+			case 'check_crawlability':
+			case 'check_email_delivery':
+			case 'profile_queries':
+			case 'discover_rest_routes':
+			case 'call_rest_endpoint':
+			case 'diagnose_cache':
+			case 'network_overview':
+				return $this->permission_require_capability(
+					$tool_name,
+					$params,
+					$context,
+					'manage_options',
+					null,
+					__( 'Insufficient permissions.', 'pressark' )
+				);
+
+			case 'get_revision_history':
+			case 'read_blocks':
+				return $this->permission_require_any_capability(
+					$tool_name,
+					$params,
+					$context,
+					array( 'edit_post', 'read_post' ),
+					$post_id,
+					__( 'Insufficient permissions.', 'pressark' )
+				);
+
+			case 'edit_block':
+			case 'insert_block':
+			case 'insert_pattern':
+				return $this->permission_require_capability(
+					$tool_name,
+					$params,
+					$context,
+					'edit_post',
+					$post_id,
+					__( 'Insufficient permissions.', 'pressark' )
+				);
+
+			case 'edit_template':
+				return $this->permission_require_capability(
+					$tool_name,
+					$params,
+					$context,
+					'edit_theme_options',
+					null,
+					__( 'Insufficient permissions.', 'pressark' )
+				);
+		}
+
+		return $this->entitlement_permission( $tool_name, $params, $context );
+	}
+
 	// ── Composite Diagnostics ───────────────────────────────────────────
 
 	public function handle_store_health( array $params ): array {
@@ -95,8 +179,22 @@ class PressArk_Handler_Diagnostics extends PressArk_Handler_Base {
 	}
 
 	public function handle_measure_page_speed( array $params ): array {
+		// PressArk v5.1.1 hardening: restrict sensitive diagnostics to administrators.
+		if ( ! current_user_can( 'manage_options' ) ) {
+			return $this->error( __( 'Insufficient permissions.', 'pressark' ) );
+		}
+		// PressArk v5.1.1 hardening: validate and constrain requested diagnostic URLs.
+		$url = esc_url_raw( $params['url'] ?? home_url( '/' ) );
+		if ( ! wp_http_validate_url( $url ) ) {
+			return $this->error( __( 'Invalid URL.', 'pressark' ) );
+		}
+		$site_host = wp_parse_url( home_url( '/' ), PHP_URL_HOST );
+		$req_host  = wp_parse_url( $url, PHP_URL_HOST );
+		if ( ! $req_host || strcasecmp( (string) $req_host, (string) $site_host ) !== 0 ) {
+			return $this->error( __( 'Invalid URL.', 'pressark' ) );
+		}
 		$diagnostics = new PressArk_Diagnostics();
-		$data = $diagnostics->measure_page_speed( $params['url'] ?? '' );
+		$data = $diagnostics->measure_page_speed( $url );
 		if ( isset( $data['error'] ) ) {
 			return array( 'success' => false, 'message' => $data['error'], 'data' => $data );
 		}
@@ -134,13 +232,23 @@ class PressArk_Handler_Diagnostics extends PressArk_Handler_Base {
 	}
 
 	public function handle_profile_queries( array $params ): array {
-		$cap_error = $this->require_cap( 'manage_options' );
-		if ( $cap_error ) {
-			return $cap_error;
+		// PressArk v5.1.1 hardening: restrict sensitive diagnostics to administrators.
+		if ( ! current_user_can( 'manage_options' ) ) {
+			return $this->error( __( 'Insufficient permissions.', 'pressark' ) );
+		}
+		// PressArk v5.1.1 hardening: validate and constrain requested diagnostic URLs.
+		$url = esc_url_raw( $params['url'] ?? home_url( '/' ) );
+		if ( ! wp_http_validate_url( $url ) ) {
+			return $this->error( __( 'Invalid URL.', 'pressark' ) );
+		}
+		$site_host = wp_parse_url( home_url( '/' ), PHP_URL_HOST );
+		$req_host  = wp_parse_url( $url, PHP_URL_HOST );
+		if ( ! $req_host || strcasecmp( (string) $req_host, (string) $site_host ) !== 0 ) {
+			return $this->error( __( 'Invalid URL.', 'pressark' ) );
 		}
 
 		$diagnostics = new PressArk_Diagnostics();
-		$data = $diagnostics->profile_page_queries( $params['url'] ?? '' );
+		$data = $diagnostics->profile_page_queries( $url );
 		if ( isset( $data['error'] ) ) {
 			return array( 'success' => false, 'message' => $data['error'], 'data' => $data );
 		}
@@ -148,7 +256,14 @@ class PressArk_Handler_Diagnostics extends PressArk_Handler_Base {
 	}
 
 	public function handle_get_revision_history( array $params ): array {
-		$post_id    = (int) ( $params['post_id'] ?? 0 );
+		// PressArk v5.1.1 hardening: gate revision access to readable or editable posts.
+		$post_id    = absint( $params['post_id'] ?? 0 );
+		if ( ! $post_id ) {
+			return $this->error( __( 'Invalid post ID.', 'pressark' ) );
+		}
+		if ( ! current_user_can( 'edit_post', $post_id ) && ! current_user_can( 'read_post', $post_id ) ) {
+			return $this->error( __( 'Insufficient permissions.', 'pressark' ) );
+		}
 		$limit      = min( (int) ( $params['limit'] ?? 10 ), 20 );
 		$compare_to = (int) ( $params['compare_to'] ?? 0 );
 		$post       = get_post( $post_id );
@@ -367,42 +482,66 @@ class PressArk_Handler_Diagnostics extends PressArk_Handler_Base {
 	// ── Gutenberg Blocks ────────────────────────────────────────────────
 
 	public function handle_read_blocks( array $params ): array {
+		// PressArk v5.1.1 hardening: gate block reads to readable or editable posts.
+		$post_id = absint( $params['post_id'] ?? 0 );
+		if ( ! $post_id ) {
+			return $this->error( __( 'Invalid post ID.', 'pressark' ) );
+		}
+		if ( ! current_user_can( 'edit_post', $post_id ) && ! current_user_can( 'read_post', $post_id ) ) {
+			return $this->error( __( 'Insufficient permissions.', 'pressark' ) );
+		}
 		$blocks = new PressArk_Blocks();
-		return $blocks->read_blocks( (int) ( $params['post_id'] ?? 0 ) );
+		return $blocks->read_blocks( $post_id );
 	}
 
 	public function handle_edit_block( array $params ): array {
-		$post_id = (int) ( $params['post_id'] ?? 0 );
-
-		// Resolve from URL if provided.
-		if ( empty( $post_id ) && ! empty( $params['url'] ) ) {
-			$post_id = url_to_postid( esc_url_raw( $params['url'] ) );
+		$post_id = $this->resolve_post_id( $params );
+		if ( is_array( $post_id ) ) {
+			return $post_id;
 		}
-
-		// Resolve from slug if provided.
-		if ( empty( $post_id ) && ! empty( $params['slug'] ) ) {
-			$post_type = sanitize_text_field( $params['post_type'] ?? 'page' );
-			$found     = get_page_by_path( sanitize_text_field( $params['slug'] ), OBJECT, $post_type );
-			if ( $found ) {
-				$post_id = $found->ID;
-			}
+		// PressArk v5.1.1 hardening: require post edit capability before block writes.
+		if ( $err = $this->require_cap( 'edit_post', $post_id ) ) {
+			return $err;
 		}
+		$updates = $params['updates'] ?? array();
+		// PressArk v5.1.1 hardening: sanitize block update payloads before mutation.
+		if ( is_string( $updates ) ) {
+			$decoded = json_decode( $updates, true );
+			$updates = is_array( $decoded ) ? $decoded : array();
+		}
+		$updates = wp_kses_post_deep( is_array( $updates ) ? $updates : array() );
 
 		$blocks = new PressArk_Blocks();
 		return $blocks->edit_block(
 			$post_id,
 			$params['block_index'] ?? 0,
-			(array) ( $params['updates'] ?? array() )
+			$updates
 		);
 	}
 
 	public function handle_insert_block( array $params ): array {
+		$post_id = absint( $params['post_id'] ?? 0 );
+		if ( ! $post_id ) {
+			return $this->error( __( 'Invalid post ID.', 'pressark' ) );
+		}
+		// PressArk v5.1.1 hardening: require post edit capability before block writes.
+		if ( $err = $this->require_cap( 'edit_post', $post_id ) ) {
+			return $err;
+		}
+		$attrs = $params['attrs'] ?? array();
+		// PressArk v5.1.1 hardening: sanitize inserted block payloads before mutation.
+		if ( is_string( $attrs ) ) {
+			$decoded = json_decode( $attrs, true );
+			$attrs   = is_array( $decoded ) ? $decoded : array();
+		}
+		$attrs   = wp_kses_post_deep( is_array( $attrs ) ? $attrs : array() );
+		$content = wp_kses_post( (string) ( $params['content'] ?? '' ) );
 		$blocks = new PressArk_Blocks();
 		return $blocks->insert_block(
-			(int)    ( $params['post_id']    ?? 0 ),
+			$post_id,
 			(string) ( $params['block_type'] ?? 'core/paragraph' ),
-			(array)  ( $params['attrs']      ?? array() ),
-			(string) ( $params['content']    ?? '' ),
+			$attrs,
+			$content,
 			(int)    ( $params['position']   ?? -1 )
 		);
 	}

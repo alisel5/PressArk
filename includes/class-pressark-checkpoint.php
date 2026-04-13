@@ -317,12 +317,41 @@ class PressArk_Checkpoint {
 
 		// v5.3.0: Plan state.
 		if ( ! self::plan_state_is_empty( $this->plan_state ) ) {
-			$phase = $this->plan_state['phase'] ?? '';
+			$phase   = $this->plan_state['phase'] ?? '';
+			$status  = $this->plan_state['status'] ?? '';
+			$artifact = $this->get_plan_artifact();
 			$parts[] = 'PLAN PHASE: ' . $phase;
-			if ( 'executing' === $phase && ! empty( $this->plan_state['plan_text'] ) ) {
+			if ( '' !== $status ) {
+				$parts[] = 'PLAN STATUS: ' . $status;
+			}
+			if ( ! empty( $artifact['approval_level'] ) ) {
+				$parts[] = 'PLAN APPROVAL LEVEL: ' . sanitize_key( (string) $artifact['approval_level'] );
+			}
+			if ( 'executing' === $phase && ! empty( $artifact ) && class_exists( 'PressArk_Plan_Artifact' ) ) {
+				$parts[] = 'APPROVED PLAN: ' . mb_substr( PressArk_Plan_Artifact::to_markdown( $artifact ), 0, 300 );
+			} elseif ( 'executing' === $phase && ! empty( $this->plan_state['plan_text'] ) ) {
 				$parts[] = 'APPROVED PLAN: ' . mb_substr( $this->plan_state['plan_text'], 0, 300 );
 			} elseif ( 'exploring' === $phase ) {
 				$parts[] = 'MODE: Read-only exploration. Do not propose writes until a plan is formed and approved.';
+			}
+			if ( ! empty( $artifact['steps'] ) ) {
+				$plan_rows = array_slice( (array) ( class_exists( 'PressArk_Plan_Artifact' )
+					? PressArk_Plan_Artifact::to_plan_steps( $artifact )
+					: array() ), 0, 6 );
+				if ( ! empty( $plan_rows ) ) {
+					$parts[] = 'PLAN TASKS: ' . implode(
+						'; ',
+						array_map(
+							static function ( array $row ): string {
+								$text = sanitize_text_field( (string) ( $row['text'] ?? '' ) );
+								$kind = sanitize_key( (string) ( $row['kind'] ?? '' ) );
+								$group = sanitize_key( (string) ( $row['group'] ?? '' ) );
+								return trim( '[' . $kind . '/' . $group . '] ' . $text );
+							},
+							$plan_rows
+						)
+					);
+				}
 			}
 		}
 
@@ -394,6 +423,10 @@ class PressArk_Checkpoint {
 		$this->goal = sanitize_text_field( $goal );
 	}
 
+	public function get_goal(): string {
+		return $this->goal;
+	}
+
 	public function add_entity( int $id, string $title, string $type ): void {
 		// Deduplicate by ID.
 		foreach ( $this->entities as $e ) {
@@ -460,6 +493,14 @@ class PressArk_Checkpoint {
 
 	public function add_constraint( string $constraint ): void {
 		$this->constraints[] = sanitize_text_field( $constraint );
+	}
+
+	public function get_constraints(): array {
+		return $this->constraints;
+	}
+
+	public function get_entities(): array {
+		return $this->entities;
 	}
 
 	public function add_outcome( string $action, string $result ): void {
@@ -895,12 +936,22 @@ class PressArk_Checkpoint {
 		}
 
 		$this->plan_state['phase'] = $phase;
+		if ( '' === $phase ) {
+			unset( $this->plan_state['status'] );
+		}
 
 		if ( 'exploring' === $phase && empty( $this->plan_state['entered_at'] ) ) {
 			$this->plan_state['entered_at'] = gmdate( 'c' );
+			if ( empty( $this->plan_state['status'] ) ) {
+				$this->plan_state['status'] = 'exploring';
+			}
+		}
+		if ( 'planning' === $phase ) {
+			$this->plan_state['status'] = 'ready';
 		}
 		if ( 'executing' === $phase && empty( $this->plan_state['approved_at'] ) ) {
 			$this->plan_state['approved_at'] = gmdate( 'c' );
+			$this->plan_state['status']      = 'approved';
 		}
 	}
 
@@ -911,6 +962,10 @@ class PressArk_Checkpoint {
 	 */
 	public function set_plan_text( string $text ): void {
 		$this->plan_state['plan_text'] = sanitize_textarea_field( mb_substr( $text, 0, 4000 ) );
+	}
+
+	public function get_plan_text(): string {
+		return (string) ( $this->plan_state['plan_text'] ?? '' );
 	}
 
 	/**
@@ -925,6 +980,158 @@ class PressArk_Checkpoint {
 	 */
 	public function get_plan_phase(): string {
 		return $this->plan_state['phase'] ?? '';
+	}
+
+	public function get_plan_status(): string {
+		return sanitize_key( (string) ( $this->plan_state['status'] ?? '' ) );
+	}
+
+	public function set_plan_status( string $status ): void {
+		$status = sanitize_key( $status );
+		if ( '' === $status ) {
+			unset( $this->plan_state['status'] );
+			return;
+		}
+
+		$this->plan_state['status'] = $status;
+	}
+
+	public function set_plan_policy( array $decision ): void {
+		$this->plan_state['policy'] = array(
+			'mode'              => sanitize_key( (string) ( $decision['mode'] ?? '' ) ),
+			'approval_required' => ! empty( $decision['approval_required'] ),
+			'reads_first'       => ! empty( $decision['reads_first'] ),
+			'reason_codes'      => array_values( array_filter( array_map( 'sanitize_key', (array) ( $decision['reason_codes'] ?? array() ) ) ) ),
+			'complexity_score'  => max( 0, absint( $decision['complexity_score'] ?? 0 ) ),
+			'risk_score'        => max( 0, absint( $decision['risk_score'] ?? 0 ) ),
+			'breadth_score'     => max( 0, absint( $decision['breadth_score'] ?? 0 ) ),
+			'uncertainty_score' => max( 0, absint( $decision['uncertainty_score'] ?? 0 ) ),
+			'destructive_score' => max( 0, absint( $decision['destructive_score'] ?? 0 ) ),
+		);
+	}
+
+	public function get_plan_policy(): array {
+		return is_array( $this->plan_state['policy'] ?? null ) ? $this->plan_state['policy'] : array();
+	}
+
+	public function set_plan_request_context( array $context ): void {
+		$conversation = array();
+		foreach ( array_slice( (array) ( $context['conversation'] ?? array() ), -20 ) as $message ) {
+			if ( ! is_array( $message ) ) {
+				continue;
+			}
+
+			$role    = sanitize_key( (string) ( $message['role'] ?? '' ) );
+			$content = sanitize_textarea_field( mb_substr( (string) ( $message['content'] ?? '' ), 0, 2000 ) );
+			if ( '' === $role || '' === $content ) {
+				continue;
+			}
+
+			$conversation[] = array(
+				'role'    => $role,
+				'content' => $content,
+			);
+		}
+
+		$this->plan_state['request_context'] = array(
+			'screen'        => sanitize_text_field( (string) ( $context['screen'] ?? '' ) ),
+			'post_id'       => absint( $context['post_id'] ?? 0 ),
+			'deep_mode'     => ! empty( $context['deep_mode'] ),
+			'loaded_groups' => array_values( array_filter( array_map( 'sanitize_text_field', (array) ( $context['loaded_groups'] ?? array() ) ) ) ),
+			'chat_id'       => absint( $context['chat_id'] ?? 0 ),
+			'message'       => sanitize_textarea_field( mb_substr( (string) ( $context['message'] ?? '' ), 0, 4000 ) ),
+			'execute_message' => sanitize_textarea_field( mb_substr( (string) ( $context['execute_message'] ?? '' ), 0, 4000 ) ),
+			'conversation'  => $conversation,
+		);
+	}
+
+	public function get_plan_request_context(): array {
+		return is_array( $this->plan_state['request_context'] ?? null ) ? $this->plan_state['request_context'] : array();
+	}
+
+	public function set_plan_artifact( array $artifact ): void {
+		$clean = class_exists( 'PressArk_Plan_Artifact' )
+			? PressArk_Plan_Artifact::sanitize( $artifact )
+			: array();
+
+		if ( empty( $clean ) ) {
+			unset( $this->plan_state['current_artifact'] );
+			return;
+		}
+
+		$this->plan_state['current_artifact'] = $clean;
+		$this->plan_state['plan_text']        = class_exists( 'PressArk_Plan_Artifact' )
+			? PressArk_Plan_Artifact::to_markdown( $clean )
+			: (string) ( $this->plan_state['plan_text'] ?? '' );
+		$this->plan_state['approval_level']   = sanitize_key( (string) ( $clean['approval_level'] ?? '' ) );
+		unset( $this->plan_state['next_version'] );
+	}
+
+	public function get_plan_artifact(): array {
+		$artifact = class_exists( 'PressArk_Plan_Artifact' )
+			? PressArk_Plan_Artifact::sanitize( $this->plan_state['current_artifact'] ?? array() )
+			: array();
+		if ( empty( $artifact ) && ! empty( $this->plan_state['plan_text'] ) && class_exists( 'PressArk_Plan_Artifact' ) ) {
+			$artifact = PressArk_Plan_Artifact::synthesize_from_legacy(
+				(string) $this->plan_state['plan_text'],
+				array(),
+				array(
+					'approval_level' => (string) ( $this->plan_state['approval_level'] ?? 'hard' ),
+				)
+			);
+		}
+
+		return $artifact;
+	}
+
+	public function get_plan_history(): array {
+		return is_array( $this->plan_state['history'] ?? null ) ? $this->plan_state['history'] : array();
+	}
+
+	public function queue_plan_revision( string $revision_note ): void {
+		$revision_note = sanitize_text_field( $revision_note );
+		if ( '' === $revision_note ) {
+			return;
+		}
+
+		$this->archive_current_plan_artifact( 'revised', array( 'revision_note' => $revision_note ) );
+		$artifact = $this->get_plan_artifact();
+		$this->plan_state['revision_note'] = $revision_note;
+		$this->plan_state['next_version']  = max( 1, absint( $artifact['version'] ?? 0 ) + 1 );
+		$this->plan_state['status']        = 'revising';
+	}
+
+	public function get_plan_revision_note(): string {
+		return sanitize_text_field( (string) ( $this->plan_state['revision_note'] ?? '' ) );
+	}
+
+	public function get_next_plan_version(): int {
+		return max( 0, absint( $this->plan_state['next_version'] ?? 0 ) );
+	}
+
+	public function approve_plan_artifact( array $artifact = array() ): array {
+		$artifact = ! empty( $artifact ) ? $artifact : $this->get_plan_artifact();
+		if ( empty( $artifact ) ) {
+			return array();
+		}
+
+		$artifact['approval_level'] = 'hard';
+		$this->set_plan_artifact( $artifact );
+		$this->set_plan_phase( 'executing' );
+		$this->plan_state['status'] = 'approved';
+
+		return $artifact;
+	}
+
+	public function reject_plan_artifact( string $reason = '' ): void {
+		$this->archive_current_plan_artifact(
+			'rejected',
+			array(
+				'reason' => sanitize_text_field( $reason ),
+			)
+		);
+		$this->plan_state['status'] = 'rejected';
+		$this->plan_state['phase']  = '';
 	}
 
 	/**
@@ -945,13 +1152,41 @@ class PressArk_Checkpoint {
 		return 'executing' === ( $this->plan_state['phase'] ?? '' );
 	}
 
+	public function has_active_plan_gate(): bool {
+		return in_array( $this->get_plan_phase(), array( 'exploring', 'planning' ), true )
+			&& ! empty( $this->get_plan_artifact() );
+	}
+
 	/**
 	 * Clear plan state (e.g., on settlement).
 	 *
 	 * @since 5.3.0
 	 */
 	public function clear_plan_state(): void {
-		$this->plan_state = array();
+		$this->archive_current_plan_artifact( 'cleared' );
+		$history = $this->get_plan_history();
+		$this->plan_state = empty( $history ) ? array() : array( 'history' => $history );
+	}
+
+	private function archive_current_plan_artifact( string $status, array $meta = array() ): void {
+		$artifact = $this->get_plan_artifact();
+		if ( empty( $artifact ) ) {
+			return;
+		}
+
+		$history   = $this->get_plan_history();
+		$history[] = array(
+			'status'      => sanitize_key( $status ),
+			'archived_at' => gmdate( 'c' ),
+			'meta'        => array_filter(
+				array(
+					'revision_note' => sanitize_text_field( (string) ( $meta['revision_note'] ?? '' ) ),
+					'reason'        => sanitize_text_field( (string) ( $meta['reason'] ?? '' ) ),
+				)
+			),
+			'artifact'    => $artifact,
+		);
+		$this->plan_state['history'] = array_slice( $history, -8 );
 	}
 
 	public function set_loaded_tool_groups( array $groups ): void {
@@ -1499,23 +1734,103 @@ class PressArk_Checkpoint {
 			$phase = '';
 		}
 
-		if ( '' === $phase ) {
+		$artifact = class_exists( 'PressArk_Plan_Artifact' )
+			? PressArk_Plan_Artifact::sanitize( $raw['current_artifact'] ?? array() )
+			: array();
+		$history  = array();
+		foreach ( array_slice( (array) ( $raw['history'] ?? array() ), -8 ) as $entry ) {
+			if ( ! is_array( $entry ) ) {
+				continue;
+			}
+			$item = array(
+				'status'      => sanitize_key( (string) ( $entry['status'] ?? '' ) ),
+				'archived_at' => sanitize_text_field( (string) ( $entry['archived_at'] ?? '' ) ),
+				'meta'        => array_filter(
+					array(
+						'revision_note' => sanitize_text_field( (string) ( $entry['meta']['revision_note'] ?? '' ) ),
+						'reason'        => sanitize_text_field( (string) ( $entry['meta']['reason'] ?? '' ) ),
+					)
+				),
+				'artifact'    => class_exists( 'PressArk_Plan_Artifact' )
+					? PressArk_Plan_Artifact::sanitize( $entry['artifact'] ?? array() )
+					: array(),
+			);
+			if ( ! empty( $item['artifact'] ) ) {
+				$history[] = $item;
+			}
+		}
+
+		if ( '' === $phase && empty( $artifact ) && empty( $raw['plan_text'] ) && empty( $history ) ) {
 			return array();
 		}
 
-		return array(
+		return array_filter( array(
 			'phase'       => $phase,
 			'plan_text'   => sanitize_textarea_field( mb_substr( (string) ( $raw['plan_text'] ?? '' ), 0, 4000 ) ),
 			'entered_at'  => sanitize_text_field( $raw['entered_at'] ?? '' ),
 			'approved_at' => sanitize_text_field( $raw['approved_at'] ?? '' ),
-		);
+			'status'      => sanitize_key( (string) ( $raw['status'] ?? '' ) ),
+			'approval_level' => sanitize_key( (string) ( $raw['approval_level'] ?? '' ) ),
+			'current_artifact' => $artifact,
+			'history'     => $history,
+			'policy'      => is_array( $raw['policy'] ?? null ) ? array(
+				'mode'              => sanitize_key( (string) ( $raw['policy']['mode'] ?? '' ) ),
+				'approval_required' => ! empty( $raw['policy']['approval_required'] ),
+				'reads_first'       => ! empty( $raw['policy']['reads_first'] ),
+				'reason_codes'      => array_values( array_filter( array_map( 'sanitize_key', (array) ( $raw['policy']['reason_codes'] ?? array() ) ) ) ),
+				'complexity_score'  => max( 0, absint( $raw['policy']['complexity_score'] ?? 0 ) ),
+				'risk_score'        => max( 0, absint( $raw['policy']['risk_score'] ?? 0 ) ),
+				'breadth_score'     => max( 0, absint( $raw['policy']['breadth_score'] ?? 0 ) ),
+				'uncertainty_score' => max( 0, absint( $raw['policy']['uncertainty_score'] ?? 0 ) ),
+				'destructive_score' => max( 0, absint( $raw['policy']['destructive_score'] ?? 0 ) ),
+			) : array(),
+			'request_context' => is_array( $raw['request_context'] ?? null ) ? array(
+				'screen'        => sanitize_text_field( (string) ( $raw['request_context']['screen'] ?? '' ) ),
+				'post_id'       => absint( $raw['request_context']['post_id'] ?? 0 ),
+				'deep_mode'     => ! empty( $raw['request_context']['deep_mode'] ),
+				'loaded_groups' => array_values( array_filter( array_map( 'sanitize_text_field', (array) ( $raw['request_context']['loaded_groups'] ?? array() ) ) ) ),
+				'chat_id'       => absint( $raw['request_context']['chat_id'] ?? 0 ),
+				'message'       => sanitize_textarea_field( mb_substr( (string) ( $raw['request_context']['message'] ?? '' ), 0, 4000 ) ),
+				'execute_message' => sanitize_textarea_field( mb_substr( (string) ( $raw['request_context']['execute_message'] ?? '' ), 0, 4000 ) ),
+				'conversation'  => array_values(
+					array_filter(
+						array_map(
+							static function ( $message ) {
+								if ( ! is_array( $message ) ) {
+									return null;
+								}
+
+								$role    = sanitize_key( (string) ( $message['role'] ?? '' ) );
+								$content = sanitize_textarea_field( mb_substr( (string) ( $message['content'] ?? '' ), 0, 2000 ) );
+								if ( '' === $role || '' === $content ) {
+									return null;
+								}
+
+								return array(
+									'role'    => $role,
+									'content' => $content,
+								);
+							},
+							array_slice( (array) ( $raw['request_context']['conversation'] ?? array() ), -20 )
+						)
+					)
+				),
+			) : array(),
+			'revision_note' => sanitize_text_field( (string) ( $raw['revision_note'] ?? '' ) ),
+			'next_version'  => max( 0, absint( $raw['next_version'] ?? 0 ) ),
+		) );
 	}
 
 	/**
 	 * @since 5.3.0
 	 */
 	private static function plan_state_is_empty( array $state ): bool {
-		return empty( $state ) || empty( $state['phase'] );
+		return empty( $state )
+			|| (
+				empty( $state['phase'] )
+				&& empty( $state['plan_text'] )
+				&& empty( $state['current_artifact'] )
+			);
 	}
 
 	private static function sanitize_approvals( array $raw ): array {

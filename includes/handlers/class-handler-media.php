@@ -15,12 +15,134 @@ if ( ! defined( 'ABSPATH' ) ) { exit; }
 
 class PressArk_Handler_Media extends PressArk_Handler_Base {
 
+	/**
+	 * Fast pre-execution permission probe for media-domain tools.
+	 *
+	 * @since 5.6.0
+	 */
+	public function check_permissions( string $tool_name, array $params, array $context = array() ): array {
+		$post_id       = $this->permission_post_id( $params );
+		$attachment_id = absint( $params['attachment_id'] ?? $params['media_id'] ?? $params['id'] ?? 0 );
+
+		switch ( $tool_name ) {
+			case 'list_media':
+			case 'get_media':
+				return $this->permission_require_capability(
+					$tool_name,
+					$params,
+					$context,
+					'upload_files',
+					null,
+					__( 'You do not have permission to view media.', 'pressark' )
+				);
+
+			case 'update_media':
+			case 'regenerate_thumbnails':
+				return $attachment_id > 0
+					? $this->permission_require_capability(
+						$tool_name,
+						$params,
+						$context,
+						'edit_post',
+						$attachment_id,
+						__( 'You do not have permission to edit this attachment.', 'pressark' )
+					)
+					: $this->permission_require_capability(
+						$tool_name,
+						$params,
+						$context,
+						'edit_posts',
+						null,
+						__( 'You do not have permission to edit media.', 'pressark' )
+					);
+
+			case 'delete_media':
+				return $attachment_id > 0
+					? $this->permission_require_capability(
+						$tool_name,
+						$params,
+						$context,
+						'delete_post',
+						$attachment_id,
+						__( 'You do not have permission to delete this attachment.', 'pressark' )
+					)
+					: $this->permission_require_capability(
+						$tool_name,
+						$params,
+						$context,
+						'delete_posts',
+						null,
+						__( 'You do not have permission to delete media.', 'pressark' )
+					);
+
+			case 'bulk_delete_media':
+				return $this->permission_require_capability(
+					$tool_name,
+					$params,
+					$context,
+					'delete_posts',
+					null,
+					__( 'You do not have permission to delete media.', 'pressark' )
+				);
+
+			case 'list_comments':
+			case 'moderate_comments':
+			case 'reply_comment':
+				return $this->permission_require_capability(
+					$tool_name,
+					$params,
+					$context,
+					'moderate_comments',
+					null,
+					__( 'You do not have permission to moderate comments.', 'pressark' )
+				);
+
+			case 'list_taxonomies':
+			case 'manage_taxonomy':
+				return $this->permission_require_capability(
+					$tool_name,
+					$params,
+					$context,
+					'manage_categories',
+					null,
+					__( 'You do not have permission to manage taxonomies.', 'pressark' )
+				);
+
+			case 'assign_terms':
+			case 'get_custom_fields':
+			case 'update_custom_field':
+				return $post_id > 0
+					? $this->permission_require_capability(
+						$tool_name,
+						$params,
+						$context,
+						'edit_post',
+						$post_id,
+						__( 'You do not have permission to edit this content.', 'pressark' )
+					)
+					: $this->permission_require_capability(
+						$tool_name,
+						$params,
+						$context,
+						'edit_posts',
+						null,
+						__( 'You do not have permission to edit this content.', 'pressark' )
+					);
+		}
+
+		return $this->entitlement_permission( $tool_name, $params, $context );
+	}
+
 	// ── Part C: Media Library ────────────────────────────────────────
 
 	/**
 	 * List media attachments, optionally filtered by post, type, or search.
 	 */
 	public function list_media( array $params ): array {
+		// PressArk v5.1.1 hardening: require upload_files before exposing media library data.
+		if ( ! current_user_can( 'upload_files' ) ) {
+			return $this->error( __( 'You do not have permission to view media.', 'pressark' ) );
+		}
 		// If post_id is provided, use get_attached_media for accurate results.
 		if ( ! empty( $params['post_id'] ) ) {
 			$post_id   = (int) $params['post_id'];
@@ -128,6 +250,10 @@ class PressArk_Handler_Media extends PressArk_Handler_Base {
 	 * Get full details of a single media attachment.
 	 */
 	public function get_media( array $params ): array {
+		// PressArk v5.1.1 hardening: require upload_files before exposing media details.
+		if ( ! current_user_can( 'upload_files' ) ) {
+			return $this->error( __( 'You do not have permission to view media.', 'pressark' ) );
+		}
 		$id = absint( $params['attachment_id'] ?? $params['media_id'] ?? $params['id'] ?? 0 );
 		if ( ! $id ) {
 			return array( 'success' => false, 'message' => __( 'Attachment ID is required.', 'pressark' ) );

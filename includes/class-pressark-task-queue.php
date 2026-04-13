@@ -700,6 +700,44 @@ class PressArk_Task_Queue {
 			$root_run_id = $run_id;
 		}
 
+		if ( class_exists( 'PressArk_Router' ) && PressArk_Router::ROUTE_PLAN === (string) $route ) {
+			PressArk_Activity_Trace::clear_current_context();
+			PressArk_Activity_Trace::set_current_context(
+				array(
+					'correlation_id' => $correlation_id,
+					'run_id'         => $run_id,
+					'task_id'        => $task_id,
+					'reservation_id' => $reservation_id,
+					'chat_id'        => (int) ( $resolved_pre['chat_id'] ?? ( $run['chat_id'] ?? 0 ) ),
+					'user_id'        => (int) ( $task['user_id'] ?? 0 ),
+					'route'          => (string) $route,
+				)
+			);
+			PressArk_Activity_Trace::publish(
+				array(
+					'event_type' => 'worker.cancelled',
+					'phase'      => 'async',
+					'status'     => 'cancelled',
+					'reason'     => 'worker_cancelled',
+					'summary'    => 'Background worker rejected a plan-mode task because plan runs must stay synchronous.',
+					'payload'    => array(
+						'parent_run_id' => $parent_run_id,
+						'root_run_id'   => $root_run_id,
+						'route'         => (string) $route,
+					),
+				)
+			);
+			if ( '' !== $reservation_id ) {
+				$reservation = new PressArk_Reservation();
+				$reservation->fail( $reservation_id, 'Plan mode tasks must execute synchronously.' );
+			}
+			if ( '' !== $run_id ) {
+				PressArk_Pipeline::fail_run( $run_id, 'Plan mode tasks must execute synchronously.' );
+			}
+			$this->store->fail( $task_id, 'Plan mode tasks must execute synchronously.' );
+			return;
+		}
+
 		PressArk_Activity_Trace::clear_current_context();
 		PressArk_Activity_Trace::set_current_context(
 			array(
@@ -821,6 +859,7 @@ class PressArk_Task_Queue {
 			$async_chat_id = (int) ( $resolved['chat_id'] ?? 0 );
 			$async_user_id = (int) $task['user_id'];
 			$agent->set_run_context( $run_id, $async_chat_id );
+			$agent->set_mode( 'execute' );
 
 			// v3.3.0: Reload fresh conversation + checkpoint from server
 			// at execution time. The enqueued snapshot may be stale if the

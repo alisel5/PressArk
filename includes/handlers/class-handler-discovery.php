@@ -419,7 +419,17 @@ class PressArk_Handler_Discovery extends PressArk_Handler_Base {
 
 		$tool_map = array();
 		foreach ( $all_tools as $tool ) {
-			$tool_map[ $tool['name'] ] = $tool['description'];
+			$name     = sanitize_key( (string) ( $tool['name'] ?? '' ) );
+			$metadata = class_exists( 'PressArk_Operation_Registry' )
+				? PressArk_Operation_Registry::get_authoritative_discovery_metadata( $name )
+				: null;
+			$tool_map[ $name ] = trim(
+				(string) (
+					$metadata['description']
+					?? $tool['description']
+					?? ''
+				)
+			);
 		}
 
 		$lines = array();

@@ -67,7 +67,9 @@ class PressArk_Read_Orchestrator {
 		foreach ( $read_calls as $tc ) {
 			$name = $tc['name'];
 			$args = $tc['arguments'] ?? array();
-			$safe = PressArk_Operation_Registry::is_concurrency_safe( $name, $args );
+			$safe = array_key_exists( '_concurrency_safe', $tc )
+				? (bool) $tc['_concurrency_safe']
+				: PressArk_Operation_Registry::is_concurrency_safe( $name, $args );
 
 			if ( null === $current_batch ) {
 				// First tool: start the first batch.
@@ -195,6 +197,17 @@ class PressArk_Read_Orchestrator {
 		callable $emit_fn,
 		callable $cancel_fn
 	): array {
+		if ( class_exists( 'PressArk_Queue_Action_Scheduler' )
+			&& method_exists( 'PressArk_Queue_Action_Scheduler', 'execute_safe_read_batch' )
+		) {
+			return PressArk_Queue_Action_Scheduler::execute_safe_read_batch(
+				$calls,
+				$execute_fn,
+				$emit_fn,
+				$cancel_fn
+			);
+		}
+
 		$results   = array();
 		$cancelled = false;
 

@@ -2,12 +2,12 @@
 /**
  * PressArk Tool Catalog
  *
- * Tool metadata: capabilities, group membership, keyword matching, and
+ * Tool metadata: groups, keyword matching, discovery ranking, and
  * schema generation.
  *
- * v3.4.0: classify() and find_group_for_tool() now delegate to the
- * Operation Registry. The CAPABILITIES constant is kept for backward
- * compatibility but the registry is the source of truth.
+ * v5.6.0: Capability and prompt metadata now come from self-describing
+ * tool objects, with the operation registry preserving execution-time
+ * routing and dynamic capability overrides.
  */
 
 if ( ! defined( 'ABSPATH' ) ) {
@@ -18,248 +18,13 @@ class PressArk_Tool_Catalog {
 
 	private static ?self $instance = null;
 
+
 	public static function instance(): self {
 		if ( null === self::$instance ) {
 			self::$instance = new self();
 		}
 		return self::$instance;
 	}
-
-	// ── Capability Map ──────────────────────────────────────────────────
-	// Every tool classified as read | preview | confirm.
-	// 'read' = auto-execute, 'preview' = live preview, 'confirm' = confirm card.
-	//
-	// @deprecated 3.4.1 Use PressArk_Operation_Registry::classify() instead.
-	// Kept for backward compatibility with any third-party code.
-
-	private const CAPABILITIES = array(
-		// Discovery.
-		'get_site_overview'        => 'read',
-		'get_site_map'             => 'read',
-		'get_brand_profile'        => 'read',
-		'get_available_tools'      => 'read',
-		'site_note'                => 'read',
-
-		// Content — reads.
-		'read_content'             => 'read',
-		'search_content'           => 'read',
-		'list_posts'               => 'read',
-		'get_random_content'       => 'read',
-
-		// Content — writes.
-		'edit_content'             => 'preview',
-		'update_meta'              => 'preview',
-		'create_post'              => 'preview',
-		'delete_content'           => 'confirm',
-
-		// SEO.
-		'analyze_seo'              => 'read',
-		'fix_seo'                  => 'preview',
-		'check_crawlability'       => 'read',
-
-		// Security.
-		'scan_security'            => 'read',
-		'fix_security'             => 'confirm',
-
-		// Settings.
-		'get_site_settings'        => 'read',
-		'update_site_settings'     => 'preview',
-		'check_email_delivery'     => 'read',
-
-		// Menus.
-		'get_menus'                => 'read',
-		'update_menu'              => 'confirm',
-
-		// Media.
-		'list_media'               => 'read',
-		'get_media'                => 'read',
-		'update_media'             => 'confirm',
-		'delete_media'             => 'confirm',
-		'regenerate_thumbnails'    => 'confirm',
-
-		// Comments.
-		'list_comments'            => 'read',
-		'moderate_comments'        => 'confirm',
-		'reply_comment'            => 'confirm',
-
-		// Taxonomy.
-		'list_taxonomies'          => 'read',
-		'manage_taxonomy'          => 'confirm',
-		'assign_terms'             => 'confirm',
-
-		// Email.
-		'get_email_log'            => 'read',
-
-		// Users.
-		'list_users'               => 'read',
-		'get_user'                 => 'read',
-		'update_user'              => 'confirm',
-
-		// Health & Diagnostics.
-		'site_health'              => 'read',
-		'inspect_hooks'            => 'read',
-		'measure_page_speed'       => 'read',
-		'profile_queries'          => 'read',
-		'get_revision_history'     => 'read',
-		'discover_rest_routes'     => 'read',
-		'diagnose_cache'           => 'read',
-		'analyze_comment_moderation' => 'read',
-		'store_health'             => 'read',
-		'site_brief'               => 'read',
-		'page_audit'               => 'read',
-
-		// Scheduled tasks.
-		'list_scheduled_tasks'     => 'read',
-		'manage_scheduled_task'    => 'confirm',
-
-		// Content generation.
-		'generate_content'         => 'read',
-		'rewrite_content'          => 'read',
-		'generate_bulk_meta'       => 'read',
-
-		// Bulk operations.
-		'bulk_edit'                => 'confirm',
-		'find_and_replace'         => 'confirm',
-
-		// Export.
-		'export_report'            => 'read',
-
-		// Site profile.
-		'view_site_profile'        => 'read',
-		'refresh_site_profile'     => 'confirm',
-
-		// Logs.
-		'list_logs'                => 'read',
-		'read_log'                 => 'read',
-		'analyze_logs'             => 'read',
-		'clear_log'                => 'confirm',
-
-		// Content index.
-		'search_knowledge'         => 'read',
-		'index_status'             => 'read',
-		'rebuild_index'            => 'confirm',
-
-		// Plugins.
-		'list_plugins'             => 'read',
-		'toggle_plugin'            => 'confirm',
-
-		// Themes.
-		'list_themes'              => 'read',
-		'get_theme_settings'       => 'read',
-		'get_customizer_schema'    => 'read',
-		'update_theme_setting'     => 'preview',
-		'switch_theme'             => 'confirm',
-
-		// Database.
-		'database_stats'           => 'read',
-		'cleanup_database'         => 'confirm',
-		'optimize_database'        => 'confirm',
-
-		// WooCommerce — reads.
-		'get_product'              => 'read',
-		'analyze_store'            => 'read',
-		'list_orders'              => 'read',
-		'get_order'                => 'read',
-		'list_customers'           => 'read',
-		'get_customer'             => 'read',
-		'get_shipping_zones'       => 'read',
-		'get_tax_settings'         => 'read',
-		'get_payment_gateways'     => 'read',
-		'get_wc_settings'          => 'read',
-		'get_wc_emails'            => 'read',
-		'get_wc_status'            => 'read',
-		'list_reviews'             => 'read',
-		'inventory_report'         => 'read',
-		'sales_summary'            => 'read',
-		'list_variations'          => 'read',
-		'get_top_sellers'          => 'read',
-		'get_order_statuses'       => 'read',
-		'get_products_on_sale'     => 'read',
-		'customer_insights'        => 'read',
-		'list_product_attributes'  => 'read',
-		'category_report'          => 'read',
-		'revenue_report'           => 'read',
-		'stock_report'             => 'read',
-		'get_wc_alerts'            => 'read',
-
-		// WooCommerce — writes.
-		'edit_product'             => 'confirm',
-		'create_product'           => 'confirm',
-		'bulk_edit_products'       => 'confirm',
-		'update_order'             => 'confirm',
-		'manage_coupon'            => 'confirm',
-		'email_customer'           => 'confirm',
-		'moderate_review'          => 'confirm',
-		'edit_variation'           => 'confirm',
-		'create_variation'         => 'confirm',
-		'bulk_edit_variations'     => 'confirm',
-		'create_refund'            => 'confirm',
-		'create_order'             => 'confirm',
-		'trigger_wc_email'         => 'confirm',
-		'manage_webhooks'          => 'read', // Dynamic — overridden in classify().
-
-		// Elementor — reads.
-		'elementor_read_page'      => 'read',
-		'elementor_find_widgets'   => 'read',
-		'elementor_list_templates' => 'read',
-		'elementor_get_styles'     => 'read',
-		'elementor_audit_page'     => 'read',
-		'elementor_site_pages'     => 'read',
-		'elementor_get_widget_schema' => 'read',
-		'elementor_get_breakpoints' => 'read',
-		'elementor_manage_conditions' => 'read',
-		'elementor_list_dynamic_tags' => 'read',
-		'elementor_read_form'      => 'read',
-		'elementor_list_popups'    => 'read',
-
-		// Elementor — writes.
-		'elementor_edit_widget'    => 'preview',
-		'elementor_add_widget'     => 'preview',
-		'elementor_add_container'  => 'preview',
-		'elementor_create_page'    => 'preview',
-		'elementor_find_replace'   => 'preview',
-		'elementor_set_dynamic_tag' => 'preview',
-		'elementor_create_from_template' => 'confirm',
-		'elementor_edit_form_field' => 'confirm',
-		'elementor_set_visibility' => 'confirm',
-		'elementor_global_styles'  => 'confirm',
-		'elementor_clone_page'     => 'confirm',
-		'elementor_edit_popup_trigger' => 'confirm',
-
-		// Blocks & FSE.
-		'read_blocks'              => 'read',
-		'edit_block'               => 'preview',
-		'insert_block'             => 'preview',
-
-		// Custom fields.
-		'get_custom_fields'        => 'read',
-		'update_custom_field'      => 'confirm',
-
-		// Forms.
-		'list_forms'               => 'read',
-
-		// Templates & design.
-		'get_templates'            => 'read',
-		'edit_template'            => 'preview',
-		'get_design_system'        => 'read',
-		'list_patterns'            => 'read',
-		'insert_pattern'           => 'preview',
-
-		// Multisite.
-		'network_overview'         => 'read',
-
-		// REST endpoint (dynamic — overridden in classify()).
-		'call_rest_endpoint'       => 'read',
-
-		// Meta-tools (always loaded).
-		'load_tool_group'          => 'read',
-		'discover_tools'           => 'read',
-		'load_tools'               => 'read',
-
-		// Resource bridge (v5.1.0).
-		'list_resources'           => 'read',
-		'read_resource'            => 'read',
-	);
 
 	// ── Group Keyword Patterns ──────────────────────────────────────────
 	// Used to match user messages to tool groups.
@@ -304,24 +69,27 @@ class PressArk_Tool_Catalog {
 
 	/**
 	 * Classify a tool's capability (read, preview, or confirm).
-	 * Handles dynamic tools (call_rest_endpoint, manage_webhooks).
+	 * Dynamic overrides remain in the operation registry so tools like
+	 * call_rest_endpoint can switch mode based on input.
 	 *
-	 * v3.4.0: Delegates to Operation Registry as primary source.
-	 * v3.4.1: Registry is sole source of truth. CAPABILITIES kept as fallback
-	 *         for any third-party tools not in the registry.
+	 * v5.6.0: Uses tool object metadata before falling back to the usage tracker.
 	 */
 	public function classify( string $tool_name, array $args = array() ): string {
-		// v3.4.0: Registry is the primary source of truth.
+		$tool_name = sanitize_key( $tool_name );
+
+		if ( '' === $tool_name ) {
+			return 'read';
+		}
+
 		if ( PressArk_Operation_Registry::exists( $tool_name ) ) {
 			return PressArk_Operation_Registry::classify( $tool_name, $args );
 		}
 
-		// Fallback: static CAPABILITIES map (backward compat for any unregistered tools).
-		if ( isset( self::CAPABILITIES[ $tool_name ] ) ) {
-			return self::CAPABILITIES[ $tool_name ];
+		$tool = $this->resolve_tool_object( $tool_name );
+		if ( is_object( $tool ) && method_exists( $tool, 'is_readonly' ) ) {
+			return $tool->is_readonly() ? 'read' : 'confirm';
 		}
 
-		// Fallback: check usage tracker for write detection.
 		$tracker = new PressArk_Usage_Tracker();
 		if ( $tracker->is_write_action( $tool_name ) ) {
 			return 'confirm';
@@ -421,7 +189,7 @@ class PressArk_Tool_Catalog {
 	public function get_all_tool_names( bool $include_meta = true ): array {
 		$has_woo        = class_exists( 'WooCommerce' );
 		$has_elementor  = class_exists( '\\Elementor\\Plugin' );
-		$all_tools      = PressArk_Tools::get_all( $has_woo, $has_elementor );
+		$all_tools      = $this->get_tool_summary_rows( $has_woo, $has_elementor );
 		$normalized     = array_values( array_filter( array_map(
 			static function ( array $tool ): string {
 				return sanitize_key( (string) ( $tool['name'] ?? '' ) );
@@ -449,14 +217,45 @@ class PressArk_Tool_Catalog {
 	public function get_schemas( array $tool_names ): array {
 		$has_woo       = class_exists( 'WooCommerce' );
 		$has_elementor = class_exists( '\\Elementor\\Plugin' );
-		$all_tools     = PressArk_Tools::get_all( $has_woo, $has_elementor );
-		$tool_names_set = array_flip( $this->normalize_string_list( $tool_names ) );
+		$legacy_tools  = $this->get_legacy_tool_definition_map( $has_woo, $has_elementor );
+		$requested     = $this->normalize_string_list( $tool_names );
+		$tool_names_set = array_flip( $requested );
 
-		$schemas = array();
-		foreach ( $all_tools as $tool ) {
-			if ( isset( $tool_names_set[ $tool['name'] ] ) ) {
-				$schemas[] = PressArk_Tools::tool_to_schema( $tool );
+		$schemas      = array();
+		$schema_names = array();
+		foreach ( $requested as $requested_name ) {
+			$name = PressArk_Operation_Registry::resolve_alias( $requested_name );
+			$tool = $this->resolve_tool_object( $name );
+			if ( in_array( $name, array( 'discover_tools', 'load_tools', 'load_tool_group' ), true ) ) {
+				continue;
 			}
+
+			$schema = null;
+			if ( PressArk_Operation_Registry::exists( $name ) ) {
+				$schema = $this->build_authoritative_schema(
+					$name,
+					$legacy_tools[ $name ] ?? null
+				);
+			}
+			if ( ! is_array( $schema ) && is_object( $tool ) && method_exists( $tool, 'to_legacy_definition' ) ) {
+				$schema = PressArk_Tools::tool_to_schema( $tool->to_legacy_definition() );
+			}
+			if ( ! is_array( $schema ) && isset( $legacy_tools[ $name ] ) ) {
+				$schema = PressArk_Tools::tool_to_schema( $legacy_tools[ $name ] );
+			}
+			if ( ! is_array( $schema ) ) {
+				continue;
+			}
+			if ( isset( $schema_names[ $name ] ) ) {
+				continue;
+			}
+
+			$preference = $this->schema_preference_weight( $name, $tool );
+			if ( 0 !== $preference ) {
+				$schema['x-pressark-preference'] = $preference;
+			}
+			$schema_names[ $name ] = true;
+			$schemas[] = $schema;
 		}
 
 		// Add meta-tool schemas (v2.3.1: discover_tools + load_tools).
@@ -497,37 +296,22 @@ class PressArk_Tool_Catalog {
 		$has_woo       = class_exists( 'WooCommerce' );
 		$has_elementor = class_exists( '\\Elementor\\Plugin' );
 		$loaded_set    = array_flip( $this->normalize_string_list( $loaded_names ) );
-
-		// Lazy-load PressArk_Tools descriptions only if registry descriptions are missing.
-		$tools_fallback = null;
+		$all_tools     = $this->get_tool_summary_rows( $has_woo, $has_elementor );
+		$tool_group_map = $this->build_tool_group_map();
 
 		$lines = array();
-		foreach ( PressArk_Operation_Registry::all() as $op ) {
-			// Skip already-loaded tools and meta-tools.
-			if ( isset( $loaded_set[ $op->name ] ) || $op->is_meta() ) {
-				continue;
-			}
-			// Skip conditional plugins if not active.
-			if ( 'woocommerce' === $op->requires && ! $has_woo ) {
-				continue;
-			}
-			if ( 'elementor' === $op->requires && ! $has_elementor ) {
+		foreach ( $all_tools as $tool ) {
+			$name = sanitize_key( (string) ( $tool['name'] ?? '' ) );
+			if ( '' === $name || isset( $loaded_set[ $name ] ) ) {
 				continue;
 			}
 
-			$desc = $op->description;
-			if ( empty( $desc ) ) {
-				// Fallback: pull from PressArk_Tools during transition.
-				if ( null === $tools_fallback ) {
-					$tools_fallback = array();
-					foreach ( PressArk_Tools::get_all( $has_woo, $has_elementor ) as $t ) {
-						$tools_fallback[ $t['name'] ] = $t['description'] ?? '';
-					}
-				}
-				$desc = $tools_fallback[ $op->name ] ?? '';
-			}
+			$desc  = sanitize_text_field( (string) ( $tool['description'] ?? '' ) );
+			$group = (string) ( $tool_group_map[ $name ] ?? '' );
 
-			$lines[] = '- ' . $op->name . ' (' . $op->group . '): ' . $desc;
+			$lines[] = '' !== $group
+				? '- ' . $name . ' (' . $group . '): ' . $desc
+				: '- ' . $name . ': ' . $desc;
 		}
 
 		if ( empty( $lines ) ) {
@@ -812,9 +596,16 @@ class PressArk_Tool_Catalog {
 
 		$has_woo        = class_exists( 'WooCommerce' );
 		$has_elementor  = class_exists( '\\Elementor\\Plugin' );
-		$all_tools      = PressArk_Tools::get_all( $has_woo, $has_elementor );
+		$all_tools      = $this->get_tool_summary_rows( $has_woo, $has_elementor );
 		$loaded_set     = array_flip( $this->normalize_string_list( $loaded_names ) );
 		$tool_group_map = $this->build_tool_group_map();
+		$tool_map       = array();
+		foreach ( $all_tools as $tool ) {
+			$name = sanitize_key( (string) ( $tool['name'] ?? '' ) );
+			if ( '' !== $name ) {
+				$tool_map[ $name ] = $tool;
+			}
+		}
 
 		// Tokenize query into words for multi-word matching.
 		$query_words = array_values( array_filter( preg_split( '/\s+/', $query_lower ) ) );
@@ -847,7 +638,7 @@ class PressArk_Tool_Catalog {
 		foreach ( $all_tools as $tool ) {
 			$candidate = $this->score_discovery_tool(
 				$tool,
-				(string) ( $tool_group_map[ $tool['name'] ] ?? '' ),
+				(string) ( $tool['group'] ?? $tool_group_map[ $tool['name'] ] ?? '' ),
 				$query_lower,
 				$query_words,
 				$loaded_set,
@@ -886,15 +677,12 @@ class PressArk_Tool_Catalog {
 				if ( isset( $seen[ $tool_name ] ) ) {
 					continue;
 				}
+				if ( ! isset( $tool_map[ $tool_name ] ) ) {
+					continue;
+				}
 				$seen[ $tool_name ] = true;
 
-				$desc = '';
-				foreach ( $all_tools as $t ) {
-					if ( $t['name'] === $tool_name ) {
-						$desc = $t['description'] ?? '';
-						break;
-					}
-				}
+				$desc = (string) ( $tool_map[ $tool_name ]['description'] ?? '' );
 
 				$candidate = $this->score_discovery_tool(
 					array(
@@ -1013,8 +801,13 @@ class PressArk_Tool_Catalog {
 		}
 
 		$operation = PressArk_Operation_Registry::resolve( $name );
+		$search_hint = sanitize_text_field( (string) ( $tool['search_hint'] ?? '' ) );
 		if ( $operation ) {
-			$score += $this->score_search_hint_match( $operation->search_hint, $query_words );
+			if ( '' === $search_hint ) {
+				$search_hint = PressArk_Operation_Registry::get_search_hint( $name );
+			}
+
+			$score += $this->score_search_hint_match( $search_hint, $query_lower, $query_words );
 			$score += $this->score_tag_match( $operation->tags, $query_words );
 			$score += $this->discovery_legality_bonus( $decision );
 			$score += $this->discovery_evidence_bonus( $operation );
@@ -1028,6 +821,8 @@ class PressArk_Tool_Catalog {
 			if ( $operation->is_deferred() ) {
 				$score += 4;
 			}
+		} elseif ( '' !== $search_hint ) {
+			$score += $this->score_search_hint_match( $search_hint, $query_lower, $query_words );
 		}
 
 		$score += $this->health_score_adjustment( $group_health, 'tool' );
@@ -1272,16 +1067,19 @@ class PressArk_Tool_Catalog {
 	 * @param string[] $query_words Query tokens.
 	 * @return int
 	 */
-	private function score_search_hint_match( string $search_hint, array $query_words ): int {
+	private function score_search_hint_match( string $search_hint, string $query_lower, array $query_words ): int {
 		$hint = strtolower( trim( $search_hint ) );
 		if ( '' === $hint ) {
 			return 0;
 		}
 
 		$score = 0;
+		if ( '' !== $query_lower && str_contains( $hint, $query_lower ) ) {
+			$score += 24;
+		}
 		foreach ( $query_words as $word ) {
 			if ( strlen( $word ) >= 2 && str_contains( $hint, $word ) ) {
-				$score += 10;
+				$score += 12;
 			}
 		}
 
@@ -1475,6 +1273,155 @@ class PressArk_Tool_Catalog {
 		}
 
 		return array_values( array_unique( $normalized ) );
+	}
+
+	/**
+	 * Build a registry-first summary row set for discovery and visibility flows.
+	 *
+	 * @param bool $has_woo       Whether WooCommerce is active.
+	 * @param bool $has_elementor Whether Elementor is active.
+	 * @return array<int,array{name: string, description: string}>
+	 */
+	private function get_tool_summary_rows( bool $has_woo, bool $has_elementor ): array {
+		$legacy = $this->get_legacy_tool_definition_map( $has_woo, $has_elementor );
+		$rows   = array();
+
+		foreach ( PressArk_Operation_Registry::all() as $op ) {
+			if ( $op->is_meta() ) {
+				continue;
+			}
+			if ( 'woocommerce' === $op->requires && ! $has_woo ) {
+				continue;
+			}
+			if ( 'elementor' === $op->requires && ! $has_elementor ) {
+				continue;
+			}
+			if (
+				! isset( $legacy[ $op->name ] )
+				&& ! is_array( PressArk_Operation_Registry::get_authoritative_provider_schema_data( $op->name ) )
+			) {
+				continue;
+			}
+
+			$rows[] = array(
+				'name'           => $op->name,
+				'description'    => $this->authoritative_tool_description(
+					$op->name,
+					$legacy[ $op->name ] ?? null
+				),
+				'search_hint'    => PressArk_Operation_Registry::get_search_hint( $op->name ),
+				'group'          => PressArk_Operation_Registry::get_group( $op->name ),
+				'loading_intent' => PressArk_Operation_Registry::get_loading_intent( $op->name ),
+			);
+			unset( $legacy[ $op->name ] );
+		}
+
+		foreach ( $legacy as $tool ) {
+			$name = sanitize_key( (string) ( $tool['name'] ?? '' ) );
+			if ( '' === $name || in_array( $name, array( 'discover_tools', 'load_tools', 'load_tool_group' ), true ) ) {
+				continue;
+			}
+
+			$rows[] = array(
+				'name'           => $name,
+				'description'    => sanitize_text_field( (string) ( $tool['description'] ?? '' ) ),
+				'search_hint'    => '',
+				'group'          => sanitize_key( (string) ( $tool['group'] ?? '' ) ),
+				'loading_intent' => 'auto',
+			);
+		}
+
+		return $rows;
+	}
+
+	/**
+	 * Build a legacy tool definition map keyed by tool name.
+	 *
+	 * @param bool $has_woo       Whether WooCommerce is active.
+	 * @param bool $has_elementor Whether Elementor is active.
+	 * @return array<string,array<string,mixed>>
+	 */
+	private function get_legacy_tool_definition_map( bool $has_woo, bool $has_elementor ): array {
+		$map = array();
+
+		foreach ( PressArk_Tools::get_tools_by_names( PressArk_Tools::get_registered_tool_names(), $has_woo, $has_elementor ) as $tool ) {
+			if ( ! is_object( $tool ) || ! method_exists( $tool, 'to_legacy_definition' ) ) {
+				continue;
+			}
+
+			$definition = $tool->to_legacy_definition();
+			$name       = sanitize_key( (string) ( $definition['name'] ?? '' ) );
+			if ( '' !== $name ) {
+				$map[ $name ] = $definition;
+			}
+		}
+
+		return $map;
+	}
+
+	/**
+	 * Resolve the registry-first description for one tool with legacy fallback.
+	 *
+	 * @param array<string,mixed>|null $legacy_tool Legacy tool definition.
+	 */
+	private function authoritative_tool_description( string $tool_name, ?array $legacy_tool = null ): string {
+		$metadata = PressArk_Operation_Registry::get_discovery_metadata( $tool_name );
+		$desc     = is_array( $metadata )
+			? trim( (string) ( $metadata['description'] ?? '' ) )
+			: '';
+
+		if ( '' === $desc ) {
+			$desc = trim( (string) ( $legacy_tool['description'] ?? '' ) );
+		}
+
+		return sanitize_text_field( $desc );
+	}
+
+	/**
+	 * Build an outward provider schema from registry authority, with a legacy
+	 * description fallback for partially-ported tools.
+	 *
+	 * @param array<string,mixed>|null $legacy_tool Legacy tool definition.
+	 * @return array<string,mixed>|null
+	 */
+	private function build_authoritative_schema( string $tool_name, ?array $legacy_tool = null ): ?array {
+		$schema = PressArk_Operation_Registry::build_authoritative_provider_schema( $tool_name );
+		if ( ! is_array( $schema ) ) {
+			return null;
+		}
+
+		$description = trim( (string) ( $schema['function']['description'] ?? '' ) );
+		if ( '' === $description && ! empty( $legacy_tool['description'] ) ) {
+			$schema['function']['description'] = sanitize_text_field( (string) $legacy_tool['description'] );
+		}
+
+		return $schema;
+	}
+
+	/**
+	 * Resolve one self-describing tool object when available.
+	 */
+	private function resolve_tool_object( string $tool_name ) {
+		if ( ! class_exists( 'PressArk_Tools' ) ) {
+			return null;
+		}
+
+		return PressArk_Tools::get_tool( $tool_name );
+	}
+
+	/**
+	 * Extract the prompt-side preference weight from the tool object metadata.
+	 */
+	private function schema_preference_weight( string $tool_name, $tool = null ): int {
+		if ( ! is_object( $tool ) ) {
+			$tool = $this->resolve_tool_object( $tool_name );
+		}
+
+		if ( ! is_object( $tool ) || ! method_exists( $tool, 'get_prompt_snippet' ) ) {
+			return 0;
+		}
+
+		return PressArk_Tools::extract_prompt_weight( (string) $tool->get_prompt_snippet() );
 	}
 
 	/**

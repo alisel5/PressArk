@@ -36,6 +36,18 @@ abstract class PressArk_Handler_Base {
 	}
 
 	/**
+	 * Fast pre-execution permission probe for a tool owned by this handler.
+	 *
+	 * Handlers override this when they need capability-aware decisions before
+	 * the action runs. The default implementation only checks entitlements.
+	 *
+	 * @since 5.6.0
+	 */
+	public function check_permissions( string $tool_name, array $params, array $context = array() ): array {
+		return $this->entitlement_permission( $tool_name, $params, $context );
+	}
+
+	/**
 	 * v3.7.1: Attach async task context for business idempotency.
 	 * Called by the task queue before dispatching to the agent/engine.
 	 *
@@ -106,6 +118,334 @@ abstract class PressArk_Handler_Base {
 			),
 			$extra
 		);
+	}
+
+	/**
+	 * Build a normalized allow decision.
+	 *
+	 * @since 5.6.0
+	 */
+	protected function permission_allow( array $extra = array() ): array {
+		return array_merge(
+			array(
+				'allowed'   => true,
+				'behavior'  => 'allow',
+				'reason'    => '',
+				'ui_action' => 'none',
+			),
+			$extra
+		);
+	}
+
+	/**
+	 * Build a normalized ask decision.
+	 *
+	 * @since 5.6.0
+	 */
+	protected function permission_ask( string $reason, string $ui_action = 'approval_dialog', array $extra = array() ): array {
+		return array_merge(
+			array(
+				'allowed'   => false,
+				'behavior'  => 'ask',
+				'reason'    => $reason,
+				'ui_action' => $ui_action,
+			),
+			$extra
+		);
+	}
+
+	/**
+	 * Build a normalized block decision.
+	 *
+	 * @since 5.6.0
+	 */
+	protected function permission_block( string $reason, array $extra = array() ): array {
+		return array_merge(
+			array(
+				'allowed'   => false,
+				'behavior'  => 'block',
+				'reason'    => $reason,
+				'ui_action' => 'none',
+			),
+			$extra
+		);
+	}
+
+	/**
+	 * Check only entitlements for the current tool and user.
+	 *
+	 * @since 5.6.0
+	 */
+	protected function entitlement_permission( string $tool_name, array $params, array $context = array() ): array {
+		if ( ! class_exists( 'PressArk_Entitlements' ) ) {
+			return $this->permission_allow();
+		}
+
+		$user_id = max(
+			0,
+			(int) (
+				$context['user_id']
+				?? get_current_user_id()
+			)
+		);
+
+		return PressArk_Entitlements::check_tool_permission( $tool_name, $params, $user_id );
+	}
+
+	/**
+	 * Require a capability before falling through to entitlements.
+	 *
+	 * @since 5.6.0
+	 */
+	protected function permission_require_capability(
+		string $tool_name,
+		array $params,
+		array $context,
+		string $capability,
+		?int $object_id = null,
+		string $message = ''
+	): array {
+		$has = $object_id
+			? current_user_can( $capability, $object_id )
+			: current_user_can( $capability );
+
+		if ( ! $has ) {
+			return $this->permission_block(
+				'' !== $message
+					? $message
+					: __( 'You do not have permission to perform this action.', 'pressark' ),
+				array( 'tool_name' => $tool_name )
+			);
+		}
+
+		return $this->entitlement_permission( $tool_name, $params, $context );
+	}
+
+	/**
+	 * Require one of several capabilities before entitlements.
+	 *
+	 * @since 5.6.0
+	 * @param string[] $capabilities Capability names.
+	 */
+	protected function permission_require_any_capability(
+		string $tool_name,
+		array $params,
+		array $context,
+		array $capabilities,
+		?int $object_id = null,
+		string $message = ''
+	): array {
+		foreach ( array_values( array_filter( array_map( 'strval', $capabilities ) ) ) as $capability ) {
+			$has = $object_id
+				? current_user_can( $capability, $object_id )
+				: current_user_can( $capability );
+
+			if ( $has ) {
+				return $this->entitlement_permission( $tool_name, $params, $context );
+			}
+		}
+
+		return $this->permission_block(
+			'' !== $message
+				? $message
+				: __( 'You do not have permission to perform this action.', 'pressark' ),
+			array( 'tool_name' => $tool_name )
+		);
+	}
+
+	/**
+	 * Require WooCommerce and an optional capability before entitlements.
+	 *
+	 * @since 5.6.0
+	 */
+	protected function permission_require_wc(
+		string $tool_name,
+		array $params,
+		array $context,
+		string $capability = '',
+		?int $object_id = null,
+		string $message = ''
+	): array {
+		if ( ! class_exists( 'WooCommerce' ) ) {
+			return $this->permission_block(
+				__( 'WooCommerce is not active.', 'pressark' ),
+				array( 'tool_name' => $tool_name )
+			);
+		}
+
+		if ( '' !== $capability ) {
+			return $this->permission_require_capability( $tool_name, $params, $context, $capability, $object_id, $message );
+		}
+
+		return $this->entitlement_permission( $tool_name, $params, $context );
+	}
+
+	/**
+	 * Require Elementor and an optional capability before entitlements.
+	 *
+	 * @since 5.6.0
+	 */
+	protected function permission_require_elementor(
+		string $tool_name,
+		array $params,
+		array $context,
+		string $capability = '',
+		?int $object_id = null,
+		string $message = ''
+	): array {
+		if ( ! PressArk_Elementor::is_active() ) {
+			return $this->permission_block(
+				__( 'Elementor is not active.', 'pressark' ),
+				array( 'tool_name' => $tool_name )
+			);
+		}
+
+		if ( '' !== $capability ) {
+			return $this->permission_require_capability( $tool_name, $params, $context, $capability, $object_id, $message );
+		}
+
+		return $this->entitlement_permission( $tool_name, $params, $context );
+	}
+
+	/**
+	 * Require Elementor write support before entitlements.
+	 *
+	 * @since 5.6.0
+	 */
+	protected function permission_require_elementor_write(
+		string $tool_name,
+		array $params,
+		array $context,
+		string $minimum_version = '',
+		string $capability = '',
+		?int $object_id = null,
+		string $message = ''
+	): array {
+		$permission = $this->permission_require_elementor( $tool_name, $params, $context );
+		if ( 'allow' !== ( $permission['behavior'] ?? 'allow' ) ) {
+			return $permission;
+		}
+
+		if ( '' !== $minimum_version && defined( 'ELEMENTOR_VERSION' ) && version_compare( ELEMENTOR_VERSION, $minimum_version, '<' ) ) {
+			return $this->permission_block(
+				sprintf(
+					/* translators: 1: current Elementor version, 2: minimum required version */
+					__( 'Elementor %1$s is too old for safe write operations. Please update to %2$s or newer.', 'pressark' ),
+					ELEMENTOR_VERSION,
+					$minimum_version
+				),
+				array( 'tool_name' => $tool_name )
+			);
+		}
+
+		if ( '' !== $capability ) {
+			return $this->permission_require_capability( $tool_name, $params, $context, $capability, $object_id, $message );
+		}
+
+		return $this->entitlement_permission( $tool_name, $params, $context );
+	}
+
+	/**
+	 * Resolve a common post_id shape for permission probes.
+	 *
+	 * @since 5.6.0
+	 */
+	protected function permission_post_id( array $params ): int {
+		return absint( $params['post_id'] ?? $params['id'] ?? 0 );
+	}
+
+	/**
+	 * v5.6.0: Streaming progress via on_progress callback (inspired by Claude Code Tool.ts pattern).
+	 *
+	 * Sanitizes incremental progress payloads before they are emitted and
+	 * ensures callback failures never interrupt the underlying tool.
+	 *
+	 * @param callable|null $on_progress Optional progress callback.
+	 * @param array         $data        Incremental progress payload.
+	 */
+	protected function emit_progress( ?callable $on_progress, array $data ): void {
+		if ( ! is_callable( $on_progress ) ) {
+			return;
+		}
+
+		$sanitized = $this->sanitize_progress_payload( $data );
+		if ( empty( $sanitized ) ) {
+			return;
+		}
+
+		$serialized = wp_json_encode( $sanitized );
+		$tokens     = (int) ceil( max( 0, is_string( $serialized ) ? mb_strlen( $serialized ) : 0 ) / 4 );
+
+		try {
+			$on_progress( $sanitized );
+		} catch ( \Throwable $e ) {
+			PressArk_Error_Tracker::warning(
+				'HandlerBase',
+				'Progress callback failed during handler execution',
+				array(
+					'handler'          => static::class,
+					'progress_tokens'  => $tokens,
+					'progress_keys'    => array_keys( $sanitized ),
+					'error'            => $e->getMessage(),
+				)
+			);
+		}
+	}
+
+	/**
+	 * Sanitize streamed progress payloads so transient UI updates do not expose
+	 * secrets or personal data.
+	 *
+	 * @param mixed       $value Progress value.
+	 * @param string|null $key   Current field name.
+	 * @return mixed
+	 */
+	private function sanitize_progress_payload( $value, ?string $key = null ) {
+		if ( is_array( $value ) ) {
+			$sanitized = array();
+			foreach ( $value as $child_key => $child_value ) {
+				$normalized_key = is_string( $child_key ) ? $child_key : (string) $child_key;
+				$sanitized_value = $this->sanitize_progress_payload( $child_value, $normalized_key );
+				if ( null === $sanitized_value ) {
+					continue;
+				}
+				$sanitized[ $normalized_key ] = $sanitized_value;
+			}
+			return $sanitized;
+		}
+
+		if ( is_object( $value ) ) {
+			return $this->sanitize_progress_payload( (array) $value, $key );
+		}
+
+		if ( is_bool( $value ) || is_int( $value ) || is_float( $value ) || null === $value ) {
+			return $value;
+		}
+
+		$text     = sanitize_text_field( (string) $value );
+		$key_name = strtolower( (string) $key );
+
+		if ( '' === $text ) {
+			return '';
+		}
+
+		if ( '' !== $key_name && preg_match( '/(email|e-mail|api[_-]?key|token|secret|password|authorization|auth)/i', $key_name ) ) {
+			return '[redacted]';
+		}
+
+		if ( preg_match( '/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i', $text ) ) {
+			return '[redacted-email]';
+		}
+
+		if ( preg_match( '/\b(?:sk|pk|rk|api)[-_][A-Za-z0-9_-]{8,}\b/', $text ) ) {
+			return '[redacted-secret]';
+		}
+
+		if ( mb_strlen( $text ) > 240 ) {
+			$text = mb_substr( $text, 0, 240 ) . '...';
+		}
+
+		return $text;
 	}
 
 	// ── Capability Helpers ──────────────────────────────────────────────

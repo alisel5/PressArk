@@ -80,6 +80,8 @@
 		pollRequestInFlight: false,
 		_activeRequest: null,
 		_activeRunId: null,
+		_confirmStreamActive: false,
+		_toolProgressState: {},
 		activePreviewFooterEl: null,
 
 		init: function () {
@@ -1195,6 +1197,543 @@
 			return msgEl;
 		},
 
+		presentResult: function (result, options) {
+			options = options || {};
+			var silentContinuation = !!options.silentContinuation;
+			var responseType = result.type || 'final_response';
+
+			if (responseType === 'permission_required') {
+				var permissionReply = result.reply || result.message || 'This action needs permission before it can run.';
+				if (result.upgrade_prompt) {
+					var permissionUpgradeUrl = (result.upgrade_url || window.pressarkData.upgradeUrl || '#');
+					permissionReply += '\n\n[Upgrade your plan](' + permissionUpgradeUrl + ')';
+				}
+				if (permissionReply) {
+					this.appendAssistantResultMessage(permissionReply, result);
+					this.conversation.push({ role: 'assistant', content: permissionReply });
+				}
+			} else if (responseType === 'queued') {
+				this.pendingTaskCount = Math.max(this.pendingTaskCount, 1);
+				this.syncTaskPolling(true);
+				this.appendAssistantResultMessage(result.message || 'Working on that in the background...', result);
+				this.conversation.push({ role: 'assistant', content: result.message || '' });
+			} else if (responseType === 'preview') {
+				if (result.reply) {
+					this.appendAssistantResultMessage(result.reply, result);
+					this.conversation.push({ role: 'assistant', content: result.reply });
+				}
+				this.openPreview({
+					preview_session_id: result.preview_session_id,
+					preview_url: result.preview_url,
+					diff: result.diff,
+					risk_receipt: result.risk_receipt,
+				});
+			} else if (responseType === 'confirm_card') {
+				if (result.reply) {
+					this.appendAssistantResultMessage(result.reply, result);
+					this.conversation.push({ role: 'assistant', content: result.reply });
+				}
+				if (result.pending_actions && result.pending_actions.length > 0) {
+					for (var p = 0; p < result.pending_actions.length; p++) {
+						this.renderPreviewCard(result.pending_actions[p], result.run_id || '', p);
+					}
+				}
+			} else if (responseType === 'plan_ready') {
+				var planReply = result.reply || result.message || 'Plan ready. Review the checklist below, then approve, revise, or cancel.';
+				if (planReply && !silentContinuation) {
+					this.appendAssistantResultMessage(planReply, result);
+					this.conversation.push({ role: 'assistant', content: planReply });
+				}
+				this.renderPlanReadyCard(result);
+			} else {
+				var reply = result.reply || result.message || (result.is_error ? 'Something went wrong.' : '');
+				if (reply && !silentContinuation) {
+					this.appendAssistantResultMessage(reply, result);
+					this.conversation.push({ role: 'assistant', content: reply });
+				}
+
+				if (result.pending_actions && result.pending_actions.length > 0) {
+					for (var p2 = 0; p2 < result.pending_actions.length; p2++) {
+						this.renderPreviewCard(result.pending_actions[p2], result.run_id || '', p2);
+					}
+				}
+
+				if (result.actions_performed && result.actions_performed.length > 0) {
+					for (var i = 0; i < result.actions_performed.length; i++) {
+						this.addActionResult(result.actions_performed[i]);
+					}
+				}
+			}
+
+			this.applyResultState(result);
+
+			if (result.suggestions) {
+				this.renderSuggestionChips(result.suggestions);
+			}
+
+			this.autoSaveChat();
+		},
+
+		normalizePlanSteps: function (planData) {
+			var rawSteps = [];
+			if (Array.isArray(planData)) {
+				rawSteps = planData;
+			} else if (planData && Array.isArray(planData.steps)) {
+				rawSteps = planData.steps;
+			} else if (planData && Array.isArray(planData.plan_steps)) {
+				rawSteps = planData.plan_steps;
+			} else if (planData && typeof planData.plan_markdown === 'string' && planData.plan_markdown) {
+				var planLines = planData.plan_markdown.split(/\r?\n/);
+				for (var i = 0; i < planLines.length; i++) {
+					var match = planLines[i].match(/^\s*\d+\.\s+(.+)$/);
+					if (match && match[1]) {
+						rawSteps.push(match[1]);
+					}
+				}
+			}
+
+			var normalized = [];
+			for (var s = 0; s < rawSteps.length; s++) {
+				var step = rawSteps[s];
+				if (typeof step === 'string') {
+					if (step.trim()) {
+						normalized.push({ status: 'pending', text: step.trim() });
+					}
+					continue;
+				}
+				if (!step || typeof step !== 'object') {
+					continue;
+				}
+				var text = step.text || step.label || step.title || '';
+				if (!text) {
+					continue;
+				}
+				normalized.push({
+					status: step.status || 'pending',
+					text: text
+				});
+			}
+
+			return normalized;
+		},
+
+		renderPlanReadyCard: function (planData, hostEl) {
+			if (!planData) return null;
+
+			var container = hostEl || this.messagesEl;
+			if (!container) return null;
+
+			var steps = this.normalizePlanSteps(planData);
+			var runId = planData.run_id || planData.runId || '';
+			var approveEndpoint = planData.approve_endpoint || planData.approveEndpoint || planData.execute_endpoint || planData.executeEndpoint || '';
+			var executeEndpoint = planData.execute_endpoint || planData.executeEndpoint || approveEndpoint || '';
+			var reviseEndpoint = planData.revise_endpoint || planData.reviseEndpoint || '';
+			var rejectEndpoint = planData.reject_endpoint || planData.rejectEndpoint || '';
+			var approvalLevel = String(planData.approval_level || planData.approvalLevel || 'hard');
+			var planPhase = String(planData.plan_phase || planData.planPhase || 'planning');
+			var artifact = planData.plan_artifact && typeof planData.plan_artifact === 'object' ? planData.plan_artifact : {};
+			var summaryText = artifact.request_summary || planData.request_summary || planData.reply || planData.message || 'Plan ready.';
+			var planVersion = artifact.version ? String(artifact.version) : '';
+			var canExecute = !!approveEndpoint && planData.can_execute !== false && steps.length > 0;
+			var existing = null;
+			var cards = container.querySelectorAll('.pressark-plan-card');
+
+			for (var i = 0; i < cards.length; i++) {
+				if (runId && cards[i].dataset.runId === runId) {
+					existing = cards[i];
+					break;
+				}
+			}
+
+			var card = existing || document.createElement('div');
+			card.className = 'pressark-plan-card';
+			if (runId) {
+				card.dataset.runId = runId;
+			}
+
+			var stepsHtml = '';
+			for (var s = 0; s < steps.length; s++) {
+				stepsHtml += '<li class="step-' + this.escapeHtml(steps[s].status || 'pending') + '">' + this.escapeHtml(steps[s].text) + '</li>';
+			}
+
+			var summary = 'Plan ready';
+			if (steps.length > 0) {
+				summary += ' - ' + steps.length + ' step' + (steps.length === 1 ? '' : 's');
+			}
+
+			var phaseLabelMap = {
+				exploring: 'Exploring',
+				planning: 'Planning',
+				ready: 'Ready',
+				executing: 'Executing'
+			};
+			var phaseLabel = phaseLabelMap[planPhase] || 'Planning';
+			var approvalLabel = approvalLevel === 'soft' ? 'Soft plan' : 'Hard approval';
+			var approveLabel = approvalLevel === 'soft' ? 'Execute' : 'Approve & Execute';
+
+			var bodyHtml = '';
+			bodyHtml +=
+				'<div class="pressark-plan-meta">' +
+				'<span class="pressark-plan-badge pressark-plan-phase">' + this.escapeHtml(phaseLabel) + '</span>' +
+				'<span class="pressark-plan-badge pressark-plan-approval">' + this.escapeHtml(approvalLabel) + '</span>' +
+				(planVersion ? '<span class="pressark-plan-badge pressark-plan-version">v' + this.escapeHtml(planVersion) + '</span>' : '') +
+				'</div>';
+
+			if (summaryText) {
+				bodyHtml += '<div class="pressark-plan-description">' + this.escapeHtml(summaryText) + '</div>';
+			}
+
+			if (stepsHtml) {
+				bodyHtml += '<ol class="pressark-plan-steps">' + stepsHtml + '</ol>';
+			}
+
+			if (runId && (canExecute || reviseEndpoint || rejectEndpoint)) {
+				bodyHtml +=
+					'<div class="pressark-plan-revision-wrap">' +
+					'<textarea class="pressark-plan-revision-note" rows="2" placeholder="Add constraints or revision notes"></textarea>' +
+					'</div>';
+				bodyHtml +=
+					'<div class="pressark-preview-actions pressark-plan-actions">' +
+					(canExecute
+						? '<button type="button" class="pressark-preview-confirm pressark-plan-approve">' + this.escapeHtml(approveLabel) + '</button>'
+						: '') +
+					(reviseEndpoint
+						? '<button type="button" class="pressark-plan-revise">Revise Plan</button>'
+						: '') +
+					(rejectEndpoint
+						? '<button type="button" class="pressark-preview-cancel pressark-plan-reject">Reject / Cancel</button>'
+						: '') +
+					'</div>';
+				bodyHtml += '<div class="pressark-plan-action-status" aria-live="polite"></div>';
+			}
+
+			card.innerHTML =
+				'<div class="pressark-plan-header">' +
+				'<span class="pressark-plan-summary">' + this.escapeHtml(summary) + '</span>' +
+				'</div>' +
+				bodyHtml;
+
+			var self = this;
+			var header = card.querySelector('.pressark-plan-header');
+			if (header) {
+				header.addEventListener('click', function (event) {
+					if (event.target && event.target.closest && event.target.closest('.pressark-plan-actions, .pressark-plan-revision-wrap')) {
+						return;
+					}
+					card.classList.toggle('collapsed');
+				});
+			}
+
+			var approveBtn = card.querySelector('.pressark-plan-approve');
+			if (approveBtn) {
+				approveBtn.addEventListener('click', function (event) {
+					event.preventDefault();
+					event.stopPropagation();
+					self.executePlan(runId, card, approveEndpoint || executeEndpoint);
+				});
+			}
+
+			var reviseBtn = card.querySelector('.pressark-plan-revise');
+			if (reviseBtn) {
+				reviseBtn.addEventListener('click', function (event) {
+					event.preventDefault();
+					event.stopPropagation();
+					self.revisePlan(runId, card, reviseEndpoint);
+				});
+			}
+
+			var rejectBtn = card.querySelector('.pressark-plan-reject');
+			if (rejectBtn) {
+				rejectBtn.addEventListener('click', function (event) {
+					event.preventDefault();
+					event.stopPropagation();
+					self.rejectPlan(runId, card, rejectEndpoint);
+				});
+			}
+
+			if (!existing) {
+				container.appendChild(card);
+			}
+
+			this.scrollToBottom();
+			return card;
+		},
+
+		getPlanRevisionNote: function (card) {
+			if (!card) return '';
+			var input = card.querySelector('.pressark-plan-revision-note');
+			return input ? String(input.value || '').trim() : '';
+		},
+
+		setPlanActionState: function (card, state, message, disableControls) {
+			if (!card) return;
+			var controls = card.querySelectorAll('.pressark-plan-approve, .pressark-plan-revise, .pressark-plan-reject, .pressark-plan-revision-note');
+			for (var i = 0; i < controls.length; i++) {
+				controls[i].disabled = !!disableControls;
+			}
+
+			var statusEl = card.querySelector('.pressark-plan-action-status');
+			if (!statusEl) return;
+
+			if (!message) {
+				statusEl.innerHTML = '';
+				return;
+			}
+
+			if (state === 'pending') {
+				statusEl.innerHTML =
+					'<div class="pressark-confirm-stream">' +
+					'<div class="pressark-confirm-stream__label">' + this.escapeHtml(message) + '</div>' +
+					'<div class="pressark-confirm-stream__body"></div>' +
+					'</div>';
+				return;
+			}
+
+			statusEl.innerHTML =
+				'<div class="pressark-action-result ' + (state === 'success' ? 'pressark-action-success' : 'pressark-action-fail') + '">' +
+				'<span>' + (state === 'success' ? pwIcon('check') : pwIcon('x')) + ' ' + this.escapeHtml(message) + '</span>' +
+				'</div>';
+		},
+
+		performPlanAction: function (runId, endpoint, payload, card, options) {
+			if (!runId) {
+				return Promise.resolve({ success: false, message: 'Missing plan run ID.' });
+			}
+
+			var self = this;
+			var data = window.pressarkData || {};
+			var requestOptions = options || {};
+			var url = endpoint || (data.restUrl + (requestOptions.path || 'plan/execute'));
+			var body = Object.assign({ run_id: runId }, payload || {});
+
+			this.setPlanActionState(card, 'pending', requestOptions.pendingLabel || 'Working...', true);
+			this.beginPassiveRequest();
+
+			return fetch(url, {
+				method: 'POST',
+				headers: {
+					'Content-Type': 'application/json',
+					'X-WP-Nonce': data.nonce
+				},
+				body: JSON.stringify(body)
+			})
+				.then(function (response) { return response.json(); })
+				.then(function (result) {
+					self.finishPassiveRequest();
+
+					if (result && !result.error) {
+						self.setPlanActionState(card, 'success', requestOptions.successMessage || 'Action completed.', true);
+						self.presentResult(result);
+					} else {
+						self.setPlanActionState(
+							card,
+							'error',
+							(result && (result.message || result.error)) || requestOptions.failureMessage || 'Plan action failed.',
+							false
+						);
+						if (result && result.message) {
+							self.appendRetryableError(result.message, true);
+						}
+					}
+
+					return result;
+				})
+				.catch(function () {
+					self.finishPassiveRequest();
+					self.setPlanActionState(card, 'error', 'Network error. Please try again.', false);
+					self.appendRetryableError('Network error. Please try again.', true);
+					return { success: false, message: 'Network error. Please try again.' };
+				});
+		},
+
+		executePlan: function (runId, card, executeEndpoint) {
+			if (window.pressarkData && window.pressarkData.streamingEnabled !== false) {
+				return this.executePlanStream(runId, card, executeEndpoint);
+			}
+
+			return this.performPlanAction(
+				runId,
+				executeEndpoint,
+				{},
+				card,
+				{
+					path: 'plan/execute',
+					pendingLabel: 'Running execute phase...',
+					successMessage: 'Execution started. Review the response below.',
+					failureMessage: 'Failed to start execution.'
+				}
+			);
+		},
+
+		executePlanStream: function (runId, card, executeEndpoint) {
+			if (!runId) {
+				return Promise.resolve({ success: false, message: 'Missing plan run ID.' });
+			}
+			if (this.isSending || this._confirmStreamActive) {
+				return Promise.resolve({ success: false, message: 'Another request is already running.' });
+			}
+
+			var self = this;
+			var data = window.pressarkData || {};
+			var streamEndpoint = (executeEndpoint || '').replace(/\/plan\/execute$/, '/plan/approve-stream')
+				.replace(/\/plan\/approve$/, '/plan/approve-stream');
+			if (!streamEndpoint) {
+				streamEndpoint = (data.restUrl || '') + 'plan/approve-stream';
+			}
+
+			this.setPlanActionState(card, 'pending', 'Executing approved plan...', true);
+
+			var controller = this.beginRequest();
+			this.showTyping('Executing approved plan');
+
+			var bubble = null;
+			var textBuffer = '';
+			this._streamGotContent = false;
+			this._streamSegmentText = '';
+
+			return fetch(streamEndpoint, {
+				method: 'POST',
+				signal: controller.signal,
+				headers: {
+					'Content-Type': 'application/json',
+					'X-WP-Nonce': data.nonce
+				},
+				body: JSON.stringify({ run_id: runId })
+			}).then(function (response) {
+				if (!response.ok || !response.body) {
+					self.finishRequest();
+					return self.performPlanAction(
+						runId,
+						executeEndpoint,
+						{},
+						card,
+						{
+							path: 'plan/approve',
+							pendingLabel: 'Running execute phase...',
+							successMessage: 'Execution started. Review the response below.',
+							failureMessage: 'Failed to start execution.'
+						}
+					);
+				}
+
+				var reader = response.body.getReader();
+				if (self._activeRequest) self._activeRequest.reader = reader;
+				var decoder = new TextDecoder();
+				var sseBuffer = '';
+
+				function ensureBubble() {
+					if (!bubble) {
+						self.removeTypingIndicator();
+						bubble = self.createStreamingBubble();
+						self._streamGotContent = true;
+					}
+					return bubble;
+				}
+
+				function pump() {
+					return reader.read().then(function (result) {
+						if (result.done) {
+							ensureBubble();
+							self.finalizeStream(bubble, textBuffer);
+							self.setPlanActionState(card, 'error', 'Execution stream ended early. Please review the message below.', false);
+							return { success: false, message: 'Execution stream ended early.' };
+						}
+
+						sseBuffer += decoder.decode(result.value, { stream: true });
+						var parsed = self.parseSSEBuffer(sseBuffer);
+						sseBuffer = parsed.remaining;
+
+						for (var i = 0; i < parsed.events.length; i++) {
+							var evt = parsed.events[i];
+							if (evt.type === 'token' || evt.type === 'plan' || evt.type === 'step' || evt.type === 'tool_call' || evt.type === 'tool_progress' || evt.type === 'tool_result' || evt.type === 'done' || evt.type === 'error') {
+								ensureBubble();
+							}
+
+							try {
+								self.handleStreamEvent(evt, bubble);
+							} catch (eventErr) {
+								self.setPlanActionState(card, 'error', eventErr.message || 'Execution failed.', false);
+								throw eventErr;
+							}
+
+							if (evt.type === 'token' && evt.data && evt.data.text) {
+								textBuffer += evt.data.text;
+							}
+							if (evt.type === 'done') {
+								self.setPlanActionState(card, 'success', 'Execution continued below.', true);
+								return evt.data || { success: true };
+							}
+							if (evt.type === 'error') {
+								self.setPlanActionState(card, 'error', (evt.data && evt.data.message) || 'Execution failed.', false);
+								throw new Error((evt.data && evt.data.message) || 'Execution failed.');
+							}
+						}
+
+						return pump();
+					});
+				}
+
+				return pump();
+			}).catch(function (err) {
+				self.finishRequest();
+
+				if (err && err.name === 'AbortError') {
+					self.setPlanActionState(card, 'error', 'Execution stopped.', false);
+					return { success: false, message: 'Execution stopped.' };
+				}
+
+				self.setPlanActionState(card, 'error', 'Network error. Please try again.', false);
+				if (bubble) {
+					self.renderInterruptedStream(
+						bubble,
+						"Couldn't reach PressArk. Check your connection and try again."
+					);
+				} else {
+					self.appendRetryableError("Couldn't reach PressArk. Check your connection and try again.");
+				}
+				return { success: false, message: 'Network error. Please try again.' };
+			});
+		},
+
+		revisePlan: function (runId, card, reviseEndpoint) {
+			var note = this.getPlanRevisionNote(card);
+			if (!note) {
+				this.setPlanActionState(card, 'error', 'Add a revision note first.', false);
+				return Promise.resolve({ success: false, message: 'Add a revision note first.' });
+			}
+
+			return this.performPlanAction(
+				runId,
+				reviseEndpoint,
+				{ revision_note: note },
+				card,
+				{
+					path: 'plan/revise',
+					pendingLabel: 'Revising plan...',
+					successMessage: 'Updated plan requested. Review the response below.',
+					failureMessage: 'Failed to revise the plan.'
+				}
+			);
+		},
+
+		rejectPlan: function (runId, card, rejectEndpoint) {
+			var note = this.getPlanRevisionNote(card);
+			var payload = note ? { reason: note } : {};
+
+			return this.performPlanAction(
+				runId,
+				rejectEndpoint,
+				payload,
+				card,
+				{
+					path: 'plan/reject',
+					pendingLabel: 'Cancelling plan...',
+					successMessage: 'Plan cancelled.',
+					failureMessage: 'Failed to cancel the plan.'
+				}
+			);
+		},
+
 		escapeHtml: function (text) {
 			return String(text)
 				.replace(/&/g, '&amp;')
@@ -1342,7 +1881,7 @@
 				btn.disabled = true;
 				card.querySelector('.pressark-preview-cancel').disabled = true;
 
-				self.confirmAction(actionData, true, actionRunId, actionPendingIndex).then(function (result) {
+				self.confirmAction(actionData, true, actionRunId, actionPendingIndex, card).then(function (result) {
 					var previewData = self.pendingPreviews[actionId];
 					self.renderConfirmResult(card, result, previewData);
 					delete self.pendingActions[actionId];
@@ -1387,7 +1926,7 @@
 				if (confirmBtn) {
 					confirmBtn.disabled = true;
 				}
-				self.confirmAction(actionData, false, actionRunId, actionPendingIndex).then(function (result) {
+				self.confirmAction(actionData, false, actionRunId, actionPendingIndex, card).then(function (result) {
 					self.renderConfirmResult(card, result, previewData);
 					delete self.pendingActions[actionId];
 					delete self.pendingPreviews[actionId];
@@ -1801,7 +2340,11 @@
 			return card;
 		},
 
-		confirmAction: function (actionData, confirmed, runId, actionIndex) {
+		confirmAction: function (actionData, confirmed, runId, actionIndex, card) {
+			if (confirmed && window.pressarkData && window.pressarkData.streamingEnabled !== false) {
+				return this.confirmActionStream(runId, actionIndex, card);
+			}
+
 			var data = window.pressarkData;
 			var payload = {
 				confirmed: confirmed,
@@ -1820,6 +2363,207 @@
 				.catch(function () {
 					return { success: false, message: 'Network error. Please try again.' };
 				});
+		},
+
+		beginPassiveRequest: function () {
+			this._confirmStreamActive = true;
+			this._toolProgressState = {};
+			if (this.sendBtn) {
+				this.sendBtn.disabled = true;
+			}
+			if (this.inputEl) {
+				this.inputEl.disabled = true;
+			}
+		},
+
+		finishPassiveRequest: function () {
+			this._confirmStreamActive = false;
+			this._toolProgressState = {};
+			if (this.sendBtn) {
+				this.sendBtn.disabled = false;
+			}
+			if (this.inputEl) {
+				this.inputEl.disabled = false;
+			}
+		},
+
+		buildConfirmStreamSurface: function (card) {
+			if (!card) return null;
+
+			var actionsDiv = card.querySelector('.pressark-preview-actions');
+			if (!actionsDiv) return null;
+
+			actionsDiv.innerHTML =
+				'<div class="pressark-confirm-stream">' +
+				'<div class="pressark-confirm-stream__label">Applying changes...</div>' +
+				'<div class="pressark-confirm-stream__body"></div>' +
+				'</div>';
+
+			return actionsDiv.querySelector('.pressark-confirm-stream__body');
+		},
+
+		handleConfirmStreamEvent: function (event, contentEl) {
+			if (!contentEl || !event) return null;
+
+			switch (event.type) {
+				case 'tool_call':
+					this._renderInlineStep(contentEl, {
+						status: 'reading',
+						label: event.data && event.data.name ? event.data.name.replace(/_/g, ' ') : 'Processing',
+						tool: (event.data && (event.data.name || event.data.tool)) || '',
+						toolKey: this.getToolProgressKey(event.data),
+					});
+					return null;
+
+				case 'tool_progress':
+					var progressData = (event.data && typeof event.data.progress === 'object' && event.data.progress)
+						? event.data.progress
+						: {};
+					var progressKey = this.getToolProgressKey(event.data);
+					if (!this._acceptToolProgressEvent(progressKey, event.data && event.data.sequence)) {
+						return null;
+					}
+
+					var processed = parseInt(progressData.processed, 10);
+					var total = parseInt(progressData.total, 10);
+					var percent = (!isNaN(processed) && !isNaN(total) && total > 0)
+						? Math.round((processed / total) * 100)
+						: null;
+					var toolName = (event.data && (event.data.name || event.data.tool)) || 'Processing';
+					var progressLabel = toolName.replace(/_/g, ' ');
+					if (!isNaN(processed) && !isNaN(total) && total > 0) {
+						progressLabel += ' ' + processed + '/' + total;
+					}
+
+					var detailParts = [];
+					if (typeof progressData.message === 'string' && progressData.message) {
+						detailParts.push(progressData.message);
+					}
+					if (!isNaN(progressData.updated)) {
+						detailParts.push(progressData.updated + ' updated');
+					}
+					if (!isNaN(progressData.errors) && progressData.errors > 0) {
+						detailParts.push(progressData.errors + ' errors');
+					}
+
+					this._renderInlineStep(contentEl, {
+						status: 'reading',
+						label: progressLabel,
+						tool: event.data ? (event.data.name || event.data.tool || '') : '',
+						toolKey: progressKey,
+						detail: detailParts.join(' · '),
+						progressPercent: percent,
+						progressValue: !isNaN(processed) ? processed : null,
+						progressMax: !isNaN(total) ? total : null,
+						progressText: (!isNaN(processed) && !isNaN(total) && total > 0) ? (processed + '/' + total) : ''
+					});
+					return null;
+
+				case 'tool_result':
+					var doneKey = this.getToolProgressKey(event.data);
+					var doneName = ((event.data && event.data.name) || '').replace(/_/g, ' ');
+					if (doneKey && this._toolProgressState) {
+						delete this._toolProgressState[doneKey];
+					}
+					this._renderInlineStep(contentEl, {
+						status: 'done',
+						label: (doneName || 'Action') + ' complete',
+						tool: (event.data && event.data.name) || '',
+						toolKey: doneKey,
+						detail: (event.data && event.data.summary) || '',
+						progressPercent: 100,
+					});
+					return null;
+
+				case 'done':
+					return event.data || {};
+
+				case 'error':
+					throw new Error((event.data && event.data.message) || 'Unable to finish applying changes.');
+			}
+
+			return null;
+		},
+
+		confirmActionStream: function (runId, actionIndex, card) {
+			var self = this;
+			var data = window.pressarkData || {};
+			var contentEl = this.buildConfirmStreamSurface(card);
+			var payload = {
+				confirmed: true,
+				run_id: runId || '',
+				action_index: (typeof actionIndex !== 'undefined') ? actionIndex : 0
+			};
+
+			this.beginPassiveRequest();
+
+			return fetch(data.restUrl + 'confirm-stream', {
+				method: 'POST',
+				headers: {
+					'Content-Type': 'application/json',
+					'X-WP-Nonce': data.nonce
+				},
+				body: JSON.stringify(payload)
+			}).then(function (response) {
+				if (!response.ok || !response.body) {
+					self.finishPassiveRequest();
+					return fetch(data.restUrl + 'confirm', {
+						method: 'POST',
+						headers: {
+							'Content-Type': 'application/json',
+							'X-WP-Nonce': data.nonce
+						},
+						body: JSON.stringify(payload)
+					}).then(function (fallbackResponse) {
+						return fallbackResponse.json();
+					});
+				}
+
+				var reader = response.body.getReader();
+				var decoder = new TextDecoder();
+				var sseBuffer = '';
+
+				return new Promise(function (resolve, reject) {
+					function pump() {
+						reader.read().then(function (chunk) {
+							if (chunk.done) {
+								self.finishPassiveRequest();
+								reject(new Error('PressArk lost the progress stream before the action finished.'));
+								return;
+							}
+
+							sseBuffer += decoder.decode(chunk.value, { stream: true });
+							var parsed = self.parseSSEBuffer(sseBuffer);
+							sseBuffer = parsed.remaining;
+
+							for (var i = 0; i < parsed.events.length; i++) {
+								try {
+									var maybeResult = self.handleConfirmStreamEvent(parsed.events[i], contentEl);
+									if (maybeResult) {
+										self.finishPassiveRequest();
+										resolve(maybeResult);
+										return;
+									}
+								} catch (eventError) {
+									self.finishPassiveRequest();
+									reject(eventError);
+									return;
+								}
+							}
+
+							pump();
+						}).catch(function (streamError) {
+							self.finishPassiveRequest();
+							reject(streamError);
+						});
+					}
+
+					pump();
+				});
+			}).catch(function () {
+				self.finishPassiveRequest();
+				return { success: false, message: 'Network error. Please try again.' };
+			});
 		},
 
 		renderConfirmResult: function (card, result, previewData) {
@@ -2852,6 +3596,7 @@
 		beginRequest: function () {
 			var controller = new AbortController();
 			this._activeRequest = { controller: controller, reader: null };
+			this._toolProgressState = {};
 			this.isSending = true;
 			this.setSendButtonState('stop');
 			return controller;
@@ -2860,6 +3605,7 @@
 		finishRequest: function () {
 			this._activeRequest = null;
 			this._activeRunId = null;
+			this._toolProgressState = {};
 			this.isSending = false;
 			this.setSendButtonState('send');
 			this.removeTypingIndicator();
@@ -2946,7 +3692,7 @@
 		// ── Send Message ──────────────────────────────────────────────
 
 		sendMessage: function (internalMessage) {
-			if (this.isSending) return;
+			if (this.isSending || this._confirmStreamActive) return;
 
 			// Defensive: ensure message is always a string (guards against minifier
 			// variable-shadowing bugs where a Response object could be passed).
@@ -3088,65 +3834,7 @@
 					}
 
 					// Branch on response type.
-					var responseType = result.type || 'final_response';
-
-					if (responseType === 'queued') {
-						// Background task queued — show message and start the PressArk poller.
-						self.pendingTaskCount = Math.max(self.pendingTaskCount, 1);
-						self.syncTaskPolling(true);
-						self.appendAssistantResultMessage(result.message || 'Working on that in the background...', result);
-						self.conversation.push({ role: 'assistant', content: result.message || '' });
-					} else if (responseType === 'preview') {
-						// Live preview — show reply, then open preview overlay.
-						if (result.reply) {
-							self.appendAssistantResultMessage(result.reply, result);
-							self.conversation.push({ role: 'assistant', content: result.reply });
-						}
-						self.openPreview({
-							preview_session_id: result.preview_session_id,
-							preview_url: result.preview_url,
-							diff: result.diff,
-							risk_receipt: result.risk_receipt,
-						});
-					} else if (responseType === 'confirm_card') {
-						// Confirm card — show reply + old-style confirm cards.
-						if (result.reply) {
-							self.appendAssistantResultMessage(result.reply, result);
-							self.conversation.push({ role: 'assistant', content: result.reply });
-						}
-						if (result.pending_actions && result.pending_actions.length > 0) {
-							for (var p = 0; p < result.pending_actions.length; p++) {
-								self.renderPreviewCard(result.pending_actions[p], result.run_id || '', p);
-							}
-						}
-					} else {
-						// final_response — standard text reply.
-						var reply = result.reply || result.message || (result.is_error ? 'Something went wrong.' : '');
-						if (reply && !silentContinuation) {
-							self.appendAssistantResultMessage(reply, result);
-							self.conversation.push({ role: 'assistant', content: reply });
-						}
-
-						if (result.pending_actions && result.pending_actions.length > 0) {
-							for (var p2 = 0; p2 < result.pending_actions.length; p2++) {
-								self.renderPreviewCard(result.pending_actions[p2], result.run_id || '', p2);
-							}
-						}
-
-						if (result.actions_performed && result.actions_performed.length > 0) {
-							for (var i = 0; i < result.actions_performed.length; i++) {
-								self.addActionResult(result.actions_performed[i]);
-							}
-						}
-					}
-
-					self.applyResultState(result);
-
-					if (result.suggestions) {
-						self.renderSuggestionChips(result.suggestions);
-					}
-
-					self.autoSaveChat();
+					self.presentResult(result, { silentContinuation: silentContinuation });
 					} catch (processingErr) {
 						processingErr._pressarkResult = result;
 						throw processingErr;
@@ -3189,7 +3877,7 @@
 		// ── SSE Streaming (v4.4.0) ──────────────────────────────────
 
 		sendMessageStream: function (message, internalMessage) {
-			if (this.isSending) return;
+			if (this.isSending || this._confirmStreamActive) return;
 
 			if (!internalMessage) {
 				this.lastUserMessage = message;
@@ -3298,7 +3986,7 @@
 						for (var i = 0; i < parsed.events.length; i++) {
 							var evt = parsed.events[i];
 							// Create the bubble on first meaningful content.
-							if (evt.type === 'token' || evt.type === 'plan' || evt.type === 'step' || evt.type === 'tool_call' || evt.type === 'tool_result' || evt.type === 'done' || evt.type === 'error') {
+							if (evt.type === 'token' || evt.type === 'plan' || evt.type === 'step' || evt.type === 'tool_call' || evt.type === 'tool_progress' || evt.type === 'tool_result' || evt.type === 'done' || evt.type === 'error') {
 								ensureBubble();
 							}
 							self.handleStreamEvent(evt, bubble, textBuffer);
@@ -3412,6 +4100,128 @@
 			return { events: events, remaining: remaining };
 		},
 
+		getToolProgressKey: function (data) {
+			if (!data || typeof data !== 'object') return '';
+			return String(data.tool_key || data.id || data.tool_use_id || data.tool || data.name || '');
+		},
+
+		_acceptToolProgressEvent: function (toolKey, sequence) {
+			if (!toolKey) return true;
+			if (!this._toolProgressState) this._toolProgressState = {};
+
+			var nextSeq = parseInt(sequence || 0, 10);
+			var current = this._toolProgressState[toolKey] || {};
+			var lastSeq = parseInt(current.sequence || 0, 10);
+
+			if (nextSeq > 0 && lastSeq > 0 && nextSeq <= lastSeq) {
+				return false;
+			}
+
+			this._toolProgressState[toolKey] = {
+				sequence: nextSeq > 0 ? nextSeq : (lastSeq + 1)
+			};
+			return true;
+		},
+
+		_findInlineStepRow: function (contentEl, toolKey, tool) {
+			if (!contentEl) return null;
+			var rows = contentEl.querySelectorAll('.pressark-inline-step');
+			for (var i = rows.length - 1; i >= 0; i--) {
+				var row = rows[i];
+				if (toolKey && row.dataset.toolKey === toolKey) {
+					return row;
+				}
+				if (!toolKey && tool && row.dataset.tool === tool) {
+					return row;
+				}
+			}
+			return null;
+		},
+
+		_getInlineStepIconMarkup: function (status) {
+			if (status === 'reading') {
+				return '<span class="pressark-step-icon pressark-step-icon--reading">' + pwIcons.loader + '</span>';
+			}
+			if (status === 'done') {
+				return '<span class="pressark-step-icon pressark-step-icon--done">' + pwIcons.check + '</span>';
+			}
+			if (status === 'preparing_preview') {
+				return '<span class="pressark-step-icon pressark-step-icon--preview">' + pwIcons.sparkles + '</span>';
+			}
+			if (status === 'needs_confirm') {
+				return '<span class="pressark-step-icon pressark-step-icon--confirm">' + pwIcons.pencil + '</span>';
+			}
+			return '<span class="pressark-step-icon">\u2022</span>';
+		},
+
+		_applyInlineStepState: function (row, status, label, stepData) {
+			if (!row) return;
+			row.className = 'pressark-inline-step pressark-step--' + status;
+			row.dataset.status = status;
+			row.dataset.tool = stepData.tool || '';
+			row.dataset.toolKey = stepData.toolKey || stepData.tool || '';
+
+			if (!row.querySelector('.pressark-inline-step-body')) {
+				row.innerHTML =
+					this._getInlineStepIconMarkup(status) +
+					'<span class="pressark-inline-step-body">' +
+					'<span class="pressark-step-label"></span>' +
+					'<span class="pressark-inline-step-detail" hidden></span>' +
+					'<span class="pressark-inline-step-progress" hidden>' +
+					'<span class="pressark-inline-step-progress-track"><span class="pressark-inline-step-progress-fill"></span></span>' +
+					'<span class="pressark-inline-step-progress-text"></span>' +
+					'</span>' +
+					'</span>';
+			}
+
+			var currentIcon = row.querySelector('.pressark-step-icon');
+			if (currentIcon) {
+				currentIcon.outerHTML = this._getInlineStepIconMarkup(status);
+			}
+
+			var labelEl = row.querySelector('.pressark-step-label');
+			if (labelEl) {
+				labelEl.textContent = label;
+			}
+
+			var detailEl = row.querySelector('.pressark-inline-step-detail');
+			if (detailEl) {
+				if (stepData.detail) {
+					detailEl.hidden = false;
+					detailEl.textContent = stepData.detail;
+				} else {
+					detailEl.hidden = true;
+					detailEl.textContent = '';
+				}
+			}
+
+			var progressWrap = row.querySelector('.pressark-inline-step-progress');
+			var progressFill = row.querySelector('.pressark-inline-step-progress-fill');
+			var progressText = row.querySelector('.pressark-inline-step-progress-text');
+			var percent = typeof stepData.progressPercent === 'number'
+				? Math.max(0, Math.min(100, stepData.progressPercent))
+				: null;
+
+			if (progressWrap && progressFill && progressText) {
+				if (percent !== null || status === 'done') {
+					var resolvedPercent = percent !== null ? percent : 100;
+					progressWrap.hidden = false;
+					progressFill.style.width = resolvedPercent + '%';
+					if (stepData.progressText) {
+						progressText.textContent = stepData.progressText;
+					} else if (stepData.progressValue !== null && typeof stepData.progressValue !== 'undefined' && stepData.progressMax !== null && typeof stepData.progressMax !== 'undefined') {
+						progressText.textContent = stepData.progressValue + '/' + stepData.progressMax;
+					} else {
+						progressText.textContent = resolvedPercent + '%';
+					}
+				} else {
+					progressWrap.hidden = true;
+					progressFill.style.width = '0%';
+					progressText.textContent = '';
+				}
+			}
+		},
+
 		handleStreamEvent: function (event, bubble) {
 			// run_started arrives before the first token/step, so it must be
 			// handled even when no streaming bubble exists yet.
@@ -3462,15 +4272,72 @@
 						status: 'reading',
 						label: event.data.name ? event.data.name.replace(/_/g, ' ') : 'Processing',
 						tool: event.data.name || '',
+						toolKey: this.getToolProgressKey(event.data),
+					});
+					this._streamSegmentText = '';
+					break;
+
+				case 'tool_progress':
+					var progressData = (event.data && typeof event.data.progress === 'object' && event.data.progress)
+						? event.data.progress
+						: {};
+					var progressKey = this.getToolProgressKey(event.data);
+					if (!this._acceptToolProgressEvent(progressKey, event.data && event.data.sequence)) {
+						break;
+					}
+
+					var processed = parseInt(progressData.processed, 10);
+					var total = parseInt(progressData.total, 10);
+					var percent = (!isNaN(processed) && !isNaN(total) && total > 0)
+						? Math.round((processed / total) * 100)
+						: null;
+					var toolName = (event.data && (event.data.name || event.data.tool)) || 'Processing';
+					var progressLabel = toolName.replace(/_/g, ' ');
+					if (!isNaN(processed) && !isNaN(total) && total > 0) {
+						progressLabel += ' ' + processed + '/' + total;
+					}
+
+					var progressDetail = '';
+					if (typeof progressData.message === 'string' && progressData.message) {
+						progressDetail = progressData.message;
+					} else {
+						var detailParts = [];
+						if (!isNaN(progressData.updated)) {
+							detailParts.push(progressData.updated + ' updated');
+						}
+						if (!isNaN(progressData.errors) && progressData.errors > 0) {
+							detailParts.push(progressData.errors + ' errors');
+						}
+						progressDetail = detailParts.join(' · ');
+					}
+
+					this._renderInlineStep(contentEl, {
+						status: 'reading',
+						label: progressLabel,
+						tool: event.data.name || event.data.tool || '',
+						toolKey: progressKey,
+						detail: progressDetail,
+						progressPercent: percent,
+						progressValue: !isNaN(processed) ? processed : null,
+						progressMax: !isNaN(total) ? total : null,
+						progressText: (!isNaN(processed) && !isNaN(total) && total > 0) ? (processed + '/' + total) : ''
 					});
 					this._streamSegmentText = '';
 					break;
 
 				case 'tool_result':
+					var doneKey = this.getToolProgressKey(event.data);
+					var doneName = (event.data.name || '').replace(/_/g, ' ');
+					if (doneKey && this._toolProgressState) {
+						delete this._toolProgressState[doneKey];
+					}
 					this._renderInlineStep(contentEl, {
 						status: 'done',
-						label: (event.data.name || '').replace(/_/g, ' ') + ' complete',
+						label: (doneName || 'Action') + ' complete',
 						tool: event.data.name || '',
+						toolKey: doneKey,
+						detail: event.data.summary || '',
+						progressPercent: 100,
 					});
 					this._streamSegmentText = '';
 					break;
@@ -3517,32 +4384,8 @@
 		 * @since 5.2.0
 		 */
 		_renderPlanCard: function (contentEl, planItems) {
-			if (!Array.isArray(planItems) || !planItems.length) return;
-
-			var card = document.createElement('div');
-			card.className = 'pressark-plan-card';
-
-			var header = document.createElement('div');
-			header.className = 'pressark-plan-header';
-			header.textContent = 'Plan';
-			header.addEventListener('click', function () {
-				card.classList.toggle('collapsed');
-			});
-			card.appendChild(header);
-
-			var list = document.createElement('ol');
-			list.className = 'pressark-plan-steps';
-
-			for (var i = 0; i < planItems.length; i++) {
-				var li = document.createElement('li');
-				li.className = 'step-' + (planItems[i].status || 'pending');
-				li.textContent = planItems[i].text || '';
-				list.appendChild(li);
-			}
-
-			card.appendChild(list);
-			contentEl.appendChild(card);
-			this.scrollToBottom();
+			if (!contentEl) return null;
+			return this.renderPlanReadyCard(planItems, contentEl);
 		},
 
 		/**
@@ -3566,22 +4409,12 @@
 			var status = this.normalizeStepStatus(rawStatus);
 			var label = stepData.label || stepData.tool || '';
 			var tool = stepData.tool || '';
-
-			// If updating an existing 'reading' row for this tool to 'done', just update it.
-			if (rawStatus === 'done' && tool) {
-				var rows = contentEl.querySelectorAll('.pressark-inline-step');
-				for (var i = rows.length - 1; i >= 0; i--) {
-					if (rows[i].dataset.tool === tool && rows[i].dataset.status === 'reading') {
-						rows[i].className = 'pressark-inline-step pressark-step--done';
-						rows[i].dataset.status = 'done';
-						var iconEl = rows[i].querySelector('.pressark-step-icon');
-						if (iconEl) {
-							iconEl.className = 'pressark-step-icon pressark-step-icon--done';
-							iconEl.innerHTML = pwIcons.check;
-						}
-						return;
-					}
-				}
+			var toolKey = stepData.toolKey || tool;
+			var existingRow = this._findInlineStepRow(contentEl, toolKey, tool);
+			if (existingRow) {
+				this._applyInlineStepState(existingRow, status, label, stepData);
+				this.scrollToBottom();
+				return;
 			}
 
 			// Before inserting a step, if there's accumulated text directly in
@@ -3601,23 +4434,10 @@
 			var row = document.createElement('div');
 			row.className = 'pressark-inline-step pressark-step--' + status;
 			row.dataset.tool = tool;
+			row.dataset.toolKey = toolKey;
 			row.dataset.status = status;
-
-			var icon = '';
-			if (status === 'reading') {
-				icon = '<span class="pressark-step-icon pressark-step-icon--reading">' + pwIcons.loader + '</span>';
-			} else if (status === 'done') {
-				icon = '<span class="pressark-step-icon pressark-step-icon--done">' + pwIcons.check + '</span>';
-			} else if (status === 'preparing_preview') {
-				icon = '<span class="pressark-step-icon pressark-step-icon--preview">' + pwIcons.sparkles + '</span>';
-			} else if (status === 'needs_confirm') {
-				icon = '<span class="pressark-step-icon pressark-step-icon--confirm">' + pwIcons.pencil + '</span>';
-			} else {
-				icon = '<span class="pressark-step-icon">\u2022</span>';
-			}
-
-			row.innerHTML = icon + '<span class="pressark-step-label">' + this.escapeHtml(label) + '</span>';
 			contentEl.appendChild(row);
+			this._applyInlineStepState(row, status, label, stepData);
 			this.scrollToBottom();
 		},
 
@@ -3645,6 +4465,10 @@
 
 			var responseType = result.type || 'final_response';
 			var replyText = result.reply || result.message || '';
+			if (responseType === 'permission_required' && result.upgrade_prompt) {
+				var streamUpgradeUrl = (result.upgrade_url || window.pressarkData.upgradeUrl || '#');
+				replyText += (replyText ? '\n\n' : '') + '[Upgrade your plan](' + streamUpgradeUrl + ')';
+			}
 			var contentEl = bubble.querySelector('.pressark-message-content');
 			var activityItems = this.getResultActivityItems(result);
 
@@ -3694,7 +4518,9 @@
 			}
 
 			// Branch on response type.
-			if (responseType === 'queued') {
+			if (responseType === 'permission_required') {
+				// No extra UI yet; the assistant message above carries the prompt/link.
+			} else if (responseType === 'queued') {
 				this.pendingTaskCount = Math.max(this.pendingTaskCount, 1);
 				this.syncTaskPolling(true);
 			} else if (responseType === 'preview') {
@@ -3709,6 +4535,10 @@
 					for (var p = 0; p < result.pending_actions.length; p++) {
 						this.renderPreviewCard(result.pending_actions[p], result.run_id || '', p);
 					}
+				}
+			} else if (responseType === 'plan_ready') {
+				if (contentEl && !contentEl.querySelector('.pressark-plan-card')) {
+					this._renderPlanCard(contentEl, result);
 				}
 			} else {
 				// final_response

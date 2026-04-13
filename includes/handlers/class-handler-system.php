@@ -14,6 +14,108 @@ if ( ! defined( 'ABSPATH' ) ) { exit; }
 class PressArk_Handler_System extends PressArk_Handler_Base {
 
 	/**
+	 * Fast pre-execution permission probe for system-domain tools.
+	 *
+	 * @since 5.6.0
+	 */
+	public function check_permissions( string $tool_name, array $params, array $context = array() ): array {
+		$user_id = absint( $params['user_id'] ?? $params['id'] ?? 0 );
+
+		switch ( $tool_name ) {
+			case 'get_site_settings':
+			case 'update_site_settings':
+			case 'get_email_log':
+			case 'site_health':
+			case 'list_scheduled_tasks':
+			case 'manage_scheduled_task':
+			case 'list_plugins':
+			case 'toggle_plugin':
+			case 'list_themes':
+			case 'database_stats':
+			case 'cleanup_database':
+			case 'optimize_database':
+			case 'view_site_profile':
+			case 'refresh_site_profile':
+			case 'list_logs':
+			case 'read_log_action':
+			case 'analyze_logs':
+			case 'clear_log':
+				return $this->permission_require_capability(
+					$tool_name,
+					$params,
+					$context,
+					'manage_options',
+					null,
+					__( 'You do not have permission to manage site settings.', 'pressark' )
+				);
+
+			case 'get_menus':
+			case 'update_menu':
+			case 'get_theme_settings':
+			case 'get_customizer_schema':
+			case 'update_theme_setting':
+			case 'switch_theme_action':
+				return $this->permission_require_capability(
+					$tool_name,
+					$params,
+					$context,
+					'edit_theme_options',
+					null,
+					__( 'You do not have permission to modify design.', 'pressark' )
+				);
+
+			case 'list_users':
+			case 'get_user':
+				return $this->permission_require_capability(
+					$tool_name,
+					$params,
+					$context,
+					'list_users',
+					null,
+					__( 'You do not have permission to view users.', 'pressark' )
+				);
+
+			case 'update_user':
+				if (
+					$user_id > 0
+					&& (
+						array_key_exists( 'role', (array) ( $params['changes'] ?? array() ) )
+						|| array_key_exists( 'role', $params )
+					)
+				) {
+					return $this->permission_require_capability(
+						$tool_name,
+						$params,
+						$context,
+						'promote_user',
+						$user_id,
+						__( 'You do not have permission to update this user.', 'pressark' )
+					);
+				}
+
+				return $user_id > 0
+					? $this->permission_require_capability(
+						$tool_name,
+						$params,
+						$context,
+						'edit_user',
+						$user_id,
+						__( 'You do not have permission to update this user.', 'pressark' )
+					)
+					: $this->permission_require_capability(
+						$tool_name,
+						$params,
+						$context,
+						'list_users',
+						null,
+						__( 'You do not have permission to update users.', 'pressark' )
+					);
+		}
+
+		return $this->entitlement_permission( $tool_name, $params, $context );
+	}
+
+	/**
 	 * Allowed site settings that can be read/written.
 	 */
 	public const ALLOWED_SETTINGS = array(
@@ -135,11 +237,15 @@ class PressArk_Handler_System extends PressArk_Handler_Base {
 			return array( 'success' => false, 'message' => __( 'No settings changes specified.', 'pressark' ) );
 		}
 
-		$updated = array();
-		$old_values = array();
+		$updated          = array();
+		$old_values       = array();
+		$prepared_changes = array();
+		// PressArk v5.1.1 hardening: honor registered setting sanitizers and preserve default autoload behavior.
+		$registered       = function_exists( 'get_registered_settings' ) ? get_registered_settings() : array();
+		$integer_settings = array( 'posts_per_page', 'page_on_front', 'page_for_posts', 'start_of_week', 'default_category' );
 
 		foreach ( $changes as $key => $value ) {
-			$key = sanitize_text_field( $key );
+			$key = sanitize_key( $key );
 
 			if ( ! in_array( $key, self::ALLOWED_SETTINGS, true ) ) {
 				continue;
@@ -148,8 +254,53 @@ class PressArk_Handler_System extends PressArk_Handler_Base {
 				continue;
 			}
 
+			// PressArk v5.1.1 hardening: reject malformed permalink structures before persisting.
+			if ( 'permalink_structure' === $key ) {
+				$value = sanitize_option( 'permalink_structure', $value );
+				if ( false !== strpos( (string) $value, '%%%' ) ) {
+					return $this->error( __( 'Invalid permalink structure.', 'pressark' ) );
+				}
+			}
+
+			// PressArk v5.1.1 hardening: fail fast on invalid numeric option payloads.
+			if ( in_array( $key, $integer_settings, true ) && '' !== (string) $value && ! is_numeric( $value ) ) {
+				return $this->error(
+					sprintf(
+						/* translators: %s: option name */
+						__( 'Invalid value for %s.', 'pressark' ),
+						$key
+					)
+				);
+			}
+
+			if ( isset( $registered[ $key ]['sanitize_callback'] ) && is_callable( $registered[ $key ]['sanitize_callback'] ) ) {
+				$value = call_user_func( $registered[ $key ]['sanitize_callback'], $value );
+				if ( is_wp_error( $value ) ) {
+					return $this->error( $value->get_error_message() );
+				}
+			} else {
+				switch ( $key ) {
+					case 'posts_per_page':
+					case 'page_on_front':
+					case 'page_for_posts':
+					case 'start_of_week':
+					case 'default_category':
+						$value = absint( $value );
+						break;
+					case 'blog_public':
+						$value = (int) (bool) $value;
+						break;
+					default:
+						$value = sanitize_text_field( $value );
+				}
+			}
+
+			$prepared_changes[ $key ] = $value;
+		}
+
+		foreach ( $prepared_changes as $key => $value ) {
 			$old_values[ $key ] = get_option( $key, '' );
-			update_option( $key, sanitize_text_field( $value ), false );
+			update_option( $key, $value );
 			$updated[] = $key;
 		}
 
@@ -172,7 +323,7 @@ class PressArk_Handler_System extends PressArk_Handler_Base {
 			null,
 			'settings',
 			wp_json_encode( $old_values ),
-			wp_json_encode( $changes )
+			wp_json_encode( $prepared_changes )
 		);
 
 		$result = array(
@@ -497,9 +648,14 @@ class PressArk_Handler_System extends PressArk_Handler_Base {
 				if ( ! $menu_id ) {
 					return array( 'success' => false, 'message' => __( 'Menu ID is required.', 'pressark' ) );
 				}
-				$location = sanitize_text_field( $params['location'] ?? '' );
+				$location = sanitize_key( $params['location'] ?? '' );
 				if ( empty( $location ) ) {
 					return array( 'success' => false, 'message' => __( 'Location slug is required.', 'pressark' ) );
+				}
+				// PressArk v5.1.1 hardening: reject unknown menu locations before assignment.
+				$registered = get_registered_nav_menus();
+				if ( ! array_key_exists( $location, $registered ) ) {
+					return $this->error( __( 'Menu location does not exist.', 'pressark' ) );
 				}
 				$locations = get_nav_menu_locations();
 				$locations[ $location ] = $menu_id;

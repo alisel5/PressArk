@@ -20,6 +20,51 @@ if ( ! defined( 'ABSPATH' ) ) { exit; }
 class PressArk_Handler_Elementor extends PressArk_Handler_Base {
 
 	/**
+	 * Fast pre-execution permission probe for Elementor tools.
+	 *
+	 * @since 5.6.0
+	 */
+	public function check_permissions( string $tool_name, array $params, array $context = array() ): array {
+		$post_id  = $this->permission_post_id( $params );
+		$is_write = in_array(
+			$tool_name,
+			array(
+				'elementor_edit_widget',
+				'elementor_add_widget',
+				'elementor_add_container',
+				'elementor_create_from_template',
+				'elementor_find_replace',
+				'elementor_create_page',
+				'elementor_clone_page',
+				'elementor_manage_conditions',
+				'elementor_set_dynamic_tag',
+				'elementor_edit_form_field',
+				'elementor_set_visibility',
+				'elementor_edit_popup_trigger',
+			),
+			true
+		);
+
+		if ( 'elementor_global_styles' === $tool_name ) {
+			$is_write = array_key_exists( 'updates', $params ) && null !== $params['updates'];
+		}
+
+		if ( $is_write ) {
+			return $this->permission_require_elementor_write(
+				$tool_name,
+				$params,
+				$context,
+				self::MIN_WRITE_VERSION,
+				'edit_theme_options',
+				$post_id > 0 ? $post_id : null,
+				__( 'You do not have permission to modify design.', 'pressark' )
+			);
+		}
+
+		return $this->permission_require_elementor( $tool_name, $params, $context );
+	}
+
+	/**
 	 * v3.7.0: Minimum Elementor version for write operations.
 	 * Below this, read operations still work, but writes are blocked
 	 * because the _elementor_data save pipeline is unreliable.
@@ -159,8 +204,21 @@ class PressArk_Handler_Elementor extends PressArk_Handler_Base {
 	}
 
 	public function elementor_edit_widget( array $params ): array {
+		// PressArk v5.1.1 hardening: require design capability before Elementor writes.
+		if ( ! current_user_can( 'edit_theme_options' ) ) {
+			return $this->error( __( 'You do not have permission to modify design.', 'pressark' ) );
+		}
+		// PressArk v5.1.1: Elementor fallback notice.
+		$notice = __( 'Note: This change was made in Elementor as requested. For better performance, design control, and future compatibility, native WordPress blocks are recommended for new designs.', 'pressark' );
 		$err = $this->require_elementor_write(); if ($err) return $err;
 		$post_id   = intval( $params['post_id'] ?? 0 );
+		// PressArk v5.1.1 hardening: sanitize structured widget edits before mutation.
+		$changes   = $params['changes'] ?? array();
+		if ( is_string( $changes ) ) {
+			$decoded = json_decode( $changes, true );
+			$changes = is_array( $decoded ) ? $decoded : array();
+		}
+		$changes = wp_kses_post_deep( is_array( $changes ) ? $changes : array() );
 
 		// v3.7.0: Check for concurrent Elementor editor sessions.
 		$lock_err = $this->check_elementor_lock( $post_id );
@@ -180,6 +238,12 @@ class PressArk_Handler_Elementor extends PressArk_Handler_Base {
 		// Repeater item edit path.
 		if ( isset( $params['item_index'] ) && isset( $params['item_fields'] ) ) {
 			$repeater_field = sanitize_text_field( $params['field'] ?? '' );
+			$item_fields    = $params['item_fields'];
+			if ( is_string( $item_fields ) ) {
+				$decoded     = json_decode( $item_fields, true );
+				$item_fields = is_array( $decoded ) ? $decoded : array();
+			}
+			$item_fields = wp_kses_post_deep( is_array( $item_fields ) ? $item_fields : array() );
 			if ( empty( $repeater_field ) ) {
 				return array( 'success' => false, 'message' => __( 'Repeater field name is required for item edits.', 'pressark' ) );
 			}
@@ -189,11 +253,10 @@ class PressArk_Handler_Elementor extends PressArk_Handler_Base {
 				$widget_id,
 				$repeater_field,
 				(int) $params['item_index'],
-				$params['item_fields']
+				$item_fields
 			);
 		} else {
 			// Standard field edit path.
-			$changes = $params['changes'] ?? array();
 			if ( empty( $changes ) ) {
 				return array( 'success' => false, 'message' => __( 'Changes are required.', 'pressark' ) );
 			}
@@ -211,6 +274,12 @@ class PressArk_Handler_Elementor extends PressArk_Handler_Base {
 			$result['log_id']  = $log_id;
 			/* translators: %s: post title */
 			$result['message'] = $result['message'] ?? sprintf( __( 'Updated Elementor widget on "%s".', 'pressark' ), get_the_title( $post_id ) );
+			$result['notice']  = $notice;
+			$result['recommendation'] = 'native_blocks';
+			// PressArk v5.1.1 hardening: clear Elementor CSS cache after successful writes.
+			if ( class_exists( '\Elementor\Plugin' ) ) {
+				\Elementor\Plugin::$instance->files_manager->clear_cache();
+			}
 		} elseif ( isset( $result['error'] ) ) {
 			return array( 'success' => false, 'message' => $result['error'] );
 		}
@@ -219,6 +288,12 @@ class PressArk_Handler_Elementor extends PressArk_Handler_Base {
 	}
 
 	public function elementor_add_widget( array $params ): array {
+		// PressArk v5.1.1 hardening: require design capability before Elementor writes.
+		if ( ! current_user_can( 'edit_theme_options' ) ) {
+			return $this->error( __( 'You do not have permission to modify design.', 'pressark' ) );
+		}
+		// PressArk v5.1.1: Elementor fallback notice.
+		$notice = __( 'Note: This change was made in Elementor as requested. For better performance, design control, and future compatibility, native WordPress blocks are recommended for new designs.', 'pressark' );
 		$err = $this->require_elementor_write(); if ($err) return $err;
 		$post_id      = intval( $params['post_id'] ?? 0 );
 		$lock_err = $this->check_elementor_lock( $post_id );
@@ -226,6 +301,12 @@ class PressArk_Handler_Elementor extends PressArk_Handler_Base {
 		$elementor    = new PressArk_Elementor();
 		$widget_type  = sanitize_text_field( $params['widget_type'] ?? '' );
 		$settings     = $params['settings'] ?? array();
+		// PressArk v5.1.1 hardening: sanitize widget settings before insertion.
+		if ( is_string( $settings ) ) {
+			$decoded  = json_decode( $settings, true );
+			$settings = is_array( $decoded ) ? $decoded : array();
+		}
+		$settings     = wp_kses_post_deep( is_array( $settings ) ? $settings : array() );
 		$container_id = sanitize_text_field( $params['container_id'] ?? '' );
 		$position     = intval( $params['position'] ?? -1 );
 
@@ -247,6 +328,12 @@ class PressArk_Handler_Elementor extends PressArk_Handler_Base {
 				wp_json_encode( array( 'widget_type' => $widget_type, 'settings' => $settings ) )
 			);
 			$result['log_id'] = $log_id;
+			$result['notice'] = $notice;
+			$result['recommendation'] = 'native_blocks';
+			// PressArk v5.1.1 hardening: clear Elementor CSS cache after successful writes.
+			if ( class_exists( '\Elementor\Plugin' ) ) {
+				\Elementor\Plugin::$instance->files_manager->clear_cache();
+			}
 		} elseif ( isset( $result['error'] ) ) {
 			return array( 'success' => false, 'message' => $result['error'] );
 		}
@@ -255,6 +342,12 @@ class PressArk_Handler_Elementor extends PressArk_Handler_Base {
 	}
 
 	public function elementor_add_container( array $params ): array {
+		// PressArk v5.1.1 hardening: require design capability before Elementor writes.
+		if ( ! current_user_can( 'edit_theme_options' ) ) {
+			return $this->error( __( 'You do not have permission to modify design.', 'pressark' ) );
+		}
+		// PressArk v5.1.1: Elementor fallback notice.
+		$notice = __( 'Note: This change was made in Elementor as requested. For better performance, design control, and future compatibility, native WordPress blocks are recommended for new designs.', 'pressark' );
 		$err = $this->require_elementor_write(); if ($err) return $err;
 		$post_id   = intval( $params['post_id'] ?? 0 );
 		$lock_err = $this->check_elementor_lock( $post_id );
@@ -265,6 +358,12 @@ class PressArk_Handler_Elementor extends PressArk_Handler_Base {
 		$position  = intval( $params['position'] ?? -1 );
 		$parent_id = sanitize_text_field( $params['parent_id'] ?? '' );
 		$settings  = $params['settings'] ?? array();
+		// PressArk v5.1.1 hardening: sanitize container settings before insertion.
+		if ( is_string( $settings ) ) {
+			$decoded  = json_decode( $settings, true );
+			$settings = is_array( $decoded ) ? $decoded : array();
+		}
+		$settings  = wp_kses_post_deep( is_array( $settings ) ? $settings : array() );
 
 		if ( ! $post_id ) {
 			return array( 'success' => false, 'message' => __( 'post_id is required.', 'pressark' ) );
@@ -284,6 +383,12 @@ class PressArk_Handler_Elementor extends PressArk_Handler_Base {
 				wp_json_encode( array( 'layout' => $layout, 'direction' => $direction ) )
 			);
 			$result['log_id'] = $log_id;
+			$result['notice'] = $notice;
+			$result['recommendation'] = 'native_blocks';
+			// PressArk v5.1.1 hardening: clear Elementor CSS cache after successful writes.
+			if ( class_exists( '\Elementor\Plugin' ) ) {
+				\Elementor\Plugin::$instance->files_manager->clear_cache();
+			}
 		} elseif ( isset( $result['error'] ) ) {
 			return array( 'success' => false, 'message' => $result['error'] );
 		}
@@ -342,6 +447,10 @@ class PressArk_Handler_Elementor extends PressArk_Handler_Base {
 	}
 
 	public function elementor_find_replace( array $params ): array {
+		// PressArk v5.1.1 hardening: require design capability before Elementor writes.
+		if ( ! current_user_can( 'edit_theme_options' ) ) {
+			return $this->error( __( 'You do not have permission to modify design.', 'pressark' ) );
+		}
 		$err = $this->require_elementor_write(); if ($err) return $err;
 		$elementor = new PressArk_Elementor();
 		$find      = $params['find'] ?? '';
@@ -405,6 +514,12 @@ class PressArk_Handler_Elementor extends PressArk_Handler_Base {
 			/* translators: 1: number of locked pages */
 			$result['message'] .= ' ' . sprintf( __( '%s page(s) skipped (locked by another user).', 'pressark' ), $result['pages_locked'] );
 		}
+		if ( ! empty( $result['success'] ) ) {
+			// PressArk v5.1.1 hardening: clear Elementor CSS cache after successful writes.
+			if ( class_exists( '\Elementor\Plugin' ) ) {
+				\Elementor\Plugin::$instance->files_manager->clear_cache();
+			}
+		}
 
 		return $result;
 	}
@@ -425,31 +540,83 @@ class PressArk_Handler_Elementor extends PressArk_Handler_Base {
 	}
 
 	public function elementor_global_styles( array $params ): array {
-		$updates = $params['updates'] ?? null;
+		$has_updates = array_key_exists( 'updates', $params ) && null !== $params['updates'];
+		$updates     = $has_updates ? $params['updates'] : null;
+		if ( $has_updates ) {
+			// PressArk v5.1.1 hardening: require design capability before Elementor writes.
+			if ( ! current_user_can( 'edit_theme_options' ) ) {
+				return $this->error( __( 'You do not have permission to modify design.', 'pressark' ) );
+			}
+			// PressArk v5.1.1: Elementor fallback notice.
+			$notice = __( 'Note: This change was made in Elementor as requested. For better performance, design control, and future compatibility, native WordPress blocks are recommended for new designs.', 'pressark' );
+			// PressArk v5.1.1 hardening: decode and sanitize global-style payloads before write.
+			if ( is_string( $updates ) ) {
+				$decoded = json_decode( $updates, true );
+				$updates = is_array( $decoded ) ? $decoded : array();
+			}
+			if ( ! is_array( $updates ) ) {
+				$updates = array();
+			}
+			$allowed_keys = array( 'colors', 'typography', 'theme_style', 'layout' );
+			$updates      = array_intersect_key( $updates, array_flip( $allowed_keys ) );
+			$updates      = wp_kses_post_deep( $updates );
+		}
 		// v3.7.0: Use write guard if updating, read guard if just reading.
-		if ( $updates ) {
+		if ( $has_updates ) {
 			$err = $this->require_elementor_write(); if ($err) return $err;
 		} else {
 			$err = $this->require_elementor(); if ($err) return $err;
 		}
 		$elementor = new PressArk_Elementor();
-		return $elementor->global_styles( $updates );
+		$result    = $elementor->global_styles( $has_updates ? $updates : null );
+		if ( $has_updates && ! empty( $result['success'] ) ) {
+			$result['notice'] = $notice;
+			$result['recommendation'] = 'native_blocks';
+			// PressArk v5.1.1 hardening: clear Elementor CSS cache after successful writes.
+			if ( class_exists( '\Elementor\Plugin' ) ) {
+				\Elementor\Plugin::$instance->files_manager->clear_cache();
+			}
+		}
+		return $result;
 	}
 
 	public function elementor_create_page( array $params ): array {
+		// PressArk v5.1.1 hardening: require design capability before Elementor writes.
+		if ( ! current_user_can( 'edit_theme_options' ) ) {
+			return $this->error( __( 'You do not have permission to modify design.', 'pressark' ) );
+		}
+		// PressArk v5.1.1: Elementor fallback notice.
+		$notice = __( 'Note: This change was made in Elementor as requested. For better performance, design control, and future compatibility, native WordPress blocks are recommended for new designs.', 'pressark' );
 		$err = $this->require_elementor_write(); if ($err) return $err;
+		// PressArk v5.1.1 hardening: sanitize page-creation payloads before write.
+		$title      = sanitize_text_field( (string) ( $params['title'] ?? 'New Page' ) );
+		$template   = sanitize_text_field( (string) ( $params['template'] ?? '' ) );
+		$status     = sanitize_key( (string) ( $params['status'] ?? 'draft' ) );
+		$parent     = absint( $params['parent'] ?? 0 );
+		$widgets    = $params['widgets'] ?? array();
+		$post_type  = sanitize_key( (string) ( $params['post_type'] ?? 'page' ) );
+		if ( is_string( $widgets ) ) {
+			$decoded = json_decode( $widgets, true );
+			$widgets = is_array( $decoded ) ? $decoded : array();
+		}
+		$widgets    = wp_kses_post_deep( is_array( $widgets ) ? $widgets : array() );
 		$elementor = new PressArk_Elementor();
 		$result    = $elementor->create_page(
-			(string) ( $params['title']     ?? 'New Page' ),
-			(string) ( $params['template']  ?? '' ),
-			(string) ( $params['status']    ?? 'draft' ),
-			(int)    ( $params['parent']    ?? 0 ),
-			(array)  ( $params['widgets']   ?? array() ),
-			(string) ( $params['post_type'] ?? 'page' )
+			'' !== $title ? $title : 'New Page',
+			$template,
+			$status,
+			$parent,
+			$widgets,
+			$post_type
 		);
 		if ( isset( $result['success'] ) && $result['success'] ) {
 			$post_id    = (int) ( $result['post_id'] ?? 0 );
-			$extra_meta = (array) ( $params['extra_meta'] ?? array() );
+			$extra_meta = $params['extra_meta'] ?? array();
+			if ( is_string( $extra_meta ) ) {
+				$decoded    = json_decode( $extra_meta, true );
+				$extra_meta = is_array( $decoded ) ? $decoded : array();
+			}
+			$extra_meta = wp_kses_post_deep( is_array( $extra_meta ) ? $extra_meta : array() );
 
 			if ( $post_id > 0 && ! empty( $extra_meta ) ) {
 				$post_update = array( 'ID' => $post_id );
@@ -488,7 +655,7 @@ class PressArk_Handler_Elementor extends PressArk_Handler_Base {
 				}
 			}
 
-			if ( $post_id > 0 && 'future' === ( $params['status'] ?? '' ) && ! empty( $params['scheduled_date'] ) ) {
+			if ( $post_id > 0 && 'future' === $status && ! empty( $params['scheduled_date'] ) ) {
 				$scheduled_date = sanitize_text_field( (string) $params['scheduled_date'] );
 				wp_update_post( wp_slash( array(
 					'ID'            => $post_id,
@@ -503,8 +670,14 @@ class PressArk_Handler_Elementor extends PressArk_Handler_Base {
 				$result['post_id'],
 				'post',
 				null,
-				wp_json_encode( array( 'title' => $params['title'] ?? 'New Page' ) )
+				wp_json_encode( array( 'title' => '' !== $title ? $title : 'New Page' ) )
 			);
+			$result['notice'] = $notice;
+			$result['recommendation'] = 'native_blocks';
+			// PressArk v5.1.1 hardening: clear Elementor CSS cache after successful writes.
+			if ( class_exists( '\Elementor\Plugin' ) ) {
+				\Elementor\Plugin::$instance->files_manager->clear_cache();
+			}
 		}
 		return $result;
 	}

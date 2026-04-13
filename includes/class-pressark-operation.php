@@ -40,6 +40,9 @@ class PressArk_Operation {
 	/** @var string Default loading intent. */
 	private const DEFAULT_DEFER = 'auto';
 
+	/** @var string[] Supported loading intents. */
+	private const VALID_LOADING_INTENTS = array( 'auto', 'always_load', 'deferred' );
+
 	/**
 	 * Constructor — core contract (backward-compatible with v3.4.0).
 	 *
@@ -70,7 +73,13 @@ class PressArk_Operation {
 		public string  $description = '',
 		public string  $risk = 'safe',
 		public bool    $concurrency_safe = true,
-	) {}
+		int            $max_stream_chunk_tokens = 500,
+		mixed          $on_progress = null,
+	) {
+		// v5.6.0: Streaming progress via on_progress callback (inspired by Claude Code Tool.ts pattern).
+		$this->max_stream_chunk_tokens = max( 1, $max_stream_chunk_tokens );
+		$this->on_progress             = is_callable( $on_progress ) ? $on_progress : null;
+	}
 
 	// ── Extended execution contract (v5.3.0) ───────────────────────
 	//
@@ -148,6 +157,21 @@ class PressArk_Operation {
 	 * @var callable|null
 	 */
 	public mixed $validate = null;
+
+	/**
+	 * Pre-execution permission hook.
+	 *
+	 * v5.6.0: Pre-execution permission check (mirrors Claude Code
+	 * checkPermissions pattern).
+	 *
+	 * Intentionally left as mixed instead of ?callable because PHP does not
+	 * support callable-typed properties on all plugin-supported runtimes.
+	 *
+	 * Signature: fn(array $params, array $context): array
+	 *
+	 * @var callable|null
+	 */
+	public mixed $check_permissions = null;
 
 	/**
 	 * WordPress filter names to fire during execution lifecycle.
@@ -228,6 +252,23 @@ class PressArk_Operation {
 	 */
 	public array $model_guidance = array();
 
+	/**
+	 * Per-call progress callback for long-running operations.
+	 *
+	 * Intentionally left as mixed instead of ?callable because PHP does not
+	 * support callable-typed properties on all plugin-supported runtimes.
+	 *
+	 * @var callable|null
+	 */
+	public mixed $on_progress = null;
+
+	/**
+	 * Maximum size for a streamed progress payload before the caller chunks it.
+	 *
+	 * @var int
+	 */
+	public int $max_stream_chunk_tokens = 500;
+
 	// ── Contract application ───────────────────────────────────────
 
 	/**
@@ -244,13 +285,29 @@ class PressArk_Operation {
 	public function apply_contract( array $contract ): static {
 		$allowed = array(
 			'search_hint', 'interrupt', 'cache_ttl', 'output_policy',
-			'resumable', 'defer', 'idempotent', 'validate',
+			'resumable', 'defer', 'idempotent', 'validate', 'check_permissions',
 			'policy_hooks', 'tags', 'verification', 'read_invalidation',
-			'parameter_contract', 'model_guidance',
+			'parameter_contract', 'model_guidance', 'on_progress',
+			'max_stream_chunk_tokens',
 		);
 
 		foreach ( $allowed as $field ) {
 			if ( array_key_exists( $field, $contract ) ) {
+				if ( 'on_progress' === $field ) {
+					$this->on_progress = is_callable( $contract[ $field ] ) ? $contract[ $field ] : null;
+					continue;
+				}
+
+				if ( 'max_stream_chunk_tokens' === $field ) {
+					$this->max_stream_chunk_tokens = max( 1, (int) $contract[ $field ] );
+					continue;
+				}
+
+				if ( 'defer' === $field ) {
+					$this->defer = self::normalize_loading_intent( (string) $contract[ $field ] );
+					continue;
+				}
+
 				$this->{$field} = $contract[ $field ];
 			}
 		}
@@ -277,6 +334,56 @@ class PressArk_Operation {
 	 */
 	public function get_parameter_contract(): ?array {
 		return $this->has_parameter_contract() ? $this->parameter_contract : null;
+	}
+
+	/**
+	 * Compile the authoritative parameter contract into provider-ready schema.
+	 *
+	 * @since 5.6.0
+	 */
+	public function get_provider_parameter_schema(): ?array {
+		$contract = $this->get_parameter_contract();
+		if ( ! is_array( $contract ) ) {
+			return null;
+		}
+
+		return self::compile_provider_parameter_contract( $contract );
+	}
+
+	/**
+	 * Get compact registry-backed metadata for provider/discovery adapters.
+	 *
+	 * @since 5.6.0
+	 * @return array{label: string, description: string, search_hint: string, model_guidance: string[]}
+	 */
+	public function get_provider_metadata(): array {
+		$metadata = $this->get_discovery_metadata();
+
+		return array(
+			'label'          => (string) ( $metadata['label'] ?? '' ),
+			'description'    => (string) ( $metadata['description'] ?? '' ),
+			'search_hint'    => (string) ( $metadata['search_hint'] ?? '' ),
+			'model_guidance' => (array) ( $metadata['model_guidance'] ?? array() ),
+		);
+	}
+
+	/**
+	 * Get compact discovery + loading metadata for registry/catalog consumers.
+	 *
+	 * @since 5.6.0
+	 * @return array<string,mixed>
+	 */
+	public function get_discovery_metadata(): array {
+		return array(
+			'label'          => sanitize_text_field( $this->label ),
+			'description'    => sanitize_text_field( $this->description ),
+			'search_hint'    => sanitize_text_field( $this->search_hint ),
+			'model_guidance' => $this->get_model_guidance(),
+			'group'          => sanitize_key( $this->group ),
+			'capability'     => sanitize_key( $this->capability ),
+			'requires'       => is_string( $this->requires ) ? sanitize_key( $this->requires ) : '',
+			'defer'          => $this->get_loading_intent(),
+		);
 	}
 
 	/**
@@ -375,12 +482,21 @@ class PressArk_Operation {
 	}
 
 	/**
+	 * Get the canonical loading intent for this operation.
+	 *
+	 * @since 5.6.0
+	 */
+	public function get_loading_intent(): string {
+		return self::normalize_loading_intent( $this->defer );
+	}
+
+	/**
 	 * Whether this tool should always be loaded in the initial schema set.
 	 *
 	 * @since 5.3.0
 	 */
 	public function is_always_load(): bool {
-		return 'always_load' === $this->defer;
+		return 'always_load' === $this->get_loading_intent();
 	}
 
 	/**
@@ -389,7 +505,7 @@ class PressArk_Operation {
 	 * @since 5.3.0
 	 */
 	public function is_deferred(): bool {
-		return 'deferred' === $this->defer;
+		return 'deferred' === $this->get_loading_intent();
 	}
 
 	/**
@@ -466,6 +582,49 @@ class PressArk_Operation {
 	}
 
 	/**
+	 * Run the pre-execution permission hook for this operation.
+	 *
+	 * @since 5.6.0
+	 * @param array $params  Tool parameters.
+	 * @param array $context Lightweight execution context.
+	 * @return array{allowed: bool, behavior: string, reason: string, ui_action: string}
+	 */
+	public function check_permissions( array $params, array $context = array() ): array {
+		$default = array(
+			'allowed'   => true,
+			'behavior'  => 'allow',
+			'reason'    => '',
+			'ui_action' => 'none',
+		);
+
+		if ( null === $this->check_permissions || ! is_callable( $this->check_permissions ) ) {
+			return $default;
+		}
+
+		$result = call_user_func( $this->check_permissions, $params, $context );
+		if ( ! is_array( $result ) ) {
+			return $default;
+		}
+
+		$behavior = sanitize_key( (string) ( $result['behavior'] ?? '' ) );
+		if ( ! in_array( $behavior, array( 'allow', 'ask', 'block' ), true ) ) {
+			$behavior = ! empty( $result['allowed'] ) ? 'allow' : 'block';
+		}
+
+		$result['behavior'] = $behavior;
+		$result['allowed']  = 'allow' === $behavior;
+
+		if ( isset( $result['reason'] ) ) {
+			$result['reason'] = sanitize_text_field( (string) $result['reason'] );
+		}
+		if ( isset( $result['ui_action'] ) ) {
+			$result['ui_action'] = sanitize_key( (string) $result['ui_action'] );
+		}
+
+		return array_merge( $default, $result );
+	}
+
+	/**
 	 * Get the full execution contract as a flat array.
 	 *
 	 * Returns all operation semantics — both legacy and extended — in one
@@ -509,9 +668,10 @@ class PressArk_Operation {
 			// ── Caching & Output ──
 			'cache_ttl'        => $this->cache_ttl,
 			'output_policy'    => $this->output_policy,
+			'max_stream_chunk_tokens' => $this->max_stream_chunk_tokens,
 
 			// ── Loading Intent ──
-			'defer'            => $this->defer,
+			'defer'            => $this->get_loading_intent(),
 
 			// ── Policy Hooks ──
 			'policy_hooks'     => $this->policy_hooks,
@@ -522,6 +682,29 @@ class PressArk_Operation {
 			'parameter_contract' => $this->parameter_contract,
 			'model_guidance'     => $this->model_guidance,
 		);
+	}
+
+	/**
+	 * Compile an authoritative parameter contract into provider JSON Schema.
+	 *
+	 * @since 5.6.0
+	 */
+	public static function compile_provider_parameter_contract( array $contract ): array {
+		$schema = self::compile_provider_contract_node( $contract, true );
+		if ( empty( $schema['properties'] ) ) {
+			$schema['properties'] = new \stdClass();
+		}
+		if ( ! isset( $schema['required'] ) ) {
+			$schema['required'] = array();
+		}
+
+		// Some transports reject root composite keywords on tool schemas.
+		// Keep those invariants in runtime validation and guidance instead.
+		foreach ( array( 'oneOf', 'allOf', 'anyOf' ) as $keyword ) {
+			unset( $schema[ $keyword ] );
+		}
+
+		return $schema;
 	}
 
 	/**
@@ -542,6 +725,254 @@ class PressArk_Operation {
 		$params = self::apply_contract_aliases( $params, $this->parameter_contract );
 
 		return self::coerce_contract_value( $params, $this->parameter_contract );
+	}
+
+	/**
+	 * Compile one contract node into provider-facing JSON Schema.
+	 *
+	 * @since 5.6.0
+	 */
+	private static function compile_provider_contract_node( array $node, bool $is_root = false ): array {
+		$schema = array();
+		$type   = $node['type'] ?? null;
+
+		if ( null === $type && ( $is_root || isset( $node['properties'] ) ) ) {
+			$type = 'object';
+		}
+		if ( null === $type ) {
+			$type = 'string';
+		}
+
+		$schema['type'] = $type;
+
+		foreach ( array( 'description', 'enum', 'default', 'format', 'minimum', 'maximum', 'minLength', 'maxLength', 'minItems', 'maxItems', 'minProperties', 'maxProperties', 'pattern' ) as $key ) {
+			if ( array_key_exists( $key, $node ) ) {
+				$schema[ $key ] = $node[ $key ];
+			}
+		}
+
+		if ( is_array( $node['properties'] ?? null ) ) {
+			$properties = array();
+			foreach ( $node['properties'] as $property_name => $property_schema ) {
+				$property_name = (string) $property_name;
+				if ( '' === $property_name ) {
+					continue;
+				}
+
+				$properties[ $property_name ] = self::compile_provider_contract_node(
+					is_array( $property_schema ) ? $property_schema : array(),
+					false
+				);
+			}
+			$schema['properties'] = empty( $properties ) ? new \stdClass() : $properties;
+		}
+
+		if ( is_array( $node['items'] ?? null ) ) {
+			$schema['items'] = self::compile_provider_contract_node( $node['items'], false );
+		}
+
+		if ( isset( $node['required'] ) && is_array( $node['required'] ) ) {
+			$schema['required'] = array_values( array_filter( array_map( 'strval', $node['required'] ) ) );
+		}
+
+		if ( array_key_exists( 'additionalProperties', $node ) ) {
+			$schema['additionalProperties'] = $node['additionalProperties'];
+		} elseif ( ! empty( $node['strict'] ) && self::schema_allows_provider_type( $type, 'object' ) ) {
+			$schema['additionalProperties'] = false;
+		}
+
+		foreach ( (array) ( $node['one_of'] ?? array() ) as $group ) {
+			$compiled = self::compile_provider_contract_group( is_array( $group ) ? $group : array() );
+			if ( empty( $compiled['keyword'] ) || empty( $compiled['clauses'] ) ) {
+				continue;
+			}
+
+			foreach ( $compiled['clauses'] as $clause ) {
+				self::append_provider_schema_clause( $schema, $compiled['keyword'], $clause );
+			}
+		}
+
+		foreach ( (array) ( $node['dependencies'] ?? array() ) as $rule ) {
+			$clause = self::compile_provider_contract_dependency( is_array( $rule ) ? $rule : array() );
+			if ( null === $clause ) {
+				continue;
+			}
+
+			self::append_provider_schema_clause( $schema, 'allOf', $clause );
+		}
+
+		return $schema;
+	}
+
+	/**
+	 * Compile top-level one-of style groups into provider JSON Schema clauses.
+	 *
+	 * @since 5.6.0
+	 * @return array{keyword?: string, clauses?: array}
+	 */
+	private static function compile_provider_contract_group( array $group ): array {
+		$fields = array_values( array_filter( array_map( 'strval', (array) ( $group['fields'] ?? array() ) ) ) );
+		if ( empty( $fields ) || ! self::provider_paths_are_top_level( $fields ) ) {
+			return array();
+		}
+
+		$mode = sanitize_key( (string) ( $group['mode'] ?? 'exactly_one' ) );
+
+		if ( 'at_least_one' === $mode ) {
+			return array(
+				'keyword' => 'anyOf',
+				'clauses' => array_map(
+					static fn( string $field ): array => array( 'required' => array( $field ) ),
+					$fields
+				),
+			);
+		}
+
+		if ( in_array( $mode, array( 'at_most_one', 'mutually_exclusive' ), true ) ) {
+			$clauses     = array();
+			$field_count = count( $fields );
+			for ( $i = 0; $i < $field_count; $i++ ) {
+				for ( $j = $i + 1; $j < $field_count; $j++ ) {
+					$clauses[] = array(
+						'not' => array(
+							'allOf' => array(
+								array( 'required' => array( $fields[ $i ] ) ),
+								array( 'required' => array( $fields[ $j ] ) ),
+							),
+						),
+					);
+				}
+			}
+
+			return array(
+				'keyword' => 'allOf',
+				'clauses' => $clauses,
+			);
+		}
+
+		$alternatives = array();
+		foreach ( $fields as $field ) {
+			$others = array_values( array_diff( $fields, array( $field ) ) );
+			$branch = array(
+				'required' => array( $field ),
+			);
+			if ( ! empty( $others ) ) {
+				$branch['not'] = array(
+					'anyOf' => array_map(
+						static fn( string $other ): array => array( 'required' => array( $other ) ),
+						$others
+					),
+				);
+			}
+			$alternatives[] = $branch;
+		}
+
+		return array(
+			'keyword' => 'oneOf',
+			'clauses' => $alternatives,
+		);
+	}
+
+	/**
+	 * Compile dependency rules into provider JSON Schema conditionals.
+	 *
+	 * @since 5.6.0
+	 */
+	private static function compile_provider_contract_dependency( array $rule ): ?array {
+		$field = (string) ( $rule['field'] ?? '' );
+		if ( '' === $field || ! self::provider_paths_are_top_level( array( $field ) ) ) {
+			return null;
+		}
+
+		$condition = array(
+			'required' => array( $field ),
+		);
+		$values = array_values( (array) ( $rule['values'] ?? array() ) );
+		if ( ! empty( $values ) ) {
+			$condition['properties'] = array(
+				$field => array( 'enum' => $values ),
+			);
+		}
+
+		$then     = array();
+		$requires = array_values( array_filter( array_map( 'strval', (array) ( $rule['requires'] ?? array() ) ) ) );
+		$requires = array_values( array_filter(
+			$requires,
+			static fn( string $path ): bool => false === str_contains( $path, '.' )
+		) );
+		if ( ! empty( $requires ) ) {
+			$then['required'] = $requires;
+		}
+
+		foreach ( (array) ( $rule['field_values'] ?? array() ) as $other_field => $allowed_values ) {
+			$other_field = (string) $other_field;
+			if ( '' === $other_field || ! self::provider_paths_are_top_level( array( $other_field ) ) ) {
+				continue;
+			}
+
+			$then['required'][] = $other_field;
+			$then['properties'][ $other_field ] = array(
+				'enum' => array_values( (array) $allowed_values ),
+			);
+		}
+
+		if ( empty( $then ) ) {
+			return null;
+		}
+
+		if ( isset( $then['required'] ) ) {
+			$then['required'] = array_values( array_unique( $then['required'] ) );
+		}
+
+		return array(
+			'if'   => $condition,
+			'then' => $then,
+		);
+	}
+
+	/**
+	 * Append a provider JSON Schema composite clause.
+	 *
+	 * @since 5.6.0
+	 */
+	private static function append_provider_schema_clause( array &$schema, string $keyword, array $clause ): void {
+		if ( empty( $clause ) ) {
+			return;
+		}
+		if ( ! isset( $schema[ $keyword ] ) || ! is_array( $schema[ $keyword ] ) ) {
+			$schema[ $keyword ] = array();
+		}
+
+		$schema[ $keyword ][] = $clause;
+	}
+
+	/**
+	 * Whether a provider-facing schema type allows a JSON type.
+	 *
+	 * @since 5.6.0
+	 */
+	private static function schema_allows_provider_type( mixed $schema_type, string $type ): bool {
+		if ( is_array( $schema_type ) ) {
+			return in_array( $type, $schema_type, true );
+		}
+
+		return $schema_type === $type;
+	}
+
+	/**
+	 * Check whether provider-facing paths are top-level fields.
+	 *
+	 * @since 5.6.0
+	 * @param string[] $paths Paths to inspect.
+	 */
+	private static function provider_paths_are_top_level( array $paths ): bool {
+		foreach ( $paths as $path ) {
+			if ( str_contains( $path, '.' ) ) {
+				return false;
+			}
+		}
+
+		return true;
 	}
 
 	/**
@@ -1456,5 +1887,20 @@ class PressArk_Operation {
 	 */
 	private static function humanize_contract_path( string $path ): string {
 		return str_replace( '.', ' -> ', $path );
+	}
+
+	/**
+	 * Normalize loading intent to the supported registry contract values.
+	 *
+	 * @since 5.6.0
+	 */
+	private static function normalize_loading_intent( string $intent ): string {
+		$intent = sanitize_key( $intent );
+
+		if ( in_array( $intent, self::VALID_LOADING_INTENTS, true ) ) {
+			return $intent;
+		}
+
+		return self::DEFAULT_DEFER;
 	}
 }

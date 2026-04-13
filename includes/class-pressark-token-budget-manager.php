@@ -551,6 +551,20 @@ class PressArk_Token_Budget_Manager {
 
 		$normalized = array();
 		foreach ( $candidates as $candidate ) {
+			if ( is_string( $candidate ) || is_int( $candidate ) ) {
+				$name = sanitize_text_field( (string) $candidate );
+				if ( '' === $name ) {
+					continue;
+				}
+
+				$normalized[] = array(
+					'name'   => $name,
+					'tokens' => 0,
+					'type'   => 'group',
+				);
+				continue;
+			}
+
 			if ( ! is_array( $candidate ) ) {
 				continue;
 			}
@@ -563,9 +577,10 @@ class PressArk_Token_Budget_Manager {
 			}
 
 			$normalized[] = array(
-				'name'   => $name,
-				'tokens' => max( 0, (int) ( $candidate['tokens'] ?? $candidate['adjusted_tokens'] ?? 0 ) ),
-				'type'   => sanitize_key( (string) ( $candidate['type'] ?? 'group' ) ),
+				'name'           => $name,
+				'tokens'         => max( 0, (int) ( $candidate['tokens'] ?? $candidate['adjusted_tokens'] ?? 0 ) ),
+				'type'           => sanitize_key( (string) ( $candidate['type'] ?? 'group' ) ),
+				'loading_intent' => sanitize_key( (string) ( $candidate['loading_intent'] ?? '' ) ),
 			);
 		}
 

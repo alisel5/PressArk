@@ -390,6 +390,13 @@ class PressArk_Preflight {
 
 		foreach ( $keys as $key ) {
 			if ( in_array( $key, $wc_guarded_keys, true ) ) {
+				if ( '_price' === $key ) {
+					return self::block(
+						__( 'Cannot update raw "_price" on a WooCommerce product or variation — it is the active/computed price, so remapping it would be ambiguous.', 'pressark' ),
+						__( 'Use edit_product or edit_variation with one explicit field instead: regular_price for the base price, sale_price for a sale amount, or clear_sale=true to remove a sale. clear_sale is the canonical sale-removal path.', 'pressark' )
+					);
+				}
+
 				$target_tool = 'product_variation' === $post_type ? 'edit_variation' : 'edit_product';
 
 				// Build rewritten params mapping meta keys to edit_product fields.

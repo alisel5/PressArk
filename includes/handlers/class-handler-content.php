@@ -15,6 +15,110 @@ if ( ! defined( 'ABSPATH' ) ) { exit; }
 class PressArk_Handler_Content extends PressArk_Handler_Base {
 
 	/**
+	 * Fast pre-execution permission probe for content tools.
+	 *
+	 * @since 5.6.0
+	 */
+	public function check_permissions( string $tool_name, array $params, array $context = array() ): array {
+		$post_id = $this->permission_post_id( $params );
+
+		switch ( $tool_name ) {
+			case 'read_content':
+				if ( $post_id > 0 ) {
+					return $this->permission_require_capability(
+						$tool_name,
+						$params,
+						$context,
+						'read_post',
+						$post_id,
+						__( 'You do not have permission to read this post.', 'pressark' )
+					);
+				}
+				return $this->entitlement_permission( $tool_name, $params, $context );
+
+			case 'edit_content':
+			case 'update_meta':
+			case 'rewrite_content':
+				return $post_id > 0
+					? $this->permission_require_capability(
+						$tool_name,
+						$params,
+						$context,
+						'edit_post',
+						$post_id,
+						__( 'You do not have permission to edit this post.', 'pressark' )
+					)
+					: $this->permission_require_capability(
+						$tool_name,
+						$params,
+						$context,
+						'edit_posts',
+						null,
+						__( 'You do not have permission to edit content.', 'pressark' )
+					);
+
+			case 'create_post':
+			case 'generate_content':
+				$post_type = sanitize_key( (string) ( $params['post_type'] ?? 'post' ) );
+				$cap       = 'page' === $post_type ? 'publish_pages' : 'publish_posts';
+
+				return $this->permission_require_capability(
+					$tool_name,
+					$params,
+					$context,
+					$cap,
+					null,
+					__( 'You do not have permission to create this content.', 'pressark' )
+				);
+
+			case 'delete_content':
+				return $post_id > 0
+					? $this->permission_require_capability(
+						$tool_name,
+						$params,
+						$context,
+						'delete_post',
+						$post_id,
+						__( 'You do not have permission to delete this post.', 'pressark' )
+					)
+					: $this->permission_require_capability(
+						$tool_name,
+						$params,
+						$context,
+						'delete_posts',
+						null,
+						__( 'You do not have permission to delete content.', 'pressark' )
+					);
+
+			case 'bulk_delete':
+			case 'empty_trash':
+				return $this->permission_require_capability(
+					$tool_name,
+					$params,
+					$context,
+					'delete_posts',
+					null,
+					__( 'You do not have permission to delete content.', 'pressark' )
+				);
+
+			case 'generate_bulk_meta':
+			case 'bulk_edit':
+			case 'find_and_replace':
+			case 'rebuild_index':
+				return $this->permission_require_capability(
+					$tool_name,
+					$params,
+					$context,
+					'edit_posts',
+					null,
+					__( 'You do not have permission to edit content.', 'pressark' )
+				);
+		}
+
+		return $this->entitlement_permission( $tool_name, $params, $context );
+	}
+
+	/**
 	 * Read a post/page with mode-aware content reading.
 	 */
 	public function read_content( array $params ): array {
@@ -349,7 +453,11 @@ class PressArk_Handler_Content extends PressArk_Handler_Base {
 	 */
 	public function search_content( array $params ): array {
 		$query     = sanitize_text_field( $params['query'] ?? '' );
-		$post_type = sanitize_text_field( $params['post_type'] ?? 'any' );
+		// PressArk v5.1.1 hardening: validate post_type before querying.
+		$post_type = sanitize_key( $params['post_type'] ?? 'any' );
+		if ( 'any' !== $post_type && ! post_type_exists( $post_type ) ) {
+			$post_type = 'any';
+		}
 		$limit     = min( (int) ( $params['limit'] ?? 20 ), 100 );
 		$offset    = absint( $params['offset'] ?? 0 );
 
@@ -359,12 +467,17 @@ class PressArk_Handler_Content extends PressArk_Handler_Base {
 
 		$args = array(
 			's'              => $query,
-			'post_type'      => $post_type ?: 'any',
-			'post_status'    => array( 'publish', 'draft', 'private' ),
+			'post_type'      => $post_type,
 			'posts_per_page' => $limit,
 			'offset'         => $offset,
 			'orderby'        => 'relevance',
 		);
+		// PressArk v5.1.1 hardening: only expose non-public statuses to users with private-read capability.
+		if ( current_user_can( 'read_private_posts' ) ) {
+			$args['post_status'] = array( 'publish', 'draft', 'private', 'pending' );
+		} else {
+			$args['post_status'] = 'publish';
+		}
 
 		// Date filtering: after/before accept any strtotime-compatible string.
 		$date_query = array();
@@ -392,7 +505,12 @@ class PressArk_Handler_Content extends PressArk_Handler_Base {
 				'compare' => $compare,
 			);
 			if ( ! in_array( $compare, array( 'EXISTS', 'NOT EXISTS' ), true ) ) {
-				$meta_clause['value'] = $params['meta_value'] ?? '';
+				$meta_value = $params['meta_value'] ?? '';
+				// PressArk v5.1.1 hardening: sanitize scalar and array meta filters consistently.
+				$meta_value = is_array( $meta_value )
+					? array_map( 'sanitize_text_field', $meta_value )
+					: sanitize_text_field( $meta_value );
+				$meta_clause['value'] = $meta_value;
 			}
 			// phpcs:ignore WordPress.DB.SlowDBQuery.slow_db_query_meta_query -- Search tool intentionally exposes bounded WP_Query meta filtering when the caller requests it.
 			$args['meta_query'] = array( $meta_clause );
@@ -689,7 +807,7 @@ class PressArk_Handler_Content extends PressArk_Handler_Base {
 							__( 'Cannot update "%s" via raw meta on a WooCommerce product. Use edit_product instead — it keeps WC price lookup tables, stock caches, and inventory hooks in sync.', 'pressark' ),
 							$resolved_key
 						),
-						'hint'    => __( 'edit_product supports: name, regular_price, sale_price, sku, stock_quantity, stock_status, manage_stock, weight, and more.', 'pressark' ),
+						'hint'    => __( 'edit_product supports: name, regular_price, sale_price, clear_sale, sku, stock_quantity, stock_status, manage_stock, weight, and more.', 'pressark' ),
 					);
 				}
 			}
