@@ -314,7 +314,7 @@ class PressArk_Automation_Store {
 			'claimed_by'     => null,
 		);
 
-		if ( $automation && 'once' === ( $automation['cadence_type'] ?? '' ) ) {
+		if ( $automation && 'once' === ( $automation['cadence_type'] ?? '' ) && empty( $automation['event_trigger'] ) ) {
 			$update['status'] = 'archived';
 		}
 
@@ -351,7 +351,7 @@ class PressArk_Automation_Store {
 			return;
 		}
 
-		if ( 'once' === ( $automation['cadence_type'] ?? '' ) ) {
+		if ( 'once' === ( $automation['cadence_type'] ?? '' ) && empty( $automation['event_trigger'] ) ) {
 			$this->update( $automation_id, array(
 				'status'     => 'failed',
 				'next_run_at' => null,

@@ -319,6 +319,46 @@ class PressArk_Admin {
 			'default'           => array(),
 		) );
 
+		// Developer section — simulator toggle. Options register always so
+		// get_option() has stable defaults; the UI (section + fields) is
+		// only added in dev environments to keep prod surface area zero.
+		register_setting( 'pressark_settings', 'pressark_simulator_enabled', array(
+			'type'              => 'boolean',
+			'sanitize_callback' => 'rest_sanitize_boolean',
+			'default'           => false,
+			'autoload'          => false,
+		) );
+		register_setting( 'pressark_settings', 'pressark_simulator_url', array(
+			'type'              => 'string',
+			'sanitize_callback' => array( $this, 'sanitize_simulator_url' ),
+			'default'           => '',
+			'autoload'          => false,
+		) );
+
+		if ( PressArk_AI_Connector::simulator_is_dev_environment() ) {
+			add_settings_section(
+				'pressark_dev_section',
+				__( 'Developer', 'pressark' ),
+				array( $this, 'render_dev_section' ),
+				'pressark'
+			);
+
+			add_settings_field(
+				'pressark_simulator_enabled',
+				__( 'Dev Simulator', 'pressark' ),
+				array( $this, 'render_simulator_toggle_field' ),
+				'pressark',
+				'pressark_dev_section'
+			);
+
+			add_settings_field(
+				'pressark_simulator_url',
+				__( 'Simulator URL', 'pressark' ),
+				array( $this, 'render_simulator_url_field' ),
+				'pressark',
+				'pressark_dev_section'
+			);
+		}
 	}
 
 	/**
@@ -2027,6 +2067,157 @@ class PressArk_Admin {
 			esc_html__( 'days', 'pressark' )
 		);
 		echo '<p class="description">' . esc_html__( 'Archived one-shot automations older than this are deleted. Active, paused, and failed automations are retained. Default: 90 days.', 'pressark' ) . '</p>';
+	}
+
+	/**
+	 * Sanitize the simulator URL — require http(s) + a non-loopback/private
+	 * host is refused. Only localhost / private ranges are accepted because
+	 * the feature is a developer proxy, never a public relay.
+	 */
+	public function sanitize_simulator_url( $value ): string {
+		$url = trim( (string) $value );
+		if ( '' === $url ) {
+			return '';
+		}
+		$url = esc_url_raw( $url );
+		if ( '' === $url ) {
+			return '';
+		}
+		$parts = wp_parse_url( $url );
+		if ( ! is_array( $parts ) ) {
+			return '';
+		}
+		$scheme = strtolower( (string) ( $parts['scheme'] ?? '' ) );
+		if ( ! in_array( $scheme, array( 'http', 'https' ), true ) ) {
+			return '';
+		}
+		$host = strtolower( (string) ( $parts['host'] ?? '' ) );
+		if ( '' === $host ) {
+			return '';
+		}
+		// Only allow local/private hosts so the option can never be used to
+		// exfiltrate traffic to a public URL.
+		$allowed = false;
+		if ( in_array( $host, array( 'localhost', '127.0.0.1', '::1', 'host.docker.internal' ), true ) ) {
+			$allowed = true;
+		} elseif ( str_ends_with( $host, '.local' ) || str_ends_with( $host, '.test' ) || str_ends_with( $host, '.localhost' ) ) {
+			$allowed = true;
+		} elseif ( filter_var( $host, FILTER_VALIDATE_IP ) ) {
+			// Accept RFC1918 + loopback IPv4 explicitly.
+			if ( 0 === strpos( $host, '10.' ) || 0 === strpos( $host, '192.168.' ) || 0 === strpos( $host, '127.' ) ) {
+				$allowed = true;
+			} elseif ( 1 === preg_match( '/^172\.(1[6-9]|2\d|3[01])\./', $host ) ) {
+				$allowed = true;
+			}
+		}
+		if ( ! $allowed ) {
+			add_settings_error(
+				'pressark_simulator_url',
+				'pressark_simulator_url_host',
+				__( 'Simulator URL must point to a local or private host (localhost, 127.0.0.1, host.docker.internal, *.local, *.test, 10.x, 192.168.x, 172.16-31.x).', 'pressark' )
+			);
+			return '';
+		}
+		return $url;
+	}
+
+	/**
+	 * Introductory copy for the Developer section.
+	 */
+	public function render_dev_section(): void {
+		$env_note = sprintf(
+			/* translators: 1: home URL host, 2: WP_DEBUG state */
+			esc_html__( 'Only visible because this site is local (%1$s) and WP_DEBUG is %2$s. These settings have no effect in production — the section is not rendered there.', 'pressark' ),
+			'<code>' . esc_html( (string) wp_parse_url( home_url(), PHP_URL_HOST ) ) . '</code>',
+			'<code>on</code>'
+		);
+		echo '<p class="description">' . wp_kses( $env_note, array( 'code' => array() ) ) . '</p>';
+	}
+
+	/**
+	 * Toggle for the simulator (plus constant-override notice).
+	 */
+	public function render_simulator_toggle_field(): void {
+		$constant_active = defined( 'PRESSARK_SIMULATOR_URL' ) && PRESSARK_SIMULATOR_URL;
+		$enabled         = (bool) get_option( 'pressark_simulator_enabled', false );
+
+		if ( $constant_active ) {
+			printf(
+				'<label><input type="checkbox" disabled %s /> %s</label>',
+				checked( true, true, false ),
+				esc_html__( 'Active via PRESSARK_SIMULATOR_URL in wp-config.php', 'pressark' )
+			);
+			echo '<p class="description">' . esc_html__( 'The wp-config constant always wins over this option. Remove it to manage the simulator from this page.', 'pressark' ) . '</p>';
+			return;
+		}
+
+		printf(
+			'<label><input type="checkbox" name="pressark_simulator_enabled" value="1" %s /> %s</label>',
+			checked( $enabled, true, false ),
+			esc_html__( 'Route OpenAI-format API calls to the local simulator proxy', 'pressark' )
+		);
+		echo '<p class="description">' . wp_kses(
+			__( 'When on, PressArk sends chat-completion requests to the URL below instead of the real provider. Start the proxy from <code>_dev-simulator/proxy.py</code> first.', 'pressark' ),
+			array( 'code' => array() )
+		) . '</p>';
+	}
+
+	/**
+	 * URL input + reachability badge.
+	 */
+	public function render_simulator_url_field(): void {
+		$constant_active = defined( 'PRESSARK_SIMULATOR_URL' ) && PRESSARK_SIMULATOR_URL;
+		$value           = $constant_active
+			? (string) PRESSARK_SIMULATOR_URL
+			: (string) get_option( 'pressark_simulator_url', 'http://host.docker.internal:8765/v1/chat/completions' );
+
+		printf(
+			'<input type="url" name="pressark_simulator_url" value="%1$s" class="regular-text" placeholder="%2$s" %3$s />',
+			esc_attr( $value ),
+			esc_attr( 'http://host.docker.internal:8765/v1/chat/completions' ),
+			$constant_active ? 'disabled' : ''
+		);
+		echo ' <span id="pressark-simulator-status" class="description" style="margin-left:8px;">—</span>';
+		echo '<p class="description">' . esc_html__( 'Only local / private hosts are accepted (localhost, 127.0.0.1, host.docker.internal, *.local, *.test, RFC1918).', 'pressark' ) . '</p>';
+
+		$ajax_url = esc_url( rest_url( 'pressark/v1/dev/simulator-probe' ) );
+		$nonce    = esc_attr( wp_create_nonce( 'wp_rest' ) );
+		?>
+		<script>
+		(function(){
+			var urlInput = document.querySelector('input[name="pressark_simulator_url"]');
+			var statusEl = document.getElementById('pressark-simulator-status');
+			if (!urlInput || !statusEl) return;
+			var debounce = null;
+			function probe() {
+				var target = urlInput.value.trim();
+				if (!target) { statusEl.textContent = '—'; statusEl.style.color = ''; return; }
+				statusEl.textContent = 'checking…';
+				statusEl.style.color = '#777';
+				var q = new URLSearchParams({ url: target }).toString();
+				fetch('<?php echo $ajax_url; // phpcs:ignore ?>?' + q, {
+					headers: { 'X-WP-Nonce': '<?php echo $nonce; // phpcs:ignore ?>' }
+				}).then(function(r){ return r.json(); }).then(function(r){
+					if (r && r.reachable) {
+						statusEl.textContent = '✓ reachable (' + (r.status_code || 'ok') + ')';
+						statusEl.style.color = '#3a6';
+					} else {
+						statusEl.textContent = '✗ ' + (r && r.error ? r.error : 'unreachable');
+						statusEl.style.color = '#c33';
+					}
+				}).catch(function(e){
+					statusEl.textContent = '✗ ' + (e.message || 'error');
+					statusEl.style.color = '#c33';
+				});
+			}
+			urlInput.addEventListener('input', function(){
+				clearTimeout(debounce);
+				debounce = setTimeout(probe, 500);
+			});
+			probe();
+		})();
+		</script>
+		<?php
 	}
 
 	/**

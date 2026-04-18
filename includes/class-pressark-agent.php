@@ -42,7 +42,7 @@ class PressArk_Agent {
 	// Proactive checkpoint priming happens earlier than live compaction so the
 	// run always has a durable continuation capsule before budget pressure.
 	const SOFT_OUTPUT_BUDGET_RATIO     = 0.6;
-	const LIVE_COMPACTION_TOKEN_RATIO  = 0.82;
+	const LIVE_COMPACTION_TOKEN_RATIO  = 0.90;
 	const SUMMARY_HEADROOM_OUT_TOKENS  = 320;
 
 	// v5.0.6: Token-based compression ceiling (replaces ICU-based).
@@ -85,6 +85,7 @@ class PressArk_Agent {
 	private int    $discover_calls     = 0;
 	private int    $discover_zero_hits = 0;
 	private int    $load_calls         = 0;
+	private int    $max_discover_calls = self::MAX_DISCOVER_CALLS;
 	private int    $initial_tool_count = 0;
 
 	// v3.2.0: Spin detection — tracks consecutive rounds with no real progress.
@@ -98,10 +99,19 @@ class PressArk_Agent {
 
 	// v4.3.2: Execution plan from planner — guides agent step ordering.
 	private array  $plan_steps = array();
+	private array  $cached_ai_plan = array();
 	private int    $plan_step  = 1;
 	private string $planning_mode = 'none';
 	private array  $planning_decision = array();
 	private array  $active_plan_artifact = array();
+	private string $last_plan_progress_signature = '';
+
+	// Set when update_plan succeeds in plan mode. Signals the agent loop to
+	// break early and let finalize_plan_mode_result render a plan_ready card,
+	// so the user doesn't wait for round_limit to fire.
+	private bool   $plan_just_proposed = false;
+	private int    $plan_stall_rounds = 0;
+	private string $plan_stall_message = '';
 
 	// v4.0.0: Automation context for unattended runs.
 	private ?array $automation_context = null;
@@ -156,6 +166,7 @@ class PressArk_Agent {
 			? $planning_mode
 			: 'none';
 		$this->planning_decision = is_array( $context['planning_decision'] ?? null ) ? (array) $context['planning_decision'] : array();
+		$this->max_discover_calls = max( 0, (int) ( $context['max_discover_calls'] ?? self::MAX_DISCOVER_CALLS ) );
 
 		if ( class_exists( 'PressArk_Plan_Artifact' ) && ! empty( $context['plan_artifact'] ) && is_array( $context['plan_artifact'] ) ) {
 			$this->active_plan_artifact = PressArk_Plan_Artifact::ensure( $context['plan_artifact'] );
@@ -282,7 +293,7 @@ class PressArk_Agent {
 			return false;
 		}
 
-		if ( in_array( $tool_name, array( 'discover_tools', 'load_tools', 'load_tool_group' ), true ) ) {
+		if ( in_array( $tool_name, array( 'discover_tools', 'load_tools', 'load_tool_group', 'update_plan' ), true ) ) {
 			return true;
 		}
 
@@ -325,7 +336,7 @@ class PressArk_Agent {
 
 		$descriptor_tools = array_values( array_filter(
 			$allowed_names,
-			static fn( string $tool_name ): bool => ! in_array( $tool_name, array( 'discover_tools', 'load_tools', 'load_tool_group' ), true )
+			static fn( string $tool_name ): bool => ! in_array( $tool_name, array( 'discover_tools', 'load_tools', 'load_tool_group', 'update_plan' ), true )
 		) );
 		$tool_set['descriptors']            = class_exists( 'PressArk_Tools' )
 			? PressArk_Tools::get_prompt_snippets( $descriptor_tools )
@@ -478,20 +489,242 @@ class PressArk_Agent {
 			return $fallback_steps;
 		}
 
+		// Prefer a cached plan_with_ai result over the regex template so the
+		// user-visible plan reflects the AI-driven classifier output rather
+		// than generic "review / prepare / apply / verify" scaffolding.
+		if ( ! empty( $this->cached_ai_plan['steps'] ?? array() ) ) {
+			$ai_steps = array_values( array_filter( array_map(
+				static fn( $s ) => is_string( $s ) ? trim( $s ) : '',
+				(array) $this->cached_ai_plan['steps']
+			), 'strlen' ) );
+			if ( ! empty( $ai_steps ) ) {
+				return $this->build_plan_step_rows( $ai_steps );
+			}
+		}
+
 		$message = trim( $this->request_message );
 		if ( '' === $message ) {
 			return array();
 		}
 
+		$task_type = self::refine_chat_task_type( $message, $this->task_type );
+
 		$groups = $this->refine_preload_groups(
 			$message,
-			$this->task_type,
-			self::detect_preload_groups( $message, $this->task_type )
+			$task_type,
+			self::detect_preload_groups( $message, $task_type )
 		);
 
 		return $this->build_plan_step_rows(
-			$this->infer_local_plan_steps( $message, $this->task_type, $groups )
+			$this->infer_local_plan_steps( $message, $task_type, $groups )
 		);
+	}
+
+	private static function refine_chat_task_type( string $message, string $task_type ): string {
+		if ( 'chat' !== $task_type ) {
+			return $task_type;
+		}
+
+		$normalized = strtolower( trim( preg_replace( '/\s+/', ' ', $message ) ) );
+		if ( '' === $normalized ) {
+			return $task_type;
+		}
+
+		if (
+			preg_match( '/\b(?:make|create|build|design)\b/i', $normalized )
+			&& preg_match( '/\b(?:new|fresh|from scratch)\b/i', $normalized )
+			&& preg_match(
+				'/\b(?:post|page|article|blog(?:\s+post)?|landing\s+page|homepage|home\s+page|description|copy|headline|hero|section|banner)\b/i',
+				$normalized
+			)
+		) {
+			return 'generate';
+		}
+
+		if (
+			(
+				preg_match( '/\b(?:product|products|catalog|catalogue|store|shop|woo|woocommerce)\b/i', $normalized )
+				&& preg_match( '/\b(?:price|pricing|sale|discount|markdown|markup|off|regular price|sale price)\b/i', $normalized )
+			)
+			|| preg_match(
+				'/\b(?:current price|regular price|sale price)\b.*(?:[-+]\s*\d+(?:\.\d+)?%?|\d+(?:\.\d+)?%\s*off)|(?:[-+]\s*\d+(?:\.\d+)?%?|\d+(?:\.\d+)?%\s*off).*\b(?:current price|regular price|sale price)\b/i',
+				$normalized
+			)
+		) {
+			return 'edit';
+		}
+
+		if (
+			preg_match(
+				'/\b(?:make|turn|move|match|use|swap|rename|reorder|restyl(?:e|ing)|redesign|adjust|align|clean(?:\s+up)?|polish|tighten|refresh|show|hide)\b/i',
+				$normalized
+			)
+			&& preg_match(
+				'/\b(?:hero|section|banner|headline|title|cta|button|copy|text|image|gallery|logo|header|footer|menu|navigation|layout|block|widget|form|page|post|homepage|home\s+page|landing\s+page|product|pricing|price|seo|meta|description|setting|theme|plugin|template|css|php|javascript|js)\b/i',
+				$normalized
+			)
+		) {
+			return 'edit';
+		}
+
+		return $task_type;
+	}
+
+	private static function infer_wc_price_write_mode( string $message ): string {
+		$normalized = strtolower( trim( preg_replace( '/\s+/', ' ', $message ) ) );
+		if ( '' === $normalized ) {
+			return 'none';
+		}
+
+		if ( preg_match( '/\b(?:remove|end|clear|stop|cancel)\b.*\bsale\b/i', $normalized ) ) {
+			return 'clear_sale';
+		}
+
+		if (
+			preg_match( '/\b(?:sale price|on sale)\b/i', $normalized )
+			|| preg_match( '/\b(?:apply|start|run|set|put|place|mark)\b.{0,24}\bsale\b/i', $normalized )
+			|| preg_match( '/\b\d+(?:\.\d+)?%\s+sale\b/i', $normalized )
+		) {
+			return 'sale';
+		}
+
+		if (
+			preg_match( '/\b(?:regular price|base price|current price)\b/i', $normalized )
+			|| preg_match( '/\b(?:increase|decrease|raise|lower|reduce|drop|cut|bump|mark\s+up|markup)\b/i', $normalized )
+		) {
+			return 'regular';
+		}
+
+		if (
+			preg_match( '/\b(?:discount|off|cheaper|less expensive|price change|price adjustment|adjust price|change price|update price)\b/i', $normalized )
+			|| preg_match( '/(?:[-+]\s*\d+(?:\.\d+)?%?|\d+(?:\.\d+)?%\s*off)/i', $normalized )
+		) {
+			return 'ambiguous';
+		}
+
+		if ( preg_match( '/\bsale\b/i', $normalized ) ) {
+			return 'sale';
+		}
+
+		return 'none';
+	}
+
+	private static function wc_message_mentions_price_amount( string $message ): bool {
+		$normalized = strtolower( trim( preg_replace( '/\s+/', ' ', $message ) ) );
+		if ( '' === $normalized ) {
+			return false;
+		}
+
+		return (bool) preg_match(
+			'/(?:[-+]\s*\d+(?:\.\d+)?%?|\d+(?:\.\d+)?%\s*off|\b(?:to|at|for)\s*(?:usd|eur|gbp|cad|aud|\$)?\s*\d+(?:\.\d+)?\b|(?:usd|eur|gbp|cad|aud|\$)\s*\d+(?:\.\d+)?\b|\bfree\b)/i',
+			$normalized
+		);
+	}
+
+	public static function build_plan_clarification_reply( string $message, string $task_type = 'chat', array $groups = array() ): string {
+		$message   = trim( PressArk_Plan_Mode::strip_plan_directive( $message ) );
+		$task_type = self::refine_chat_task_type( $message, $task_type );
+		$groups    = array_values( array_filter( array_map(
+			static function ( $group ) {
+				if ( ! is_string( $group ) ) {
+					return '';
+				}
+
+				if ( class_exists( 'PressArk_Operation_Registry' ) && ! PressArk_Operation_Registry::is_valid_group( $group ) ) {
+					return '';
+				}
+
+				return $group;
+			},
+			$groups
+		) ) );
+
+		if (
+			preg_match( '/\bproducts?\b/i', $message )
+			|| in_array( 'woocommerce', $groups, true )
+		) {
+			$has_bulk_scope = (bool) preg_match(
+				'/\b(?:all(?:\s+of\s+them)?|every|each|bulk|batch|across|multiple|site-?wide|entire|catalog|catalogue|dozens|hundreds)\b/i',
+				$message
+			);
+			$price_mode       = self::infer_wc_price_write_mode( $message );
+			$has_price_amount = self::wc_message_mentions_price_amount( $message );
+			if ( 'ambiguous' === $price_mode ) {
+				return __( 'Do you want this applied as a WooCommerce sale price, or should I reduce the regular price instead?', 'pressark' );
+			}
+			if ( 'sale' === $price_mode ) {
+				if ( $has_bulk_scope && ! $has_price_amount ) {
+					return __( 'What sale price or discount should I apply across those products?', 'pressark' );
+				}
+
+				if ( ! $has_bulk_scope ) {
+					return $has_price_amount
+						? __( 'Which products should I put on sale?', 'pressark' )
+						: __( 'Which products should I put on sale, and what sale amount should I use?', 'pressark' );
+				}
+			}
+
+			if ( 'regular' === $price_mode ) {
+				if ( $has_bulk_scope && ! $has_price_amount ) {
+					return __( 'How much should I increase or decrease the regular price across those products?', 'pressark' );
+				}
+
+				if ( ! $has_bulk_scope ) {
+					return $has_price_amount
+						? __( 'Which products should I change the regular price for?', 'pressark' )
+						: __( 'Which products should I update, and by how much should I change the regular price?', 'pressark' );
+				}
+			}
+
+			if ( 'clear_sale' === $price_mode && ! $has_bulk_scope ) {
+				return __( 'Which products should I remove the sale from?', 'pressark' );
+			}
+
+			return (bool) preg_match(
+				'/\b(?:all|every|bulk|batch|across|multiple|site-?wide|entire|catalog|catalogue|dozens|hundreds|\d+\s+(?:products?|posts?|pages?|items?|orders?))\b/i',
+				$message
+			)
+				? __( 'Which products should I update, and what change should I make to them?', 'pressark' )
+				: __( 'Which product should I update, and what should I change?', 'pressark' );
+		}
+
+		if (
+			preg_match( '/\bseo\b|meta.?title|meta.?desc|canonical|robots\.txt|schema|search.?engine/i', $message )
+			|| in_array( 'seo', $groups, true )
+		) {
+			return __( 'Which page, post, or product should I work on for this SEO change?', 'pressark' );
+		}
+
+		if (
+			preg_match( '/\bplugin|theme|css|php|javascript|js|template|shortcode|snippet|hook|filter|code\b/i', $message )
+			|| 'code' === $task_type
+		) {
+			return __( 'Which plugin, theme area, or code file should I change?', 'pressark' );
+		}
+
+		if ( preg_match( '/\bsetting|settings|option|site title|tagline|menu|widget\b/i', $message ) ) {
+			return __( 'Which setting or admin area should I update?', 'pressark' );
+		}
+
+		if (
+			preg_match(
+				'/\bpage|post|article|homepage|home\s+page|landing\s+page|hero|section|banner|headline|cta|button|copy|text|image|header|footer|layout\b/i',
+				$message
+			)
+			|| in_array( 'content', $groups, true )
+		) {
+			return __( 'Which page or post should I update, and what should I change on it?', 'pressark' );
+		}
+
+		if ( 'generate' === $task_type ) {
+			return __( 'What should I create, and where should it go on the site?', 'pressark' );
+		}
+
+		if ( 'edit' === $task_type ) {
+			return __( 'What exact part of the site should I change, and what should the new result be?', 'pressark' );
+		}
+
+		return __( 'What should I work on first: a page, product, setting, or code change?', 'pressark' );
 	}
 
 	private function plan_response_requires_user_input( string $text ): bool {
@@ -526,6 +759,1615 @@ class PressArk_Agent {
 		);
 	}
 
+	private function checkpoint_has_grounded_plan_context( PressArk_Checkpoint $checkpoint ): bool {
+		if ( method_exists( $checkpoint, 'get_read_state' ) && ! empty( $checkpoint->get_read_state() ) ) {
+			return true;
+		}
+
+		if ( method_exists( $checkpoint, 'get_selected_target' ) && ! empty( $checkpoint->get_selected_target() ) ) {
+			return true;
+		}
+
+		return method_exists( $checkpoint, 'get_entities' ) && ! empty( $checkpoint->get_entities() );
+	}
+
+	private function planning_requires_grounded_reads(): bool {
+		return $this->is_plan_mode() || $this->is_soft_plan_mode();
+	}
+
+	private function build_grounding_retry_message( bool $before_writes = false ): string {
+		return $before_writes
+			? __( 'Inspect the current state with relevant read tools first. Do not propose or execute writes until those read results are in context.', 'pressark' )
+			: __( 'Use relevant read-only tools first to inspect the current state and exact targets. Do not finalize the plan yet; build it from those read results.', 'pressark' );
+	}
+
+	private function build_plan_synthesis_retry_message(): string {
+		return __( 'Use the read results already in context to write the numbered checklist now. Base it on the exact targets, current state, risks, and verification reads you uncovered.', 'pressark' );
+	}
+
+	private function build_read_first_synthetic_result(): array {
+		return array(
+			'success' => false,
+			'error'   => 'read_before_write_required',
+			'message' => $this->build_grounding_retry_message( true ),
+		);
+	}
+
+	/**
+	 * Build a synthetic tool-result for malformed/unknown tool calls.
+	 *
+	 * Includes the tool name (so the model can correlate without parsing
+	 * tool_use_id) and, in plan mode, a hint pointing the model toward the
+	 * read-only / meta tools that ARE available — which avoids the model
+	 * silently retrying the same blocked write call.
+	 */
+	private function build_invalid_tool_input_result( string $tool_name, string $message ): array {
+		$message = trim( sanitize_text_field( $message ) );
+		if ( '' === $message ) {
+			$message = __( 'Invalid input for this tool.', 'pressark' );
+		}
+
+		if ( $this->is_plan_mode() ) {
+			$message .= ' ' . __( 'You are in plan mode — only read-only tools and update_plan are available. Use discover_tools or load_tools to find the right read tool, inspect the current state, then call update_plan with the proposed steps.', 'pressark' );
+		}
+
+		return array(
+			'success' => false,
+			'error'   => 'invalid_tool_input',
+			'tool'    => sanitize_key( $tool_name ),
+			'message' => sanitize_text_field( $message ),
+		);
+	}
+
+	/**
+	 * Build synthetic tool results for writes that pause in the preview flow.
+	 *
+	 * This closes the replay gap where preview-triggering tool calls used to
+	 * return without any matching tool_result message, which forced replay
+	 * repair to inject a placeholder later.
+	 *
+	 * @param array<int,array<string,mixed>> $tool_calls Previewable tool calls.
+	 * @param array<string,mixed>            $session    Preview session payload.
+	 * @return array<int,array<string,mixed>>
+	 */
+	private function build_preview_pause_tool_results( array $tool_calls, array $session ): array {
+		return $this->build_write_pause_tool_results(
+			$tool_calls,
+			'preview_pending',
+			array(
+				'preview_session_id' => sanitize_text_field( (string) ( $session['session_id'] ?? '' ) ),
+				'preview_url'        => esc_url_raw( (string) ( $session['signed_url'] ?? '' ) ),
+				'diff'               => is_array( $session['diff'] ?? null ) ? (array) $session['diff'] : array(),
+			)
+		);
+	}
+
+	/**
+	 * Build synthetic tool results for writes that pause behind a confirm card.
+	 *
+	 * @param array<int,array<string,mixed>> $tool_calls Confirm-required tool calls.
+	 * @return array<int,array<string,mixed>>
+	 */
+	private function build_confirm_pause_tool_results( array $tool_calls ): array {
+		return $this->build_write_pause_tool_results( $tool_calls, 'confirm_pending' );
+	}
+
+	/**
+	 * Build synthetic tool results for preview-session creation failures.
+	 *
+	 * @param array<int,array<string,mixed>> $tool_calls Previewable tool calls.
+	 * @param string                         $message    Failure message.
+	 * @return array<int,array<string,mixed>>
+	 */
+	private function build_preview_failure_tool_results( array $tool_calls, string $message ): array {
+		$results       = array();
+		$pending_count = count( $tool_calls );
+		$message       = sanitize_text_field( $message );
+
+		foreach ( $tool_calls as $tool_call ) {
+			if ( ! is_array( $tool_call ) ) {
+				continue;
+			}
+
+			$tool_use_id = sanitize_text_field( (string) ( $tool_call['id'] ?? '' ) );
+			if ( '' === $tool_use_id ) {
+				continue;
+			}
+
+			$tool_name = sanitize_key( (string) ( $tool_call['name'] ?? $tool_call['type'] ?? '' ) );
+			$args      = is_array( $tool_call['arguments'] ?? null )
+				? (array) $tool_call['arguments']
+				: ( is_array( $tool_call['params'] ?? null ) ? (array) $tool_call['params'] : array() );
+
+			$results[] = array(
+				'tool_use_id' => $tool_use_id,
+				'result'      => array(
+					'success' => false,
+					'error'   => 'preview_session_failed',
+					'message' => $message,
+					'data'    => array_filter(
+						array(
+							'status'               => 'preview_error',
+							'approval_ui'          => 'preview',
+							'tool_name'            => $tool_name,
+							'pending_action_count' => $pending_count,
+							'args_preview'         => $this->summarize_pause_tool_args( $args ),
+						),
+						static function ( $value ): bool {
+							return is_array( $value ) ? ! empty( $value ) : '' !== (string) $value;
+						}
+					),
+				),
+			);
+		}
+
+		return $results;
+	}
+
+	/**
+	 * Build replay-safe synthetic tool results for write proposals.
+	 *
+	 * @param array<int,array<string,mixed>> $tool_calls Tool calls to materialize.
+	 * @param string                         $status     preview_pending|confirm_pending.
+	 * @param array<string,mixed>            $extra      Shared status metadata.
+	 * @return array<int,array<string,mixed>>
+	 */
+	private function build_write_pause_tool_results( array $tool_calls, string $status, array $extra = array() ): array {
+		$results       = array();
+		$pending_count = count( $tool_calls );
+
+		foreach ( $tool_calls as $tool_call ) {
+			if ( ! is_array( $tool_call ) ) {
+				continue;
+			}
+
+			$tool_use_id = sanitize_text_field( (string) ( $tool_call['id'] ?? '' ) );
+			if ( '' === $tool_use_id ) {
+				continue;
+			}
+
+			$tool_name = sanitize_key( (string) ( $tool_call['name'] ?? $tool_call['type'] ?? '' ) );
+			$args      = is_array( $tool_call['arguments'] ?? null )
+				? (array) $tool_call['arguments']
+				: ( is_array( $tool_call['params'] ?? null ) ? (array) $tool_call['params'] : array() );
+
+			$data = array(
+				'status'               => $status,
+				'approval_ui'          => 'preview_pending' === $status ? 'preview' : 'confirm_card',
+				'tool_name'            => $tool_name,
+				'pending_action_count' => $pending_count,
+				'args_preview'         => $this->summarize_pause_tool_args( $args ),
+			);
+
+			if ( 'preview_pending' === $status ) {
+				$data['preview_session_id'] = sanitize_text_field( (string) ( $extra['preview_session_id'] ?? '' ) );
+				$data['preview_url']        = esc_url_raw( (string) ( $extra['preview_url'] ?? '' ) );
+				$data['diff_summary']       = $this->summarize_preview_diff( (array) ( $extra['diff'] ?? array() ) );
+			}
+
+			$results[] = array(
+				'tool_use_id' => $tool_use_id,
+				'result'      => array(
+					'success' => true,
+					'message' => $this->write_pause_result_message( $status, $pending_count ),
+					'data'    => array_filter(
+						$data,
+						static function ( $value ): bool {
+							return is_array( $value ) ? ! empty( $value ) : '' !== (string) $value;
+						}
+					),
+				),
+			);
+		}
+
+		return $results;
+	}
+
+	/**
+	 * Human-readable pause status for replayed write tool results.
+	 */
+	private function write_pause_result_message( string $status, int $pending_count ): string {
+		if ( 'preview_pending' === $status ) {
+			return $pending_count > 1
+				? __( 'Writes staged in preview. Awaiting user approval before apply.', 'pressark' )
+				: __( 'Write staged in preview. Awaiting user approval before apply.', 'pressark' );
+		}
+
+		if ( 'confirm_pending' === $status ) {
+			return $pending_count > 1
+				? __( 'Write proposals are awaiting user confirmation before apply.', 'pressark' )
+				: __( 'Write proposal is awaiting user confirmation before apply.', 'pressark' );
+		}
+
+		return __( 'Write request is awaiting approval before apply.', 'pressark' );
+	}
+
+	/**
+	 * Keep only compact scalar args in synthetic write tool results.
+	 *
+	 * @param array<string,mixed> $args Tool arguments.
+	 * @return array<string,mixed>
+	 */
+	private function summarize_pause_tool_args( array $args ): array {
+		$summary = array();
+
+		foreach ( $args as $key => $value ) {
+			if ( count( $summary ) >= 6 ) {
+				break;
+			}
+
+			$clean_key = sanitize_key( (string) $key );
+			if ( '' === $clean_key ) {
+				continue;
+			}
+
+			if ( is_scalar( $value ) || null === $value ) {
+				if ( is_string( $value ) ) {
+					$value = sanitize_text_field( $value );
+					if ( '' === trim( $value ) ) {
+						continue;
+					}
+					if ( mb_strlen( $value ) > 120 ) {
+						$value = mb_substr( $value, 0, 117 ) . '...';
+					}
+				}
+
+				$summary[ $clean_key ] = $value;
+				continue;
+			}
+
+			if ( ! is_array( $value ) || empty( $value ) ) {
+				continue;
+			}
+
+			$scalars = array();
+			foreach ( array_slice( $value, 0, 3 ) as $item ) {
+				if ( ! is_scalar( $item ) && null !== $item ) {
+					continue;
+				}
+
+				if ( is_string( $item ) ) {
+					$item = sanitize_text_field( $item );
+					if ( mb_strlen( $item ) > 80 ) {
+						$item = mb_substr( $item, 0, 77 ) . '...';
+					}
+				}
+
+				$scalars[] = $item;
+			}
+
+			if ( ! empty( $scalars ) ) {
+				$summary[ $clean_key ] = $scalars;
+			} else {
+				$summary[ $clean_key . '_count' ] = count( $value );
+			}
+		}
+
+		return $summary;
+	}
+
+	/**
+	 * Compact diff summary for preview-session replay results.
+	 *
+	 * @param array<int,array<string,mixed>> $diff Preview diff rows.
+	 * @return array<string,mixed>
+	 */
+	private function summarize_preview_diff( array $diff ): array {
+		if ( empty( $diff ) ) {
+			return array();
+		}
+
+		$labels = array();
+		$fields = array();
+
+		foreach ( array_slice( $diff, 0, 3 ) as $entry ) {
+			if ( ! is_array( $entry ) ) {
+				continue;
+			}
+
+			$label = sanitize_text_field( (string) ( $entry['label'] ?? '' ) );
+			if ( '' !== $label ) {
+				$labels[] = $label;
+			}
+
+			foreach ( array_slice( (array) ( $entry['items'] ?? array() ), 0, 3 ) as $item ) {
+				if ( ! is_array( $item ) ) {
+					continue;
+				}
+
+				$field = sanitize_text_field( (string) ( $item['field'] ?? '' ) );
+				if ( '' !== $field ) {
+					$fields[] = $field;
+				}
+			}
+		}
+
+		return array_filter(
+			array(
+				'change_count' => count( $diff ),
+				'labels'       => array_values( array_unique( $labels ) ),
+				'fields'       => array_values( array_unique( $fields ) ),
+			),
+			static function ( $value ): bool {
+				return is_array( $value ) ? ! empty( $value ) : null !== $value && '' !== (string) $value;
+			}
+		);
+	}
+
+	private function task_requires_externalized_plan( ?PressArk_Checkpoint $checkpoint ): bool {
+		$existing_steps = $checkpoint ? $checkpoint->get_plan_steps() : array();
+		if ( count( $existing_steps ) >= 3 ) {
+			return true;
+		}
+
+		if ( $this->is_plan_mode() || 'hard_plan' === $this->planning_mode ) {
+			return true;
+		}
+
+		$message = $this->resolve_effective_request_message( $checkpoint );
+		if ( '' === trim( $message ) ) {
+			return false;
+		}
+
+		$task_type = self::refine_chat_task_type(
+			$message,
+			'' !== $this->task_type ? $this->task_type : self::classify_task( $message )
+		);
+		$groups = $this->refine_preload_groups(
+			$message,
+			$task_type,
+			self::detect_preload_groups( $message, $task_type )
+		);
+
+		return count( $this->infer_local_plan_steps( $message, $task_type, $groups ) ) >= 3;
+	}
+
+	private function requires_plan( string $user_message, ?PressArk_Checkpoint $checkpoint = null ): bool {
+		if ( $checkpoint ) {
+			$remaining_steps = array_values( array_filter(
+				$checkpoint->get_plan_steps(),
+				static fn( $step ): bool => is_array( $step ) && 'completed' !== ( $step['status'] ?? '' )
+			) );
+			if ( ! empty( $remaining_steps ) ) {
+				return true;
+			}
+		}
+
+		if ( $this->is_plan_mode() || 'hard_plan' === $this->planning_mode ) {
+			return true;
+		}
+
+		$message = trim( $user_message );
+		if ( '' === $message ) {
+			$message = $this->resolve_effective_request_message( $checkpoint );
+		}
+		if ( '' === trim( $message ) ) {
+			return false;
+		}
+
+		$task_type = self::refine_chat_task_type(
+			$message,
+			'' !== $this->task_type ? $this->task_type : self::classify_task( $message )
+		);
+		$groups = $this->refine_preload_groups(
+			$message,
+			$task_type,
+			self::detect_preload_groups( $message, $task_type )
+		);
+
+		return count( $this->infer_local_plan_steps( $message, $task_type, $groups ) ) >= 3;
+	}
+
+	private function has_active_plan_step( ?PressArk_Checkpoint $checkpoint ): bool {
+		return $checkpoint
+			&& 1 === $checkpoint->get_in_progress_plan_step_count()
+			&& ! empty( $this->get_in_progress_step( $checkpoint ) );
+	}
+
+	private function get_in_progress_step( ?PressArk_Checkpoint $checkpoint ): array {
+		if ( ! $checkpoint ) {
+			return array();
+		}
+
+		foreach ( $checkpoint->get_plan_steps() as $step ) {
+			if ( is_array( $step ) && 'in_progress' === ( $step['status'] ?? '' ) ) {
+				return $step;
+			}
+		}
+
+		return array();
+	}
+
+	private function is_plan_target_selector_key( string $key ): bool {
+		$key = sanitize_key( $key );
+		if ( '' === $key ) {
+			return false;
+		}
+
+		return in_array(
+			$key,
+			array(
+				'id',
+				'ids',
+				'post_id',
+				'post_ids',
+				'page_id',
+				'page_ids',
+				'product_id',
+				'product_ids',
+				'order_id',
+				'order_ids',
+				'user_id',
+				'user_ids',
+				'term_id',
+				'term_ids',
+				'comment_id',
+				'comment_ids',
+				'variation_id',
+				'variation_ids',
+				'template_id',
+				'template_ids',
+				'widget_id',
+				'widget_ids',
+				'slug',
+				'slugs',
+				'path',
+				'paths',
+				'file',
+				'files',
+				'template',
+				'templates',
+				'key',
+				'keys',
+				'handle',
+				'handles',
+			),
+			true
+		) || (bool) preg_match( '/(?:^|_)(?:id|slug|path|file|template|key|handle)$/', $key );
+	}
+
+	private function normalize_plan_match_token( string $value ): string {
+		$value = strtolower( trim( $value ) );
+		$value = preg_replace( '/^[`"\']+|[`"\']+$/', '', $value );
+		$value = str_replace( '\\', '/', $value );
+		$value = preg_replace( '/\s+/', ' ', $value );
+
+		return sanitize_text_field( (string) $value );
+	}
+
+	private function extract_step_target_tokens( array $step ): array {
+		$tokens = array();
+		$texts  = array_filter( array(
+			sanitize_text_field( (string) ( $step['content'] ?? '' ) ),
+			sanitize_text_field( (string) ( $step['activeForm'] ?? '' ) ),
+		) );
+
+		foreach ( $texts as $text ) {
+			if ( preg_match_all( '/[A-Za-z0-9._\/-]+\.[A-Za-z0-9]{2,8}/', $text, $matches ) ) {
+				foreach ( (array) ( $matches[0] ?? array() ) as $match ) {
+					$tokens[] = $this->normalize_plan_match_token( (string) $match );
+				}
+			}
+		}
+
+		$post_id = absint( $step['post_id'] ?? 0 );
+		if ( $post_id > 0 ) {
+			$tokens[] = (string) $post_id;
+		}
+
+		return array_values( array_unique( array_filter( $tokens ) ) );
+	}
+
+	private function extract_tool_call_target_tokens( string $tool_name, array $args ): array {
+		$tokens = array();
+
+		$collect = function ( $value, string $key = '' ) use ( &$collect, &$tokens ): void {
+			if ( is_array( $value ) ) {
+				foreach ( $value as $child_key => $child_value ) {
+					$collect( $child_value, is_string( $child_key ) ? $child_key : $key );
+				}
+				return;
+			}
+
+			if ( ! is_scalar( $value ) ) {
+				return;
+			}
+
+			$text = $this->normalize_plan_match_token( (string) $value );
+			if ( '' === $text ) {
+				return;
+			}
+
+			if (
+				$this->is_plan_target_selector_key( $key )
+				|| (bool) preg_match( '/[A-Za-z0-9._\/-]+\.[A-Za-z0-9]{2,8}/', $text )
+				|| false !== strpos( $text, '/' )
+			) {
+				$tokens[] = $text;
+			}
+		};
+
+		foreach ( $args as $key => $value ) {
+			$collect( $value, is_string( $key ) ? $key : '' );
+		}
+
+		$post_id = absint( $args['post_id'] ?? $args['id'] ?? $args['product_id'] ?? 0 );
+		if ( $post_id > 0 ) {
+			$tokens[] = (string) $post_id;
+		}
+
+		return array_values( array_unique( array_filter( $tokens ) ) );
+	}
+
+	private function extract_step_keyword_tokens( array $step ): array {
+		$text = strtolower(
+			trim(
+				sanitize_text_field(
+					implode(
+						' ',
+						array_filter( array(
+							(string) ( $step['content'] ?? '' ),
+							(string) ( $step['activeForm'] ?? '' ),
+						) )
+					)
+				)
+			)
+		);
+		if ( '' === $text ) {
+			return array();
+		}
+
+		$words     = preg_split( '/[^a-z0-9._-]+/', $text ) ?: array();
+		$stopwords = array(
+			'edit',
+			'editing',
+			'update',
+			'updating',
+			'run',
+			'running',
+			'read',
+			'reading',
+			'check',
+			'checking',
+			'review',
+			'reviewing',
+			'apply',
+			'applying',
+			'preview',
+			'confirm',
+			'complete',
+			'completing',
+			'the',
+			'and',
+			'for',
+			'with',
+			'into',
+			'from',
+			'this',
+			'that',
+		);
+		$tokens    = array();
+
+		foreach ( $words as $word ) {
+			$word = sanitize_key( (string) $word );
+			if ( '' === $word || in_array( $word, $stopwords, true ) ) {
+				continue;
+			}
+			if ( strlen( $word ) < 4 && ! in_array( $word, array( 'css', 'seo' ), true ) ) {
+				continue;
+			}
+			if ( false !== strpos( $word, '.' ) ) {
+				continue;
+			}
+			$tokens[] = $word;
+		}
+
+		return array_values( array_unique( array_slice( $tokens, 0, 6 ) ) );
+	}
+
+	private function tool_matches_current_step( string $tool_name, array $args, array $current_step ): bool {
+		if ( empty( $current_step ) ) {
+			return false;
+		}
+
+		$expected_post_id = absint( $current_step['post_id'] ?? 0 );
+		if ( $expected_post_id > 0 ) {
+			$actual_post_id = absint( $args['post_id'] ?? $args['id'] ?? $args['product_id'] ?? 0 );
+			if ( $actual_post_id > 0 && $actual_post_id !== $expected_post_id ) {
+				return false;
+			}
+		}
+
+		if ( ! empty( $current_step['preview_required'] ) && ! empty( $current_step['apply_succeeded'] ) && 'completed' !== ( $current_step['status'] ?? '' ) ) {
+			return false;
+		}
+
+		$expected_tool = sanitize_key( (string) ( $current_step['tool_name'] ?? '' ) );
+		$tool_matches  = '' !== $expected_tool && $expected_tool === $tool_name;
+		$step_targets = $this->extract_step_target_tokens( $current_step );
+		$tool_targets = $this->extract_tool_call_target_tokens( $tool_name, $args );
+
+		if ( ! empty( $step_targets ) ) {
+			if ( empty( $tool_targets ) ) {
+				if ( $tool_matches ) {
+					return true;
+				}
+
+				$haystack = strtolower( $tool_name . ' ' . (string) wp_json_encode( $args ) );
+				foreach ( $step_targets as $target ) {
+					if ( false !== strpos( $haystack, $target ) ) {
+						return true;
+					}
+				}
+
+				return false;
+			}
+
+			foreach ( $step_targets as $expected_target ) {
+				foreach ( $tool_targets as $actual_target ) {
+					if (
+						$expected_target === $actual_target
+						|| false !== strpos( $actual_target, $expected_target )
+						|| false !== strpos( $expected_target, $actual_target )
+					) {
+						return true;
+					}
+				}
+			}
+
+			return false;
+		}
+
+		if ( $tool_matches ) {
+			return true;
+		}
+
+		if ( '' !== $expected_tool ) {
+			$tool_haystack = strtolower( $tool_name . ' ' . (string) wp_json_encode( $args ) );
+			if ( false !== strpos( $tool_haystack, str_replace( '_', ' ', $expected_tool ) ) ) {
+				return true;
+			}
+		}
+
+		$keywords = $this->extract_step_keyword_tokens( $current_step );
+		if ( empty( $keywords ) ) {
+			return true;
+		}
+
+		$haystack = strtolower( $tool_name . ' ' . (string) wp_json_encode( $args ) );
+		foreach ( $keywords as $keyword ) {
+			if ( false !== strpos( $haystack, $keyword ) ) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	private function plan_step_labels_from_rows( array $steps ): array {
+		$labels = array();
+
+		foreach ( $steps as $step ) {
+			if ( is_array( $step ) ) {
+				$status = sanitize_key( (string) ( $step['status'] ?? '' ) );
+				$text   = 'in_progress' === $status
+					? sanitize_text_field( (string) ( $step['activeForm'] ?? $step['content'] ?? $step['text'] ?? '' ) )
+					: sanitize_text_field( (string) ( $step['content'] ?? $step['text'] ?? $step['activeForm'] ?? '' ) );
+			} else {
+				$text = sanitize_text_field( (string) $step );
+			}
+
+			if ( '' !== $text ) {
+				$labels[] = $text;
+			}
+		}
+
+		return array_values( $labels );
+	}
+
+	private function normalize_update_plan_steps( array $steps ): array {
+		$normalized = array();
+
+		foreach ( array_slice( $steps, 0, 12 ) as $step ) {
+			if ( ! is_array( $step ) ) {
+				continue;
+			}
+
+			$content = sanitize_text_field( (string) ( $step['content'] ?? '' ) );
+			if ( '' === $content ) {
+				continue;
+			}
+
+			$status = sanitize_key( (string) ( $step['status'] ?? 'pending' ) );
+			if ( 'done' === $status || 'verified' === $status ) {
+				$status = 'completed';
+			}
+			if ( ! in_array( $status, array( 'pending', 'in_progress', 'completed' ), true ) ) {
+				$status = 'pending';
+			}
+
+			$normalized[] = array(
+				'content'          => $content,
+				'activeForm'       => sanitize_text_field( (string) ( $step['activeForm'] ?? $content ) ),
+				'status'           => $status,
+				'post_id'          => absint( $step['post_id'] ?? 0 ),
+				'tool_name'        => sanitize_key( (string) ( $step['tool_name'] ?? '' ) ),
+				'preview_required' => ! empty( $step['preview_required'] ),
+			);
+		}
+
+		return $normalized;
+	}
+
+	private function find_matching_plan_step( array $candidate, array $existing_steps ): array {
+		$candidate_content = sanitize_text_field( (string) ( $candidate['content'] ?? '' ) );
+		$candidate_tool    = sanitize_key( (string) ( $candidate['tool_name'] ?? '' ) );
+		$candidate_post_id = absint( $candidate['post_id'] ?? 0 );
+
+		foreach ( $existing_steps as $existing ) {
+			if ( ! is_array( $existing ) ) {
+				continue;
+			}
+
+			$existing_content = sanitize_text_field( (string) ( $existing['content'] ?? '' ) );
+			if ( '' !== $candidate_content && $existing_content !== $candidate_content ) {
+				continue;
+			}
+
+			$existing_tool = sanitize_key( (string) ( $existing['tool_name'] ?? '' ) );
+			if ( '' !== $candidate_tool && '' !== $existing_tool && $candidate_tool !== $existing_tool ) {
+				continue;
+			}
+
+			$existing_post_id = absint( $existing['post_id'] ?? 0 );
+			if ( $candidate_post_id > 0 && $existing_post_id > 0 && $candidate_post_id !== $existing_post_id ) {
+				continue;
+			}
+
+			return $existing;
+		}
+
+		return array();
+	}
+
+	private function validate_update_plan_tool_call( array $args, ?PressArk_Checkpoint $checkpoint ): array {
+		$raw_steps = (array) ( $args['steps'] ?? array() );
+		foreach ( array_slice( $raw_steps, 0, 12 ) as $step ) {
+			if ( ! is_array( $step ) ) {
+				continue;
+			}
+
+			if (
+				'' === sanitize_text_field( (string) ( $step['content'] ?? '' ) )
+				|| '' === sanitize_text_field( (string) ( $step['activeForm'] ?? '' ) )
+			) {
+				return array(
+					'valid'   => false,
+					'message' => 'Each plan step must include both content and activeForm.',
+				);
+			}
+		}
+
+		$steps = $this->normalize_update_plan_steps( $raw_steps );
+		if ( empty( $steps ) ) {
+			return array(
+				'valid'   => false,
+				'message' => 'update_plan requires a non-empty ordered steps array.',
+			);
+		}
+
+		$remaining_indices = array();
+		$active_indices    = array();
+		foreach ( $steps as $index => $step ) {
+			if ( 'completed' !== ( $step['status'] ?? '' ) ) {
+				$remaining_indices[] = $index;
+			}
+			if ( 'in_progress' === ( $step['status'] ?? '' ) ) {
+				$active_indices[] = $index;
+			}
+		}
+
+		$existing_steps = $checkpoint ? $checkpoint->get_plan_steps() : array();
+
+		if ( $this->requires_plan( $this->resolve_effective_request_message( $checkpoint ), $checkpoint ) && ! empty( $remaining_indices ) ) {
+			if ( empty( $existing_steps ) ) {
+				if ( count( $active_indices ) >= 2 ) {
+					return array(
+						'valid'   => false,
+						'message' => 'For multi-step tasks, update_plan must keep exactly one step in_progress at a time.',
+					);
+				}
+			} elseif ( 1 !== count( $active_indices ) ) {
+				return array(
+					'valid'   => false,
+					'message' => 'For multi-step tasks, update_plan must keep exactly one step in_progress at a time.',
+				);
+			}
+		}
+
+		if ( 1 === count( $active_indices ) && ! empty( $remaining_indices ) && $active_indices[0] !== $remaining_indices[0] ) {
+			return array(
+				'valid'   => false,
+				'message' => 'Do not start a later step while an earlier unfinished step still exists. Move the earliest unfinished step to in_progress first.',
+			);
+		}
+
+		foreach ( $steps as $step ) {
+			if ( 'completed' !== ( $step['status'] ?? '' ) || empty( $step['preview_required'] ) ) {
+				continue;
+			}
+
+			$existing = $this->find_matching_plan_step( $step, $existing_steps );
+			if ( empty( $existing['apply_succeeded'] ) ) {
+				return array(
+					'valid'   => false,
+					'message' => 'Preview-required steps can only be marked completed after the apply step actually succeeded.',
+				);
+			}
+		}
+
+		foreach ( $steps as $step ) {
+			if ( 'completed' === ( $step['status'] ?? '' ) ) {
+				continue;
+			}
+
+			if ( 'edit_content' !== sanitize_key( (string) ( $step['tool_name'] ?? '' ) ) ) {
+				continue;
+			}
+
+			$post_id = absint( $step['post_id'] ?? 0 );
+			if ( $post_id <= 0 ) {
+				continue;
+			}
+
+			if ( ! empty( get_post_meta( $post_id, '_elementor_data', true ) ) ) {
+				return array(
+					'valid'   => false,
+					'message' => sprintf(
+						'Step targeting post #%d uses Elementor — replace tool_name "edit_content" with an elementor_* tool (e.g. elementor_update_widget) for this step. edit_content corrupts builder pages.',
+						$post_id
+					),
+				);
+			}
+		}
+
+		if ( class_exists( 'PressArk_Operation_Registry' ) ) {
+			$unknown_names = array();
+			foreach ( $steps as $step ) {
+				$tool_name = sanitize_key( (string) ( $step['tool_name'] ?? '' ) );
+				if ( '' === $tool_name ) {
+					continue;
+				}
+				$resolved = PressArk_Operation_Registry::resolve_alias( $tool_name );
+				if ( ! PressArk_Operation_Registry::exists( $resolved ) ) {
+					$unknown_names[ $tool_name ] = true;
+				}
+			}
+			if ( ! empty( $unknown_names ) ) {
+				$loaded_names = array();
+				if ( class_exists( 'PressArk_Operation_Registry' ) ) {
+					foreach ( (array) $this->loaded_groups as $group ) {
+						foreach ( (array) PressArk_Operation_Registry::tool_names_for_group( (string) $group ) as $name ) {
+							$loaded_names[ $name ] = true;
+						}
+					}
+				}
+				$loaded_names = array_keys( $loaded_names );
+				sort( $loaded_names );
+				return array(
+					'valid'   => false,
+					'message' => sprintf(
+						'Unknown tool_name(s) in plan steps: %s. Use an exact name from the currently loaded tools: %s. If the tool you need is not listed, call discover_tools or load_tools first, then re-submit the plan.',
+						implode( ', ', array_keys( $unknown_names ) ),
+						implode( ', ', array_slice( $loaded_names, 0, 40 ) )
+					),
+				);
+			}
+		}
+
+		$args['steps'] = $steps;
+
+		return array(
+			'valid'  => true,
+			'params' => $args,
+		);
+	}
+
+	private function tool_call_matches_active_plan_step( array $step, string $tool_name, array $args ): bool {
+		$expected_tool = sanitize_key( (string) ( $step['tool_name'] ?? '' ) );
+		if ( '' !== $expected_tool && $expected_tool !== $tool_name ) {
+			return false;
+		}
+
+		$expected_post_id = absint( $step['post_id'] ?? 0 );
+		if ( $expected_post_id > 0 ) {
+			$actual_post_id = absint( $args['post_id'] ?? $args['id'] ?? $args['product_id'] ?? 0 );
+			if ( $actual_post_id > 0 && $actual_post_id !== $expected_post_id ) {
+				return false;
+			}
+		}
+
+		return true;
+	}
+
+	private function guard_tool_call_against_plan( string $user_message, string $tool_name, array $args, ?PressArk_Checkpoint $checkpoint ): ?string {
+		if ( 'update_plan' === $tool_name ) {
+			return null;
+		}
+
+		if ( ! $this->requires_plan( $user_message, $checkpoint ) ) {
+			return null;
+		}
+
+		if ( ! $checkpoint ) {
+			return null;
+		}
+
+		// Grounding-phase exemption: when no plan steps exist yet, allow
+		// meta tools (discover_tools / load_tools / load_tool_group) and any
+		// read-only tool through. The grounding directive explicitly tells
+		// the model to inspect with read tools FIRST, then build the plan
+		// from those reads — without this exemption the model is stuck in a
+		// catch-22 (can't read before update_plan, can't write a useful plan
+		// without having read anything). In plan mode the tool surface is
+		// already filtered to read-only + meta tools so this is safe; once
+		// the model calls update_plan and an in-progress step exists, the
+		// strict step-matching guard below kicks back in.
+		$existing_plan_steps = $checkpoint->get_plan_steps();
+		if ( empty( $existing_plan_steps ) ) {
+			$contract = $this->resolve_tool_contract( $tool_name, $args );
+			if (
+				in_array( $tool_name, array( 'discover_tools', 'load_tools', 'load_tool_group' ), true )
+				|| ! empty( $contract['readonly'] )
+			) {
+				return null;
+			}
+		}
+
+		if ( ! $this->has_active_plan_step( $checkpoint ) ) {
+			return 'You must call update_plan first and set exactly one step to in_progress';
+		}
+
+		$current_step = $this->get_in_progress_step( $checkpoint );
+		if ( empty( $current_step ) ) {
+			return 'You must call update_plan first and set exactly one step to in_progress';
+		}
+
+		if ( ! $this->tool_matches_current_step( $tool_name, $args, $current_step ) ) {
+			$current_label = sanitize_text_field( (string) ( $current_step['content'] ?? 'the current step' ) );
+			return 'You are on step "' . $current_label . '" - finish it or update_plan to change it';
+		}
+
+		return null;
+	}
+
+	private function build_plan_guard_result( string $tool_use_id, string $error, string $message ): array {
+		return array(
+			'tool_use_id' => $tool_use_id,
+			'result'      => array(
+				'success' => false,
+				'error'   => sanitize_key( $error ),
+				'message' => sanitize_text_field( $message ),
+			),
+		);
+	}
+
+	private function current_plan_progress_signature( ?PressArk_Checkpoint $checkpoint ): string {
+		if ( ! $checkpoint ) {
+			return '';
+		}
+
+		$steps = $checkpoint->get_plan_steps();
+		if ( empty( $steps ) ) {
+			return '';
+		}
+
+		$completed = count(
+			array_filter(
+				$steps,
+				static fn( array $step ): bool => 'completed' === ( $step['status'] ?? '' )
+			)
+		);
+		$active_index = $checkpoint->get_active_plan_step_index();
+		$active_step  = $checkpoint->get_active_plan_step();
+		$active_text  = sanitize_text_field( (string) ( $active_step['content'] ?? '' ) );
+		$active_status = sanitize_key( (string) ( $active_step['status'] ?? '' ) );
+
+		return sanitize_text_field(
+			sprintf(
+				'%d|%d|%s|%s',
+				$completed,
+				$active_index,
+				$active_status,
+				$active_text
+			)
+		);
+	}
+
+	private function refresh_plan_stall_state( ?PressArk_Checkpoint $checkpoint ): void {
+		if ( ! $checkpoint || ! $this->task_requires_externalized_plan( $checkpoint ) ) {
+			$this->last_plan_progress_signature = '';
+			$this->plan_stall_rounds            = 0;
+			$this->plan_stall_message           = '';
+			return;
+		}
+
+		$signature = $this->current_plan_progress_signature( $checkpoint );
+		if ( '' === $signature ) {
+			$this->last_plan_progress_signature = '';
+			$this->plan_stall_rounds            = 0;
+			$this->plan_stall_message           = '';
+			return;
+		}
+
+		if ( $signature === $this->last_plan_progress_signature ) {
+			$this->plan_stall_rounds++;
+		} else {
+			$this->plan_stall_rounds  = 0;
+			$this->plan_stall_message = '';
+		}
+
+		$this->last_plan_progress_signature = $signature;
+
+		if ( $this->plan_stall_rounds >= 2 ) {
+			$active = $checkpoint->get_active_plan_step();
+			$label  = sanitize_text_field( (string) ( $active['activeForm'] ?? $active['content'] ?? 'the current step' ) );
+			$this->plan_stall_message = 'Plan stalled on step "' . $label . '" — update_plan or mark blocked before taking more actions.';
+		}
+	}
+
+	private function should_inject_plan_summary_prompt( ?PressArk_Checkpoint $checkpoint ): bool {
+		if ( ! $checkpoint ) {
+			return false;
+		}
+
+		foreach ( $checkpoint->get_plan_steps() as $step ) {
+			if ( is_array( $step ) && 'completed' !== ( $step['status'] ?? '' ) ) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	private function build_plan_prompt_summary_block( PressArk_Checkpoint $checkpoint ): string {
+		$rows = array_slice( $checkpoint->get_plan_steps(), 0, 6 );
+		if ( empty( $rows ) ) {
+			return '';
+		}
+
+		$parts = array();
+		foreach ( $rows as $index => $step ) {
+			if ( ! is_array( $step ) ) {
+				continue;
+			}
+
+			$label = sanitize_text_field( (string) ( $step['activeForm'] ?? $step['content'] ?? '' ) );
+			if ( '' === $label ) {
+				continue;
+			}
+
+			$status       = sanitize_key( (string) ( $step['status'] ?? 'pending' ) );
+			$status_label = 'in_progress' === $status ? 'IN PROGRESS' : str_replace( '_', ' ', $status );
+			$parts[]      = sprintf( '%d) %s [%s]', $index + 1, $label, $status_label );
+		}
+
+		if ( empty( $parts ) ) {
+			return '';
+		}
+
+		return 'Current plan: ' . implode( ', ', $parts );
+	}
+
+	private function normalize_and_guard_tool_calls(
+		array $tool_calls,
+		array &$messages,
+		string $user_message,
+		string $provider,
+		?PressArk_Checkpoint $checkpoint,
+		int $round
+	): array {
+		if ( ! class_exists( 'PressArk_Operation_Registry' ) ) {
+			return array(
+				'tool_calls' => $tool_calls,
+			);
+		}
+
+		$normalized_tool_calls = array();
+		$synthetic_results     = array();
+
+		// Pre-scan: if the batch contains a valid update_plan call, project
+		// its step transitions onto a cloned checkpoint so sibling tool calls
+		// in the same batch are guarded against the post-transition plan
+		// rather than the stale pre-batch plan. Without this, the natural
+		// parallel pattern `update_plan(mark step N completed, N+1 in_progress)
+		// + call_tool_for_step_N+1` is rejected as a plan_step_guard violation
+		// because the checkpoint still shows step N as in_progress when the
+		// sibling guard runs.
+		$guard_checkpoint = $this->project_plan_guard_checkpoint( $tool_calls, $checkpoint );
+
+		foreach ( $tool_calls as $tool_call ) {
+			if ( ! is_array( $tool_call ) ) {
+				continue;
+			}
+
+			$tool_name = sanitize_key( (string) ( $tool_call['name'] ?? $tool_call['type'] ?? '' ) );
+			if ( '' === $tool_name ) {
+				continue;
+			}
+
+			$canonical = PressArk_Operation_Registry::resolve_alias( $tool_name );
+			$args      = is_array( $tool_call['arguments'] ?? null )
+				? $tool_call['arguments']
+				: ( is_array( $tool_call['params'] ?? null ) ? $tool_call['params'] : array() );
+
+			$validation = PressArk_Operation_Registry::validate_input( $canonical, $args );
+			if ( ! ( $validation['valid'] ?? true ) ) {
+				$synthetic_results[] = array(
+					'tool_use_id' => $tool_call['id'] ?? '',
+					'result'      => $this->build_invalid_tool_input_result(
+						$canonical !== '' ? $canonical : $tool_name,
+						(string) ( $validation['message'] ?? '' )
+					),
+				);
+				continue;
+			}
+
+			if ( isset( $validation['params'] ) && is_array( $validation['params'] ) ) {
+				$args = $validation['params'];
+			}
+
+			if ( 'update_plan' === $canonical ) {
+				// Validate against the real checkpoint — the update_plan
+				// validation inspects existing completions and preview state,
+				// which must reflect the actual persisted plan.
+				$plan_validation = $this->validate_update_plan_tool_call( $args, $checkpoint );
+				if ( ! ( $plan_validation['valid'] ?? false ) ) {
+					$synthetic_results[] = $this->build_plan_guard_result(
+						(string) ( $tool_call['id'] ?? '' ),
+						'plan_update_rejected',
+						(string) ( $plan_validation['message'] ?? 'The submitted plan update was rejected.' )
+					);
+					continue;
+				}
+
+				if ( isset( $plan_validation['params'] ) && is_array( $plan_validation['params'] ) ) {
+					$args = $plan_validation['params'];
+				}
+			} else {
+				// Sibling tool calls are guarded against the projected plan
+				// state (see $guard_checkpoint above) so a parallel
+				// `update_plan + next_step_tool` batch can succeed atomically.
+				$plan_guard_message = $this->guard_tool_call_against_plan( $user_message, $canonical, $args, $guard_checkpoint );
+				if ( null !== $plan_guard_message ) {
+					$synthetic_results[] = $this->build_plan_guard_result(
+						(string) ( $tool_call['id'] ?? '' ),
+						'plan_step_guard',
+						$plan_guard_message
+					);
+					continue;
+				}
+			}
+
+			$tool_call['name']      = $canonical;
+			$tool_call['arguments'] = $args;
+			if ( isset( $tool_call['type'] ) ) {
+				$tool_call['type'] = $canonical;
+			}
+			unset( $tool_call['params'] );
+
+			$normalized_tool_calls[] = $tool_call;
+		}
+
+		if ( empty( $synthetic_results ) ) {
+			return array(
+				'tool_calls' => $normalized_tool_calls,
+			);
+		}
+
+		$this->append_tool_results( $messages, $synthetic_results, $provider );
+		$this->sync_replay_snapshot( $checkpoint, $messages );
+		$this->record_activity_event(
+			'tool.input_validation',
+			'tool_input_invalid',
+			'retrying',
+			'agent',
+			'Blocked malformed tool input before permission, preview, or execution handling.',
+			array(
+				'round'         => $round,
+				'invalid_calls' => count( $synthetic_results ),
+			)
+		);
+
+		return array(
+			'retry'      => true,
+			'tool_calls' => array(),
+		);
+	}
+
+	/**
+	 * Return a checkpoint view that reflects the plan transitions any valid
+	 * update_plan call in this batch is about to apply. Used by
+	 * guard_tool_call_against_plan so sibling calls in the same batch are
+	 * evaluated against the post-transition plan instead of the stale
+	 * pre-batch plan. Returns the original checkpoint unchanged when the
+	 * batch has no update_plan, or when update_plan fails validation (the
+	 * main loop will synth-error the bad update_plan and legitimately
+	 * reject siblings against the old plan).
+	 */
+	private function project_plan_guard_checkpoint( array $tool_calls, ?PressArk_Checkpoint $checkpoint ): ?PressArk_Checkpoint {
+		if ( ! $checkpoint || ! class_exists( 'PressArk_Operation_Registry' ) ) {
+			return $checkpoint;
+		}
+
+		foreach ( $tool_calls as $tool_call ) {
+			if ( ! is_array( $tool_call ) ) {
+				continue;
+			}
+
+			$peek_name = sanitize_key( (string) ( $tool_call['name'] ?? $tool_call['type'] ?? '' ) );
+			if ( '' === $peek_name ) {
+				continue;
+			}
+			if ( 'update_plan' !== PressArk_Operation_Registry::resolve_alias( $peek_name ) ) {
+				continue;
+			}
+
+			$peek_args = is_array( $tool_call['arguments'] ?? null )
+				? $tool_call['arguments']
+				: ( is_array( $tool_call['params'] ?? null ) ? $tool_call['params'] : array() );
+
+			$peek_input = PressArk_Operation_Registry::validate_input( 'update_plan', $peek_args );
+			if ( ! ( $peek_input['valid'] ?? true ) ) {
+				continue;
+			}
+			if ( isset( $peek_input['params'] ) && is_array( $peek_input['params'] ) ) {
+				$peek_args = $peek_input['params'];
+			}
+
+			$peek_plan = $this->validate_update_plan_tool_call( $peek_args, $checkpoint );
+			if ( ! ( $peek_plan['valid'] ?? false ) ) {
+				continue;
+			}
+
+			$peek_steps = isset( $peek_plan['params']['steps'] ) && is_array( $peek_plan['params']['steps'] )
+				? $peek_plan['params']['steps']
+				: (array) ( $peek_args['steps'] ?? array() );
+			if ( empty( $peek_steps ) ) {
+				continue;
+			}
+
+			$projected = clone $checkpoint;
+			$projected->set_plan_steps( $peek_steps );
+			return $projected;
+		}
+
+		return $checkpoint;
+	}
+
+	private function build_wc_price_intent_retry_message( string $mode ): string {
+		return match ( $mode ) {
+			'sale' => __( 'This request explicitly asks for a sale. Use sale_price for the price change and preserve regular_price unless the user also asked to change the base price.', 'pressark' ),
+			'regular' => __( 'This request changes the current or regular price. Use regular_price, price_delta, or price_adjust_pct instead of sale_price.', 'pressark' ),
+			'clear_sale' => __( 'This request removes a sale. Use clear_sale=true and preserve the regular_price.', 'pressark' ),
+			default => __( 'This price request needs an explicit WooCommerce price field that matches the user intent.', 'pressark' ),
+		};
+	}
+
+	private function resolve_effective_request_message( ?PressArk_Checkpoint $checkpoint = null ): string {
+		$request_message = trim( $this->request_message );
+		if ( '' === $request_message && $checkpoint && method_exists( $checkpoint, 'get_goal' ) ) {
+			$request_message = trim( (string) $checkpoint->get_goal() );
+		}
+
+		return $request_message;
+	}
+
+	private static function wc_price_field_is_supplied( string $field, $value ): bool {
+		if ( 'clear_sale' === $field ) {
+			return ! empty( $value );
+		}
+
+		if ( is_bool( $value ) ) {
+			return $value;
+		}
+
+		if ( is_int( $value ) || is_float( $value ) ) {
+			return true;
+		}
+
+		if ( null === $value ) {
+			return false;
+		}
+
+		return '' !== trim( (string) $value );
+	}
+
+	private static function collect_supplied_wc_price_fields( array $payload ): array {
+		$fields = array();
+		foreach ( array( 'regular_price', 'sale_price', 'clear_sale', 'sale_from', 'sale_to', 'price_delta', 'price_adjust_pct' ) as $field ) {
+			if ( array_key_exists( $field, $payload ) && self::wc_price_field_is_supplied( $field, $payload[ $field ] ) ) {
+				$fields[] = $field;
+			}
+		}
+
+		return array_values( array_unique( $fields ) );
+	}
+
+	private function collect_wc_price_fields_from_tool_call( string $tool_name, array $args ): array {
+		$tool_name = sanitize_key( $tool_name );
+		$fields    = array();
+
+		switch ( $tool_name ) {
+			case 'edit_product':
+				$fields = self::collect_supplied_wc_price_fields( (array) ( $args['changes'] ?? array() ) );
+				break;
+
+			case 'bulk_edit_products':
+				$fields = self::collect_supplied_wc_price_fields( (array) ( $args['changes'] ?? array() ) );
+				foreach ( (array) ( $args['products'] ?? array() ) as $product_row ) {
+					if ( is_array( $product_row ) ) {
+						$fields = array_merge( $fields, self::collect_supplied_wc_price_fields( (array) ( $product_row['changes'] ?? array() ) ) );
+					}
+				}
+				break;
+
+			case 'edit_variation':
+			case 'create_product':
+			case 'create_variation':
+				$fields = self::collect_supplied_wc_price_fields( $args );
+				if ( empty( $fields ) && ! empty( $args['changes'] ) && is_array( $args['changes'] ) ) {
+					$fields = self::collect_supplied_wc_price_fields( (array) $args['changes'] );
+				}
+				break;
+
+			case 'bulk_edit_variations':
+				$fields = self::collect_supplied_wc_price_fields( (array) ( $args['changes'] ?? array() ) );
+				if ( empty( $fields ) ) {
+					$fields = self::collect_supplied_wc_price_fields( $args );
+				}
+				break;
+		}
+
+		return array_values( array_unique( $fields ) );
+	}
+
+	private function maybe_guard_wc_price_write_intent(
+		array $write_calls,
+		?PressArk_Checkpoint $checkpoint,
+		array &$messages,
+		string $provider,
+		int $round,
+		array $tool_set,
+		array $initial_groups
+	): array {
+		// Intent must be inferred from BOTH the current message and the
+		// checkpoint goal. After a preview-apply, the agent loop's current
+		// message becomes a synthetic "[Continue] Completed: ..." string
+		// that no longer contains the user's original "10% sale" wording —
+		// so price intent gets lost and this guard would silently skip,
+		// letting the model write to regular_price when the user asked for
+		// a sale. Combining both inputs preserves intent across rounds.
+		$current_message = $this->resolve_effective_request_message( $checkpoint );
+		$goal_message    = $checkpoint && method_exists( $checkpoint, 'get_goal' )
+			? trim( (string) $checkpoint->get_goal() )
+			: '';
+		$combined_for_intent = trim( $current_message . ' ' . $goal_message );
+		$price_mode          = self::infer_wc_price_write_mode( $combined_for_intent );
+		if ( 'none' === $price_mode ) {
+			return array();
+		}
+		// Use the message that surfaced the intent for downstream messaging.
+		$request_message = '' !== $current_message ? $current_message : $goal_message;
+
+		$price_tools       = array( 'edit_product', 'bulk_edit_products', 'edit_variation', 'bulk_edit_variations', 'create_product', 'create_variation' );
+		$relevant_calls    = array();
+		$offending_calls   = array();
+		$regular_drivers   = array( 'regular_price', 'price_delta', 'price_adjust_pct' );
+
+		foreach ( $write_calls as $write_call ) {
+			$tool_name = sanitize_key( (string) ( $write_call['name'] ?? '' ) );
+			if ( ! in_array( $tool_name, $price_tools, true ) ) {
+				continue;
+			}
+
+			$relevant_calls[] = $write_call;
+			$fields           = $this->collect_wc_price_fields_from_tool_call( $tool_name, (array) ( $write_call['arguments'] ?? array() ) );
+
+			if ( 'ambiguous' === $price_mode ) {
+				continue;
+			}
+
+			$has_sale_price     = in_array( 'sale_price', $fields, true );
+			$has_clear_sale     = in_array( 'clear_sale', $fields, true );
+			$has_regular_driver = ! empty( array_intersect( $regular_drivers, $fields ) );
+
+			$violates_mode = match ( $price_mode ) {
+				'sale' => ! $has_sale_price,
+				'regular' => ! $has_regular_driver,
+				'clear_sale' => ! $has_clear_sale,
+				default => false,
+			};
+
+			if ( $violates_mode ) {
+				$offending_calls[] = $write_call;
+			}
+		}
+
+		if ( empty( $relevant_calls ) ) {
+			return array();
+		}
+
+		if ( 'ambiguous' === $price_mode ) {
+			$clarification = self::build_plan_clarification_reply( $request_message, $this->task_type, $this->loaded_groups );
+			$this->record_activity_event(
+				'wc_price.intent_guard',
+				'price_intent_clarification_required',
+				'needs_input',
+				'agent',
+				'Ambiguous WooCommerce pricing wording was blocked until the user clarifies sale price versus regular price.',
+				array(
+					'round' => $round,
+					'mode'  => 'ambiguous',
+					'calls' => count( $relevant_calls ),
+				)
+			);
+
+			return array(
+				'result' => $this->build_result(
+					array(
+						'type'        => 'final_response',
+						'status'      => 'needs_input',
+						'exit_reason' => 'needs_input',
+						'message'     => $clarification,
+						'reply'       => $clarification,
+						'can_execute' => false,
+					),
+					$tool_set,
+					$initial_groups,
+					$checkpoint
+				),
+			);
+		}
+
+		if ( empty( $offending_calls ) ) {
+			return array();
+		}
+
+		$synthetic_results = array();
+		foreach ( $offending_calls as $write_call ) {
+			$synthetic_results[] = array(
+				'tool_use_id' => $write_call['id'] ?? '',
+				'result'      => array(
+					'success' => false,
+					'error'   => 'wc_price_intent_mismatch',
+					'message' => $this->build_wc_price_intent_retry_message( $price_mode ),
+				),
+			);
+		}
+
+		$this->append_tool_results( $messages, $synthetic_results, $provider );
+		$this->sync_replay_snapshot( $checkpoint, $messages );
+		$this->record_activity_event(
+			'wc_price.intent_guard',
+			'wc_price_field_mismatch',
+			'retrying',
+			'agent',
+			'Blocked a WooCommerce price write whose field selection did not match the user request intent.',
+			array(
+				'round'          => $round,
+				'mode'           => $price_mode,
+				'offending_calls'=> count( $offending_calls ),
+			)
+		);
+
+		return array( 'retry' => true );
+	}
+
+	private function result_has_explicit_plan_payload( array $data, string $source_text = '' ): bool {
+		self::ensure_plan_mode_loaded();
+
+		if ( ! empty( $data['plan_artifact'] ) && is_array( $data['plan_artifact'] ) ) {
+			return true;
+		}
+
+		foreach ( (array) ( $data['plan_steps'] ?? array() ) as $row ) {
+			$text = is_array( $row )
+				? (string) ( $row['text'] ?? '' )
+				: (string) $row;
+			if ( '' !== trim( $text ) ) {
+				return true;
+			}
+		}
+
+		$type = sanitize_key( (string) ( $data['type'] ?? '' ) );
+		if ( 'plan_ready' === $type ) {
+			return true;
+		}
+
+		$plan_text = sanitize_textarea_field( (string) ( $data['plan_markdown'] ?? '' ) );
+		if ( '' === trim( $plan_text ) ) {
+			$plan_text = sanitize_textarea_field( $source_text );
+		}
+		if ( '' === trim( $plan_text ) ) {
+			$plan_text = sanitize_textarea_field( (string) ( $data['reply'] ?? $data['message'] ?? '' ) );
+		}
+		if ( '' === trim( $plan_text ) ) {
+			return false;
+		}
+
+		return ! empty( PressArk_Plan_Mode::extract_steps( $plan_text ) );
+	}
+
+	private function maybe_materialize_soft_plan_from_grounding(
+		PressArk_Checkpoint $checkpoint,
+		string $message,
+		array $conversation
+	): void {
+		if ( ! $this->is_soft_plan_mode() || $this->is_plan_mode() ) {
+			return;
+		}
+
+		if ( ! $this->checkpoint_has_grounded_plan_context( $checkpoint ) ) {
+			return;
+		}
+
+		$artifact = $this->plan_artifact_from_checkpoint( $checkpoint );
+		if ( empty( $artifact ) ) {
+			$plan = $this->plan_with_ai( $message, $conversation );
+			$this->cached_ai_plan = is_array( $plan ) ? $plan : array();
+			$plan['task_type'] = $this->task_type ?: (string) ( $plan['task_type'] ?? 'edit' );
+			$plan['groups']    = array_values(
+				array_slice(
+					array_unique(
+						array_filter(
+							array_merge(
+								(array) ( $plan['groups'] ?? array() ),
+								$this->loaded_groups
+							)
+						)
+					),
+					0,
+					6
+				)
+			);
+			$artifact = $this->build_plan_artifact( $checkpoint, $plan, $message, $conversation );
+			if ( empty( $artifact ) ) {
+				return;
+			}
+
+			$this->apply_plan_artifact_to_checkpoint( $checkpoint, $artifact, true );
+			$this->record_activity_event(
+				'plan.soft_grounded',
+				'soft_plan_grounded_after_reads',
+				'ready',
+				'plan',
+				'Generated the soft plan after grounding the request with read results.',
+				array(
+					'approval_level' => 'soft',
+					'plan_id'        => (string) ( $artifact['plan_id'] ?? '' ),
+					'version'        => (int) ( $artifact['version'] ?? 1 ),
+				)
+			);
+		} elseif ( 'executing' !== $checkpoint->get_plan_phase() ) {
+			$this->apply_plan_artifact_to_checkpoint( $checkpoint, $artifact, true );
+		}
+
+		if ( class_exists( 'PressArk_Plan_Artifact' ) ) {
+			$artifact = PressArk_Plan_Artifact::ensure( $checkpoint->get_plan_artifact() );
+			$this->active_plan_artifact = $artifact;
+			$this->plan_steps           = array_values(
+				array_filter(
+					array_map(
+						static fn( $row ) => sanitize_text_field( (string) ( $row['text'] ?? '' ) ),
+						PressArk_Plan_Artifact::to_plan_steps( $artifact )
+					)
+				)
+			);
+			$this->advance_task_graph( $checkpoint );
+		}
+	}
+
 	private function normalize_result_for_mode( array $data, ?PressArk_Checkpoint $checkpoint = null ): array {
 		if ( ! $this->is_plan_mode() ) {
 			return $data;
@@ -549,20 +2391,140 @@ class PressArk_Agent {
 			return $data;
 		}
 
-		$fallback_steps = $this->build_plan_fallback_rows();
-		$artifact       = $checkpoint ? $this->plan_artifact_from_checkpoint( $checkpoint ) : array();
+		if ( $checkpoint && $this->planning_requires_grounded_reads() && ! $this->checkpoint_has_grounded_plan_context( $checkpoint ) ) {
+			$checkpoint->set_plan_phase( 'exploring' );
+			if ( method_exists( $checkpoint, 'set_plan_status' ) ) {
+				$checkpoint->set_plan_status( 'exploring' );
+			}
+
+			// The grounding directive ("Use relevant read-only tools first...")
+			// is a model-facing retry hint, not a user-facing reply. Many
+			// terminal exit paths (round_limit, token_budget, wall-clock
+			// timeout, spin_detected, parse failure, cancellation) provide
+			// their own user-friendly message. Only fall back to the directive
+			// when the agent truly has nothing to say AND nothing has been
+			// extracted — otherwise PressArk leaks an internal hint as the
+			// assistant reply.
+			$has_terminal_message = ! empty( $data['hit_limit'] )
+				|| ! empty( $data['cancelled'] )
+				|| ! empty( $data['error'] )
+				|| ! empty( trim( (string) ( $data['message'] ?? '' ) ) )
+				|| ! empty( trim( (string) ( $data['reply'] ?? '' ) ) )
+				|| in_array( (string) ( $data['exit_reason'] ?? '' ), array( 'spin_detected', 'token_budget', 'round_limit', 'max_request_icus_compacted', 'tool_call_parse_failure' ), true );
+
+			if ( ! $has_terminal_message ) {
+				$research_reply      = $this->build_grounding_retry_message();
+				$data['reply']       = $research_reply;
+				$data['message']     = $research_reply;
+				$data['exit_reason'] = 'needs_research';
+			}
+
+			$data['type']        = 'final_response';
+			$data['status']      = 'exploring';
+			$data['can_execute'] = false;
+			unset(
+				$data['plan_markdown'],
+				$data['plan_steps'],
+				$data['plan_artifact'],
+				$data['approve_endpoint'],
+				$data['execute_endpoint'],
+				$data['revise_endpoint'],
+				$data['reject_endpoint']
+			);
+			return $data;
+		}
+
+		$fallback_steps   = $this->build_plan_fallback_rows();
+		$artifact         = $checkpoint ? $this->plan_artifact_from_checkpoint( $checkpoint ) : array();
 		if ( class_exists( 'PressArk_Plan_Artifact' ) && ! empty( $data['plan_artifact'] ) && is_array( $data['plan_artifact'] ) ) {
 			$artifact = PressArk_Plan_Artifact::ensure( $data['plan_artifact'] );
 		}
 
-		$plan_markdown  = ! empty( $artifact ) && class_exists( 'PressArk_Plan_Artifact' )
+		$plan_markdown   = ! empty( $artifact ) && class_exists( 'PressArk_Plan_Artifact' )
 			? PressArk_Plan_Artifact::to_markdown( $artifact )
-			: sanitize_textarea_field( (string) ( $data['plan_markdown'] ?? $data['message'] ?? '' ) );
+			: sanitize_textarea_field( (string) ( $data['plan_markdown'] ?? $data['reply'] ?? $data['message'] ?? '' ) );
+		$has_plan_shape = ! empty( $artifact ) || $this->result_has_explicit_plan_payload( $data, $plan_markdown );
 		$plan_steps     = ! empty( $artifact ) && class_exists( 'PressArk_Plan_Artifact' )
 			? PressArk_Plan_Artifact::to_plan_steps( $artifact )
-			: PressArk_Plan_Mode::extract_steps( $plan_markdown, $fallback_steps );
+			: PressArk_Plan_Mode::extract_steps( $plan_markdown, $has_plan_shape ? $fallback_steps : array() );
+		if ( empty( $artifact ) && ! $has_plan_shape ) {
+			if ( $checkpoint ) {
+				$checkpoint->set_plan_phase( 'exploring' );
+				if ( method_exists( $checkpoint, 'set_plan_status' ) ) {
+					$checkpoint->set_plan_status( 'exploring' );
+				}
+			}
+			$data['type']        = 'final_response';
+			$data['status']      = 'exploring';
+			$data['can_execute'] = false;
+			$data['reply']       = sanitize_textarea_field( (string) ( $data['reply'] ?? $data['message'] ?? '' ) );
+			$data['message']     = sanitize_textarea_field( (string) ( $data['message'] ?? $data['reply'] ?? '' ) );
+			unset(
+				$data['plan_markdown'],
+				$data['plan_steps'],
+				$data['plan_artifact'],
+				$data['approve_endpoint'],
+				$data['execute_endpoint'],
+				$data['revise_endpoint'],
+				$data['reject_endpoint']
+			);
+			return $data;
+		}
+		if ( empty( $artifact ) && $checkpoint && class_exists( 'PressArk_Plan_Artifact' ) ) {
+			$request_message = trim( $this->request_message );
+			if ( '' === $request_message && method_exists( $checkpoint, 'get_goal' ) ) {
+				$request_message = trim( (string) $checkpoint->get_goal() );
+			}
+			$artifact = PressArk_Plan_Artifact::ensure(
+				$plan_markdown,
+				$plan_steps,
+				array(
+					'plan_markdown'    => $plan_markdown,
+					'approval_level'   => 'hard',
+					'request_message'  => PressArk_Plan_Mode::strip_plan_directive( $request_message ),
+					'execute_message'  => PressArk_Plan_Mode::strip_plan_directive( $request_message ),
+					'request_summary'  => method_exists( $checkpoint, 'get_goal' ) ? $checkpoint->get_goal() : $request_message,
+					'affected_entities'=> method_exists( $checkpoint, 'get_entities' ) ? $checkpoint->get_entities() : array(),
+					'groups'           => $this->loaded_groups,
+					'run_id'           => $this->run_id,
+				)
+			);
+			if ( ! empty( $artifact ) ) {
+				$plan_markdown = PressArk_Plan_Artifact::to_markdown( $artifact );
+				$plan_steps    = PressArk_Plan_Artifact::to_plan_steps( $artifact );
+			}
+		}
 		if ( empty( $plan_steps ) ) {
 			$plan_steps = $fallback_steps;
+		}
+		if ( empty( $plan_steps ) ) {
+			$request_message = trim( $this->request_message );
+			if ( '' === $request_message && $checkpoint && method_exists( $checkpoint, 'get_goal' ) ) {
+				$request_message = trim( (string) $checkpoint->get_goal() );
+			}
+			$clarification = self::build_plan_clarification_reply( $request_message, $this->task_type, $this->loaded_groups );
+			if ( $checkpoint ) {
+				$checkpoint->set_plan_phase( 'exploring' );
+				if ( method_exists( $checkpoint, 'set_plan_status' ) ) {
+					$checkpoint->set_plan_status( 'needs_input' );
+				}
+			}
+			$data['type']        = 'final_response';
+			$data['status']      = 'needs_input';
+			$data['exit_reason'] = 'needs_input';
+			$data['reply']       = $clarification;
+			$data['message']     = $clarification;
+			$data['can_execute'] = false;
+			unset(
+				$data['plan_markdown'],
+				$data['plan_steps'],
+				$data['plan_artifact'],
+				$data['approve_endpoint'],
+				$data['execute_endpoint'],
+				$data['revise_endpoint'],
+				$data['reject_endpoint']
+			);
+			return $data;
 		}
 		if ( empty( $plan_markdown ) || 'round_limit' === (string) ( $data['exit_reason'] ?? '' ) ) {
 			$plan_markdown = $this->build_plan_markdown( $plan_steps, $plan_markdown );
@@ -610,10 +2572,30 @@ class PressArk_Agent {
 						'message'         => $message,
 						'execute_message' => PressArk_Plan_Mode::strip_plan_directive( $message ),
 						'conversation'    => $conversation,
+						'loaded_groups'   => array_values( array_unique( $this->loaded_groups ) ),
 					)
 				)
 			);
 		}
+	}
+
+	/**
+	 * Persist the agent's current loaded_groups into the checkpoint so that
+	 * plan-continuation replays (request-compiler) rehydrate the correct
+	 * tool loadout instead of starting from the slim preload each round.
+	 */
+	private function persist_loaded_groups_to_checkpoint( PressArk_Checkpoint $checkpoint ): void {
+		if ( ! method_exists( $checkpoint, 'set_plan_request_context' ) ) {
+			return;
+		}
+		$checkpoint->set_plan_request_context(
+			array_merge(
+				$checkpoint->get_plan_request_context(),
+				array(
+					'loaded_groups' => array_values( array_unique( $this->loaded_groups ) ),
+				)
+			)
+		);
 	}
 
 	private function plan_artifact_from_checkpoint( PressArk_Checkpoint $checkpoint ): array {
@@ -845,6 +2827,194 @@ class PressArk_Agent {
 		$this->active_plan_artifact = $artifact;
 	}
 
+	private function soft_plan_has_single_tracked_entity( PressArk_Checkpoint $checkpoint ): bool {
+		$selected_target = method_exists( $checkpoint, 'get_selected_target' )
+			? (array) $checkpoint->get_selected_target()
+			: array();
+		foreach ( array( 'post_id', 'id', 'title', 'slug', 'key' ) as $field ) {
+			if ( '' !== trim( (string) ( $selected_target[ $field ] ?? '' ) ) ) {
+				return true;
+			}
+		}
+
+		if ( class_exists( 'PressArk_Execution_Ledger' )
+			&& PressArk_Execution_Ledger::current_target_post_id( $checkpoint->get_execution() ) > 0
+		) {
+			return true;
+		}
+
+		$artifact = $this->plan_artifact_from_checkpoint( $checkpoint );
+		$entities = array_values(
+			array_filter(
+				(array) ( $artifact['affected_entities'] ?? array() ),
+				static function ( $entity ): bool {
+					if ( ! is_array( $entity ) ) {
+						return false;
+					}
+
+					foreach ( array( 'id', 'label', 'slug', 'key', 'type' ) as $field ) {
+						if ( '' !== trim( (string) ( $entity[ $field ] ?? '' ) ) ) {
+							return true;
+						}
+					}
+
+					return false;
+				}
+			)
+		);
+
+		if ( 1 === count( $entities ) ) {
+			return true;
+		}
+
+		$checkpoint_entities = array_values(
+			array_filter(
+				(array) $checkpoint->get_entities(),
+				static function ( $entity ): bool {
+					if ( ! is_array( $entity ) ) {
+						return false;
+					}
+
+					foreach ( array( 'id', 'title', 'type' ) as $field ) {
+						if ( '' !== trim( (string) ( $entity[ $field ] ?? '' ) ) ) {
+							return true;
+						}
+					}
+
+					return false;
+				}
+			)
+		);
+
+		return 1 === count( $checkpoint_entities );
+	}
+
+	private function soft_plan_call_has_explicit_target( array $args ): bool {
+		foreach ( $args as $key => $value ) {
+			$normalized = sanitize_key( (string) $key );
+			if ( '' === $normalized ) {
+				continue;
+			}
+
+			$is_selector = in_array(
+				$normalized,
+				array(
+					'id',
+					'ids',
+					'post_id',
+					'post_ids',
+					'page_id',
+					'page_ids',
+					'product_id',
+					'product_ids',
+					'order_id',
+					'order_ids',
+					'user_id',
+					'user_ids',
+					'term_id',
+					'term_ids',
+					'comment_id',
+					'comment_ids',
+					'variation_id',
+					'variation_ids',
+					'template_id',
+					'template_ids',
+					'widget_id',
+					'widget_ids',
+					'slug',
+					'slugs',
+					'path',
+					'paths',
+					'key',
+					'keys',
+					'handle',
+					'handles',
+				),
+				true
+			) || (bool) preg_match( '/(?:^|_)(?:id|slug|path|key|handle)$/', $normalized );
+
+			if ( ! $is_selector ) {
+				continue;
+			}
+
+			if ( is_scalar( $value ) && '' !== trim( (string) $value ) ) {
+				return true;
+			}
+
+			if ( is_array( $value ) ) {
+				foreach ( $value as $candidate ) {
+					if ( is_scalar( $candidate ) && '' !== trim( (string) $candidate ) ) {
+						return true;
+					}
+				}
+			}
+		}
+
+		return false;
+	}
+
+	private function soft_plan_scope_flag_is_enabled( $value ): bool {
+		if ( is_bool( $value ) ) {
+			return $value;
+		}
+
+		if ( is_numeric( $value ) ) {
+			return 1 === (int) $value;
+		}
+
+		if ( is_string( $value ) ) {
+			return in_array(
+				strtolower( trim( $value ) ),
+				array( '1', 'true', 'yes', 'all', 'bulk', 'batch', 'global', 'sitewide', 'site-wide' ),
+				true
+			);
+		}
+
+		return false;
+	}
+
+	private function soft_plan_call_is_broad_scope( string $tool_name, array $args ): bool {
+		if ( preg_match( '/(?:bulk|batch|mass|sitewide|site_wide|global|all_items?|all_posts?|all_products?)/i', $tool_name ) ) {
+			return true;
+		}
+
+		foreach ( $args as $key => $value ) {
+			$normalized = sanitize_key( (string) $key );
+			if ( '' === $normalized ) {
+				continue;
+			}
+
+			if ( in_array( $normalized, array( 'all', 'bulk', 'batch', 'sitewide', 'site_wide', 'global', 'entire_site', 'apply_to_all', 'match_all' ), true )
+				&& $this->soft_plan_scope_flag_is_enabled( $value )
+			) {
+				return true;
+			}
+
+			if ( is_array( $value )
+				&& (bool) preg_match( '/(?:^|_)(?:ids|post_ids|product_ids|order_ids|user_ids|term_ids|paths|slugs|keys)$/', $normalized )
+			) {
+				$target_count = 0;
+				foreach ( $value as $candidate ) {
+					if ( is_scalar( $candidate ) && '' !== trim( (string) $candidate ) ) {
+						$target_count++;
+					}
+					if ( $target_count > 2 ) {
+						return true;
+					}
+				}
+			}
+
+			if ( is_string( $value )
+				&& in_array( $normalized, array( 'scope', 'target', 'selection', 'query', 'filter', 'where', 'match', 'mode' ), true )
+				&& preg_match( '/\b(?:all|every|site-?wide|global|bulk|batch)\b/i', $value )
+			) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
 	private function maybe_escalate_soft_plan(
 		array $tool_calls,
 		array $tool_set,
@@ -855,11 +3025,11 @@ class PressArk_Agent {
 			return null;
 		}
 
-		$write_calls       = array();
-		$preview_call_count = 0;
-		$write_groups      = array();
-		$destructive       = false;
-		$ambiguous_targets = false;
+		$write_calls            = array();
+		$destructive            = false;
+		$broad_scope            = false;
+		$ambiguous_targets      = false;
+		$single_tracked_entity  = $this->soft_plan_has_single_tracked_entity( $checkpoint );
 
 		foreach ( $tool_calls as $tool_call ) {
 			if ( ! is_array( $tool_call ) ) {
@@ -874,28 +3044,20 @@ class PressArk_Agent {
 			}
 
 			$write_calls[] = $tool_call;
-			$capability    = sanitize_key( (string) ( $contract['capability'] ?? 'confirm' ) );
-			if ( 'preview' === $capability ) {
-				$preview_call_count++;
-			}
-			$group = sanitize_key( (string) ( $contract['group'] ?? '' ) );
-			if ( '' !== $group ) {
-				$write_groups[] = $group;
-			}
-
 			$tool_name = sanitize_key( (string) ( $tool_call['name'] ?? '' ) );
 			if ( preg_match( '/(?:delete|remove|reset|deactivate|uninstall|trash|cancel|refund)/i', $tool_name ) ) {
 				$destructive = true;
 			}
 
 			$args = is_array( $tool_call['arguments'] ?? null ) ? (array) $tool_call['arguments'] : array();
-			if ( empty( $args['post_id'] )
-				&& empty( $args['id'] )
-				&& empty( $args['product_id'] )
-				&& empty( $args['order_id'] )
-				&& empty( $args['slug'] )
-				&& empty( $args['path'] )
-				&& empty( $args['key'] )
+			$is_broad_write = $this->soft_plan_call_is_broad_scope( $tool_name, $args );
+			if ( $is_broad_write ) {
+				$broad_scope = true;
+			}
+
+			if ( ! $single_tracked_entity
+				&& ! $is_broad_write
+				&& ! $this->soft_plan_call_has_explicit_target( $args )
 			) {
 				$ambiguous_targets = true;
 			}
@@ -906,14 +3068,11 @@ class PressArk_Agent {
 		}
 
 		$reason_codes = array();
-		if ( count( $write_calls ) > 1 || $preview_call_count > 1 ) {
-			$reason_codes[] = 'multi_entity_write_set';
-		}
-		if ( count( array_unique( $write_groups ) ) > 1 ) {
-			$reason_codes[] = 'cross_domain_write_phases';
-		}
 		if ( $destructive ) {
 			$reason_codes[] = 'destructive_operation';
+		}
+		if ( $broad_scope ) {
+			$reason_codes[] = 'bulk_write_scope';
 		}
 		if ( $ambiguous_targets ) {
 			$reason_codes[] = 'ambiguous_targets';
@@ -1105,13 +3264,17 @@ class PressArk_Agent {
 	): array {
 		$round_limit  = PressArk_Entitlements::max_agent_rounds( $this->tier );
 		if ( $this->is_plan_mode() ) {
-			$round_limit = min( $round_limit, 2 );
+			$round_limit = max( 3, min( $round_limit, 4 ) );
 		}
 		$token_budget = (int) PressArk_Entitlements::tier_value( $this->tier, 'agent_token_budget' );
 
 		// v5.0.1: Wall-clock deadline prevents runaway loops even when
-		// round count and token budget are within limits.
-		$deadline = microtime( true ) + self::LOOP_TIMEOUT_SECONDS;
+		// round count and token budget are within limits. When the dev
+		// simulator is active, sub-agent observers can take 20-60s per
+		// round, so bump to 30 minutes — the round_limit and token_budget
+		// still apply as the real ceilings.
+		$loop_timeout = PressArk_AI_Connector::simulator_active() ? 1800 : self::LOOP_TIMEOUT_SECONDS;
+		$deadline     = microtime( true ) + $loop_timeout;
 
 		$this->tokens_used         = 0;
 		$this->output_tokens_used  = 0;
@@ -1155,6 +3318,8 @@ class PressArk_Agent {
 				$checkpoint->set_plan_status( 'exploring' );
 			}
 		}
+		$this->plan_steps = $this->plan_step_labels_from_rows( $checkpoint->get_plan_steps() );
+		$this->plan_step  = max( 1, (int) $checkpoint->get_active_plan_step_index() + 1 );
 
 		$approved_artifact = ( ! $this->is_plan_mode() && 'executing' === $checkpoint->get_plan_phase() )
 			? $this->plan_artifact_from_checkpoint( $checkpoint )
@@ -1181,16 +3346,16 @@ class PressArk_Agent {
 			);
 			$this->active_plan_artifact = $approved_artifact;
 		} else {
-			$plan = $this->is_plan_mode()
-				? $this->plan_local_fallback( $message, $conversation )
-				: $this->plan_with_ai( $message, $conversation );
+			$plan = $this->plan_with_ai( $message, $conversation );
+			$this->cached_ai_plan = is_array( $plan ) ? $plan : array();
 		}
 		$task_type = $plan['task_type'];
 		$this->task_type = $task_type;
 
+		$defer_grounded_plan = empty( $approved_artifact ) && ( $this->is_plan_mode() || $this->is_soft_plan_mode() );
 		$plan_artifact = ! empty( $approved_artifact )
 			? $approved_artifact
-			: $this->build_plan_artifact( $checkpoint, $plan, $message, $conversation );
+			: ( $defer_grounded_plan ? array() : $this->build_plan_artifact( $checkpoint, $plan, $message, $conversation ) );
 		if ( ! empty( $plan_artifact ) ) {
 			if ( empty( $approved_artifact ) || empty( $checkpoint->get_execution()['tasks'] ) ) {
 				$this->apply_plan_artifact_to_checkpoint(
@@ -1237,10 +3402,15 @@ class PressArk_Agent {
 					)
 				);
 			}
-		} else {
-			$this->plan_steps = $plan['steps'];
+		} elseif ( empty( $this->plan_steps ) ) {
+			$this->plan_steps = $defer_grounded_plan ? array() : $plan['steps'];
 		}
-		$this->plan_step = 1;
+		$this->plan_step = max(
+			1,
+			method_exists( $checkpoint, 'get_active_plan_step_index' )
+				? ( (int) $checkpoint->get_active_plan_step_index() + 1 )
+				: 1
+		);
 
 		// v5.2.0: Surface execution plan for multi-step transparency.
 		if ( count( $this->plan_steps ) >= 2 ) {
@@ -1252,11 +3422,19 @@ class PressArk_Agent {
 					'status' => 0 === $i ? 'active' : 'pending',
 				);
 			}
+			$plan_payload = array(
+				'run_id'         => $this->run_id,
+				'steps'          => $plan_items,
+				'plan_steps'     => $plan_items,
+				'plan_phase'     => $this->is_plan_mode() ? 'planning' : 'executing',
+				'approval_level' => $this->is_plan_mode() ? 'hard' : '',
+				'can_execute'    => false,
+			);
 			$this->steps[] = array(
 				'type'    => 'plan',
-				'content' => $plan_items,
+				'content' => $plan_payload,
 			);
-			$emit_fn( 'plan', $plan_items );
+			$emit_fn( 'plan', $plan_payload );
 
 			if ( $this->is_plan_mode() ) {
 				$checkpoint->set_plan_phase( 'planning' );
@@ -1374,6 +3552,8 @@ class PressArk_Agent {
 				return $build_cancelled_result();
 			}
 
+			$messages = $this->apply_lightweight_compaction( $messages, $round, $checkpoint );
+
 			// v4.3.0: Tier-based mid-loop compaction thresholds.
 			// Free tier compacts sooner to keep rounds cheaper.
 			$compaction_threshold = match ( true ) {
@@ -1382,6 +3562,7 @@ class PressArk_Agent {
 				PressArk_Entitlements::is_paid_tier( $this->tier ) => 8000,
 				default => 5000,
 			};
+			$this->refresh_plan_stall_state( $checkpoint );
 			$estimated_tokens = $this->estimate_messages_tokens( $messages );
 			$system_prompt    = $this->build_round_system_prompt(
 				$screen,
@@ -1635,6 +3816,61 @@ class PressArk_Agent {
 				} elseif ( ! empty( $recovery ) ) {
 					return $this->build_result( $recovery, $tool_set, $initial_groups, $checkpoint );
 				} else {
+				if (
+					$this->planning_requires_grounded_reads()
+					&& ! $this->plan_response_requires_user_input( $text )
+					&& ! $this->checkpoint_has_grounded_plan_context( $checkpoint )
+				) {
+						$messages[] = array(
+							'role'    => 'user',
+							'content' => $this->build_grounding_retry_message( $this->is_soft_plan_mode() && ! $this->is_plan_mode() ),
+						);
+						$this->sync_replay_snapshot( $checkpoint, $messages );
+						$this->record_activity_event(
+							'plan.grounding_required',
+							'grounding_before_plan_response',
+							'retrying',
+							'plan',
+							'The model tried to finalize planning before any grounding reads completed.',
+							array(
+								'round' => $round,
+								'mode'  => $this->is_plan_mode() ? 'hard_plan' : ( $this->is_soft_plan_mode() ? 'soft_plan' : 'none' ),
+							)
+						);
+						continue;
+					}
+
+					if (
+						$this->is_plan_mode()
+						&& $this->checkpoint_has_grounded_plan_context( $checkpoint )
+						&& ! $this->result_has_explicit_plan_payload(
+							array(
+								'type'    => 'final_response',
+								'reply'   => $text,
+								'message' => $text,
+							),
+							$text
+						)
+					) {
+						$messages[] = array(
+							'role'    => 'user',
+							'content' => $this->build_plan_synthesis_retry_message(),
+						);
+						$this->sync_replay_snapshot( $checkpoint, $messages );
+						$this->record_activity_event(
+							'plan.checklist_required',
+							'grounded_checklist_missing',
+							'retrying',
+							'plan',
+							'The model finished research but did not produce a grounded checklist yet.',
+							array(
+								'round' => $round,
+								'mode'  => 'hard_plan',
+							)
+						);
+						continue;
+					}
+
 					if ( empty( $text ) && $round > 1 ) {
 						$text = 'I reviewed the data but wasn\'t able to produce a useful response. Try rephrasing or providing more detail about what you need.';
 					}
@@ -1710,6 +3946,24 @@ class PressArk_Agent {
 				}
 			}
 
+			$normalized_tool_calls = $this->normalize_and_guard_tool_calls(
+				$tool_calls,
+				$messages,
+				$message,
+				$provider,
+				$checkpoint,
+				$round
+			);
+			if ( ! empty( $normalized_tool_calls['retry'] ) ) {
+				continue;
+			}
+			$tool_calls = is_array( $normalized_tool_calls['tool_calls'] ?? null )
+				? $normalized_tool_calls['tool_calls']
+				: array();
+			if ( empty( $tool_calls ) ) {
+				continue;
+			}
+
 			$permission_gate = $this->maybe_gate_tool_calls(
 				$tool_calls,
 				$screen,
@@ -1743,6 +3997,36 @@ class PressArk_Agent {
 			}
 
 			// ── CASE A: All reads — execute and continue loop ────────────────
+			if (
+				$this->is_soft_plan_mode()
+				&& ! $this->is_plan_mode()
+				&& empty( $read_calls )
+				&& ( ! empty( $preview_calls ) || ! empty( $confirm_calls ) )
+				&& ! $this->checkpoint_has_grounded_plan_context( $checkpoint )
+			) {
+				$synthetic_results = array();
+				foreach ( array_merge( $preview_calls, $confirm_calls ) as $write_call ) {
+					$synthetic_results[] = array(
+						'tool_use_id' => $write_call['id'] ?? '',
+						'result'      => $this->build_read_first_synthetic_result(),
+					);
+				}
+				$this->append_tool_results( $messages, $synthetic_results, $provider );
+				$this->sync_replay_snapshot( $checkpoint, $messages );
+				$this->record_activity_event(
+					'plan.grounding_required',
+					'grounding_before_write',
+					'retrying',
+					'plan',
+					'Soft planning blocked writes until current-state reads completed.',
+					array(
+						'round'      => $round,
+						'write_calls'=> count( $preview_calls ) + count( $confirm_calls ),
+					)
+				);
+				continue;
+			}
+
 			if ( ! empty( $read_calls ) && empty( $preview_calls ) && empty( $confirm_calls ) ) {
 				$tool_results = $this->execute_reads_orchestrated(
 					$read_calls,
@@ -1766,6 +4050,8 @@ class PressArk_Agent {
 				// RULE 3: ALL results in provider-correct format (compacted for loop).
 				$this->append_tool_results( $messages, $compacted, $provider );
 				$this->sync_replay_snapshot( $checkpoint, $messages );
+				$this->maybe_materialize_soft_plan_from_grounding( $checkpoint, $message, $conversation );
+				$this->maybe_insert_dynamic_plan_steps( $checkpoint, $read_calls );
 
 				// v3.2.0: Spin detection — check if this round's tool calls
 				// are identical to the previous round's (agent is looping).
@@ -1783,6 +4069,20 @@ class PressArk_Agent {
 					$this->idle_rounds = 0;
 				}
 				$this->last_tool_signature = $sig;
+
+				// Plan mode early-exit: if update_plan just stored a plan,
+				// return immediately so finalize_plan_mode_result renders the
+				// plan_ready card. Without this, the loop would keep going
+				// until round_limit (wasting a round and risking a late exit
+				// that surfaces as a "grounding retry" or provider error).
+				if ( $this->plan_just_proposed ) {
+					$this->plan_just_proposed = false;
+					return $this->build_result( array(
+						'type'        => 'final_response',
+						'hit_limit'   => true,
+						'exit_reason' => 'plan_ready',
+					), $tool_set, $initial_groups, $checkpoint );
+				}
 
 				// Continue loop — AI sees results and decides next step.
 				continue;
@@ -1816,6 +4116,28 @@ class PressArk_Agent {
 			}
 
 			// ── PREVIEWABLE WRITES → Live preview ────────────────────────────
+			$wc_price_guard = $this->maybe_guard_wc_price_write_intent(
+				array_merge( $preview_calls, $confirm_calls ),
+				$checkpoint,
+				$messages,
+				$provider,
+				$round,
+				$tool_set,
+				$initial_groups
+			);
+			if ( ! empty( $wc_price_guard['result'] ) && is_array( $wc_price_guard['result'] ) ) {
+				return $wc_price_guard['result'];
+			}
+			if ( ! empty( $wc_price_guard['retry'] ) ) {
+				continue;
+			}
+
+			$this->maybe_materialize_soft_plan_from_grounding( $checkpoint, $message, $conversation );
+			$this->maybe_insert_dynamic_plan_steps( $checkpoint, $tool_calls );
+			$escalated = $this->maybe_escalate_soft_plan( $tool_calls, $tool_set, $initial_groups, $checkpoint );
+			if ( is_array( $escalated ) ) {
+				return $escalated;
+			}
 			if ( ! empty( $preview_calls ) || ! empty( $confirm_calls ) ) {
 				$this->has_proposed_write = true;
 				// v4.3.2: Advance plan step when writes are proposed.
@@ -1833,7 +4155,27 @@ class PressArk_Agent {
 				$preview_payloads = $this->strip_internal_tool_call_metadata( $preview_calls );
 				$preview = new PressArk_Preview();
 				$session = $preview->create_session( $preview_payloads, $preview_payloads[0]['arguments'] ?? array() );
+				if ( empty( $session['success'] ) && isset( $session['message'] ) ) {
+					$preview_failures = $this->build_preview_failure_tool_results(
+						$preview_payloads,
+						(string) $session['message']
+					);
+					if ( ! empty( $preview_failures ) ) {
+						$this->append_tool_results( $messages, $preview_failures, $provider );
+						$this->sync_replay_snapshot( $checkpoint, $messages );
+					}
+					return $this->build_result( array(
+						'type'     => 'final_response',
+						'message'  => sanitize_text_field( (string) $session['message'] ),
+						'is_error' => true,
+					), $tool_set, $initial_groups, $checkpoint );
+				}
 				$preview_calls = $preview->get_session_tool_calls( $session['session_id'] );
+				$preview_results = $this->build_preview_pause_tool_results( $preview_calls, $session );
+				if ( ! empty( $preview_results ) ) {
+					$this->append_tool_results( $messages, $preview_results, $provider );
+					$this->sync_replay_snapshot( $checkpoint, $messages );
+				}
 
 				return $this->build_result( array(
 					'type'               => 'preview',
@@ -1850,6 +4192,11 @@ class PressArk_Agent {
 				foreach ( $confirm_calls as $cc ) {
 					$this->emit_step( 'needs_confirm', $cc['name'], $cc['arguments'] ?? array() );
 					$emit_fn( 'step', array( 'status' => 'needs_confirm', 'label' => $this->get_step_label( $cc['name'], $cc['arguments'] ?? array() ), 'tool' => $cc['name'] ) );
+				}
+				$confirm_results = $this->build_confirm_pause_tool_results( $confirm_calls );
+				if ( ! empty( $confirm_results ) ) {
+					$this->append_tool_results( $messages, $confirm_results, $provider );
+					$this->sync_replay_snapshot( $checkpoint, $messages );
 				}
 
 				return $this->build_result( array(
@@ -1899,14 +4246,6 @@ class PressArk_Agent {
 		}
 
 		$user_id = function_exists( 'get_current_user_id' ) ? (int) get_current_user_id() : 0;
-
-		if ( $checkpoint ) {
-			$this->maybe_insert_dynamic_plan_steps( $checkpoint, $tool_calls );
-			$escalated = $this->maybe_escalate_soft_plan( $tool_calls, $tool_set, $initial_groups, $checkpoint );
-			if ( is_array( $escalated ) ) {
-				return $escalated;
-			}
-		}
 
 		foreach ( $tool_calls as $tool_call ) {
 			$tool_name = sanitize_key( (string) ( $tool_call['name'] ?? '' ) );
@@ -2062,7 +4401,7 @@ class PressArk_Agent {
 			}
 
 			// Meta-tool fast path (handles its own step events).
-			$meta_result = $this->handle_meta_tool( $tc, $loader, $tool_set, $tool_defs );
+			$meta_result = $this->handle_meta_tool( $tc, $loader, $tool_set, $tool_defs, $checkpoint );
 			if ( null !== $meta_result ) {
 				$slot_results[ $i ] = array_merge( $meta_result, array( 'tool_name' => $tc['name'] ) );
 				continue;
@@ -2283,7 +4622,7 @@ class PressArk_Agent {
 	// ── Meta-Tool Handling (v2.3.1) ─────────────────────────────────────
 
 	/**
-	 * Handle meta-tools (discover_tools, load_tools, load_tool_group).
+	 * Handle meta-tools (discover_tools, load_tools, load_tool_group, update_plan).
 	 * Returns a tool result array if handled, or null for non-meta tools.
 	 *
 	 * @param array               $tc        Tool call from AI.
@@ -2292,7 +4631,7 @@ class PressArk_Agent {
 	 * @param array               &$tool_defs Current tool defs (modified by reference).
 	 * @return array|null Tool result, or null if not a meta-tool.
 	 */
-	private function handle_meta_tool( array $tc, PressArk_Tool_Loader $loader, array &$tool_set, array &$tool_defs ): ?array {
+	private function handle_meta_tool( array $tc, PressArk_Tool_Loader $loader, array &$tool_set, array &$tool_defs, ?PressArk_Checkpoint $checkpoint = null ): ?array {
 		$name = $tc['name'];
 
 		// ── discover_tools ──────────────────────────────────────────────
@@ -2302,7 +4641,7 @@ class PressArk_Agent {
 			$loaded_names = $tool_set['tool_names'] ?? array();
 
 			// v3.2.0: Enforce discover call budget.
-			if ( $this->discover_calls > self::MAX_DISCOVER_CALLS ) {
+			if ( $this->discover_calls > $this->max_discover_calls ) {
 				$this->emit_step( 'reading', $name, $tc['arguments'] );
 				$this->emit_step( 'done', $name, $tc['arguments'] );
 				$this->record_activity_event(
@@ -2321,7 +4660,7 @@ class PressArk_Agent {
 					'tool_use_id' => $tc['id'],
 					'result'      => array(
 						'success' => false,
-						'message' => 'Discovery budget reached (' . self::MAX_DISCOVER_CALLS . ' calls). Work with your currently loaded tools or respond to the user with what you know.',
+						'message' => 'Discovery budget reached (' . $this->max_discover_calls . ' calls). Work with your currently loaded tools or respond to the user with what you know.',
 					),
 				);
 			}
@@ -2416,6 +4755,26 @@ class PressArk_Agent {
 
 		// ── load_tools ──────────────────────────────────────────────────
 		if ( 'load_tools' === $name ) {
+			$group = $tc['arguments']['group'] ?? '';
+			$tools = $tc['arguments']['tools'] ?? array();
+
+			if ( ! empty( $group ) && in_array( $group, $this->loaded_groups, true ) ) {
+				$this->emit_step( 'reading', $name, $tc['arguments'] );
+				$this->emit_step( 'done', $name, $tc['arguments'] );
+
+				return array(
+					'tool_use_id' => $tc['id'],
+					'result'      => array(
+						'success' => true,
+						'message' => sprintf(
+							'Group "%s" is already loaded — %d tools available. Use them directly without calling load_tools again.',
+							$group,
+							count( (array) ( $tool_set['tool_names'] ?? array() ) )
+						),
+					),
+				);
+			}
+
 			$this->load_calls++;
 
 			// v3.2.0: Enforce load call budget.
@@ -2431,8 +4790,6 @@ class PressArk_Agent {
 				);
 			}
 
-			$group = $tc['arguments']['group'] ?? '';
-			$tools = $tc['arguments']['tools'] ?? array();
 			$msgs  = array();
 
 			if ( ! empty( $group ) ) {
@@ -2475,6 +4832,10 @@ class PressArk_Agent {
 			$tool_defs = $tool_set['schemas'];
 			$this->emit_step( 'reading', $name, $tc['arguments'] );
 
+			if ( $checkpoint && ( ! empty( $group ) || ! empty( $tools ) ) ) {
+				$this->persist_loaded_groups_to_checkpoint( $checkpoint );
+			}
+
 			$loaded_msg = ! empty( $msgs )
 				? implode( ' ', $msgs ) . ' Available tools: ' . implode( ', ', $tool_set['tool_names'] ?? array() )
 				: 'No group or tools specified. Provide "group" or "tools" parameter.';
@@ -2515,6 +4876,61 @@ class PressArk_Agent {
 			return array(
 				'tool_use_id' => $tc['id'],
 				'result'      => $result,
+			);
+		}
+
+		// ── update_plan ─────────────────────────────────────────────────
+		if ( 'update_plan' === $name ) {
+			if ( ! $checkpoint ) {
+				return array(
+					'tool_use_id' => $tc['id'],
+					'result'      => array(
+						'success' => false,
+						'message' => 'Plan storage is unavailable for this run.',
+					),
+				);
+			}
+
+			$checkpoint->set_plan_steps( (array) ( $tc['arguments']['steps'] ?? array() ) );
+			$steps = $checkpoint->get_plan_steps();
+
+			if ( $this->is_plan_mode() ) {
+				$checkpoint->set_plan_phase( 'planning' );
+				if ( method_exists( $checkpoint, 'set_plan_status' ) ) {
+					$checkpoint->set_plan_status( 'ready' );
+				}
+			} elseif ( '' === $checkpoint->get_plan_phase() ) {
+				$checkpoint->set_plan_phase( 'executing' );
+				if ( method_exists( $checkpoint, 'set_plan_status' ) ) {
+					$checkpoint->set_plan_status( 'tracking' );
+				}
+			}
+
+			$this->plan_steps = $this->plan_step_labels_from_rows( $steps );
+			$active_index     = method_exists( $checkpoint, 'get_active_plan_step_index' )
+				? (int) $checkpoint->get_active_plan_step_index()
+				: -1;
+			$this->plan_step  = $active_index >= 0 ? $active_index + 1 : max( 1, count( $this->plan_steps ) );
+
+			// Signal the agent loop to exit now so the user sees a plan_ready
+			// card without burning the rest of the round budget. Only fires in
+			// plan mode and only when update_plan actually stored steps.
+			if ( $this->is_plan_mode() && ! empty( $steps ) ) {
+				$this->plan_just_proposed = true;
+			}
+
+			$this->emit_step( 'reading', $name, $tc['arguments'] );
+			$this->emit_step( 'done', $name, $tc['arguments'] );
+
+			return array(
+				'tool_use_id' => $tc['id'],
+				'result'      => array(
+					'success' => ! empty( $steps ),
+					'message' => '' !== $checkpoint->build_plan_summary( 6 )
+						? 'Plan updated: ' . $checkpoint->build_plan_summary( 6 )
+						: 'Plan updated.',
+					'active_step' => method_exists( $checkpoint, 'get_active_plan_step' ) ? $checkpoint->get_active_plan_step() : array(),
+				),
 			);
 		}
 
@@ -3393,49 +5809,35 @@ class PressArk_Agent {
 	// ── v3.7.0: Retrieval Bundle Dedup ──────────────────────────────
 
 	/**
-	 * Check if a read tool call has already been executed in this session.
+	 * Reuse a prior read result when the exact same read is still fresh.
 	 *
-	 * Returns a compact stub result if:
-	 * 1. The bundle_id exists in the checkpoint, AND
-	 * 2. The target post has not been modified since the bundle was recorded.
+	 * Reuse is conservative:
+	 * - only readonly tools participate,
+	 * - the tool must be explicitly cacheable (or be read_content),
+	 * - the matching read-state snapshot must still be fresh,
+	 * - the tool's own cache TTL must not have expired.
 	 *
-	 * Only applies to read_content calls (the most token-heavy reads).
-	 *
-	 * @return array|null Stub result, or null to proceed with real read.
+	 * @return array|null Cached result, or null to proceed with a real read.
 	 */
 	private function check_bundle_hit( PressArk_Checkpoint $checkpoint, string $tool_name, array $args ): ?array {
-		if ( 'read_content' !== $tool_name ) {
+		if ( ! $this->tool_supports_bundle_reuse( $tool_name, $args ) ) {
 			return null;
 		}
 
-		$post_id = (int) ( $args['post_id'] ?? 0 );
-		if ( $post_id <= 0 ) {
+		$bundle_match = $this->find_bundle_match( $checkpoint, $tool_name, $args );
+		$bundle       = is_array( $bundle_match['payload'] ?? null ) ? $bundle_match['payload'] : array();
+		$snapshot     = is_array( $bundle_match['snapshot'] ?? null ) ? $bundle_match['snapshot'] : array();
+		$bundle_id    = sanitize_text_field( (string) ( $bundle_match['id'] ?? '' ) );
+
+		if ( empty( $bundle ) || '' === $bundle_id || ! $this->bundle_payload_is_reusable( $tool_name, $args, $bundle, $snapshot ) ) {
 			return null;
 		}
 
-		$bundle_id = PressArk_Checkpoint::compute_bundle_id( $tool_name, $args );
-		if ( ! $checkpoint->has_bundle( $bundle_id ) ) {
+		$result = is_array( $bundle['result'] ?? null ) ? $bundle['result'] : array();
+		if ( empty( $result ) ) {
 			return null;
 		}
 
-		$bundle = PressArk_Checkpoint::get_bundle_payload( $bundle_id );
-		if ( empty( $bundle['result'] ) || ! is_array( $bundle['result'] ) ) {
-			return null;
-		}
-
-		// Verify post hasn't changed since last read.
-		$post = get_post( $post_id );
-		if ( ! $post ) {
-			return null;
-		}
-
-		$stored_modified = (string) ( $bundle['post_modified'] ?? '' );
-		$current_modified = (string) ( $post->post_modified_gmt ?: $post->post_modified );
-		if ( $stored_modified && $current_modified && $stored_modified !== $current_modified ) {
-			return null;
-		}
-
-		$result = $bundle['result'];
 		if ( ! isset( $result['data'] ) || ! is_array( $result['data'] ) ) {
 			$result['data'] = array();
 		}
@@ -3444,11 +5846,17 @@ class PressArk_Agent {
 		$result['data']['bundle_hit'] = true;
 		$result['data']['bundle_id']  = $bundle_id;
 		if ( empty( $result['message'] ) ) {
-			$result['message'] = sprintf(
-				'Loaded cached %s result for "%s".',
-				$tool_name,
-				$post->post_title
+			$summary = sanitize_text_field(
+				(string) (
+					$snapshot['summary']
+					?? $result['data']['title']
+					?? $bundle['tool_name']
+					?? $tool_name
+				)
 			);
+			$result['message'] = '' !== $summary
+				? sprintf( 'Reused cached %s result for %s.', $tool_name, $summary )
+				: sprintf( 'Reused cached %s result.', $tool_name );
 		}
 		if ( class_exists( 'PressArk_Read_Metadata' ) ) {
 			$result = PressArk_Read_Metadata::annotate_tool_result(
@@ -3458,7 +5866,13 @@ class PressArk_Agent {
 				array(
 					'freshness'   => 'cached',
 					'provider'    => 'bundle_cache',
-					'captured_at' => sanitize_text_field( (string) ( $bundle['stored_at'] ?? gmdate( 'c' ) ) ),
+					'captured_at' => sanitize_text_field(
+						(string) (
+							$bundle['stored_at']
+							?? $snapshot['captured_at']
+							?? gmdate( 'c' )
+						)
+					),
 					'stored_at'   => sanitize_text_field( (string) ( $bundle['stored_at'] ?? '' ) ),
 				)
 			);
@@ -3468,12 +5882,272 @@ class PressArk_Agent {
 	}
 
 	/**
-	 * Record a bundle ID in the checkpoint after a successful read.
+	 * Find the best matching bundle for a read call.
+	 *
+	 * Prefers the deterministic bundle ID, then falls back to matching the
+	 * read fingerprint across checkpoint-owned bundles so alias/call-shape
+	 * differences can still reuse the same prior read.
+	 *
+	 * @return array{id: string, payload: array, snapshot: array}|array{}
+	 */
+	private function find_bundle_match( PressArk_Checkpoint $checkpoint, string $tool_name, array $args ): array {
+		$snapshot    = $this->find_read_snapshot( $checkpoint, $tool_name, $args );
+		$fingerprints = $this->bundle_lookup_fingerprints( $tool_name, $args );
+		$candidate_ids = array_values(
+			array_unique(
+				array_filter(
+					array_merge(
+						array( PressArk_Checkpoint::compute_bundle_id( $tool_name, $args ) ),
+						$this->bundle_alias_candidate_ids( $tool_name, $args )
+					)
+				)
+			)
+		);
+
+		foreach ( $candidate_ids as $bundle_id ) {
+			if ( ! $checkpoint->has_bundle( $bundle_id ) ) {
+				continue;
+			}
+
+			$payload = PressArk_Checkpoint::get_bundle_payload( $bundle_id );
+			if (
+				is_array( $payload )
+				&& ! empty( $payload )
+				&& $this->bundle_payload_is_reusable( $tool_name, $args, $payload, $snapshot )
+			) {
+				return array(
+					'id'       => sanitize_text_field( (string) $bundle_id ),
+					'payload'  => $payload,
+					'snapshot' => $snapshot,
+				);
+			}
+		}
+
+		if ( empty( $fingerprints ) ) {
+			return array();
+		}
+
+		foreach ( $checkpoint->get_bundle_ids() as $bundle_id ) {
+			$bundle_id = sanitize_text_field( (string) $bundle_id );
+			if ( '' === $bundle_id ) {
+				continue;
+			}
+
+			$payload = PressArk_Checkpoint::get_bundle_payload( $bundle_id );
+			if ( ! is_array( $payload ) || empty( $payload ) ) {
+				continue;
+			}
+
+			if (
+				array_intersect( $fingerprints, $this->bundle_payload_fingerprints( $payload ) )
+				&& $this->bundle_payload_is_reusable( $tool_name, $args, $payload, $snapshot )
+			) {
+				return array(
+					'id'       => $bundle_id,
+					'payload'  => $payload,
+					'snapshot' => $snapshot,
+				);
+			}
+		}
+
+		return array();
+	}
+
+	/**
+	 * Check whether a bundle payload is still safe to reuse.
+	 */
+	private function bundle_payload_is_reusable( string $tool_name, array $args, array $bundle, array $snapshot = array() ): bool {
+		$result = is_array( $bundle['result'] ?? null ) ? $bundle['result'] : array();
+		if ( empty( $result['success'] ) ) {
+			return false;
+		}
+
+		$tool_name = sanitize_key( $tool_name );
+		$operation = PressArk_Operation_Registry::resolve( $tool_name );
+		if ( 'read_content' !== $tool_name && ! ( $operation instanceof PressArk_Operation && $operation->is_cacheable() ) ) {
+			return false;
+		}
+
+		if ( ! empty( $snapshot ) ) {
+			if ( 'stale' === sanitize_key( (string) ( $snapshot['freshness'] ?? '' ) ) ) {
+				return false;
+			}
+		} elseif ( 'read_content' !== $tool_name ) {
+			return false;
+		}
+
+		if ( $operation instanceof PressArk_Operation && $operation->cache_ttl > 0 ) {
+			$captured_at = (string) ( $bundle['stored_at'] ?? $snapshot['captured_at'] ?? '' );
+			$captured_ts = '' !== $captured_at ? strtotime( $captured_at ) : 0;
+			if ( $captured_ts <= 0 || ( time() - $captured_ts ) > $operation->cache_ttl ) {
+				return false;
+			}
+		}
+
+		if ( 'read_content' === $tool_name ) {
+			$post_id = (int) ( $args['post_id'] ?? $bundle['post_id'] ?? $result['data']['id'] ?? 0 );
+			if ( $post_id <= 0 ) {
+				return false;
+			}
+
+			$post = get_post( $post_id );
+			if ( ! $post ) {
+				return false;
+			}
+
+			$stored_modified  = (string) ( $bundle['post_modified'] ?? '' );
+			$current_modified = (string) ( $post->post_modified_gmt ?: $post->post_modified );
+			if ( $stored_modified && $current_modified && $stored_modified !== $current_modified ) {
+				return false;
+			}
+		}
+
+		return true;
+	}
+
+	/**
+	 * Determine whether a successful read result should be bundled.
+	 */
+	private function should_bundle_read_result( string $tool_name, array $args, array $result = array() ): bool {
+		if ( empty( $result['success'] ) || $this->is_tool_result_limit_result( $result ) ) {
+			return false;
+		}
+
+		$contract = $this->resolve_tool_contract( $tool_name, $args );
+		if ( empty( $contract['readonly'] ) ) {
+			return false;
+		}
+
+		$tool_name = sanitize_key( $tool_name );
+		if ( 'read_content' === $tool_name ) {
+			return true;
+		}
+
+		$operation = PressArk_Operation_Registry::resolve( $tool_name );
+		return $operation instanceof PressArk_Operation && $operation->is_cacheable();
+	}
+
+	/**
+	 * Find the current read-state snapshot for a read call.
+	 */
+	private function find_read_snapshot( PressArk_Checkpoint $checkpoint, string $tool_name, array $args ): array {
+		if ( ! class_exists( 'PressArk_Read_Metadata' ) ) {
+			return array();
+		}
+
+		$fingerprints = $this->bundle_lookup_fingerprints( $tool_name, $args );
+		if ( empty( $fingerprints ) ) {
+			return array();
+		}
+
+		foreach ( PressArk_Read_Metadata::sanitize_snapshot_collection( $checkpoint->get_read_state() ) as $snapshot ) {
+			$handle            = sanitize_text_field( (string) ( $snapshot['handle'] ?? '' ) );
+			$query_fingerprint = sanitize_text_field( (string) ( $snapshot['query_fingerprint'] ?? '' ) );
+			if ( in_array( $handle, $fingerprints, true ) || in_array( $query_fingerprint, $fingerprints, true ) ) {
+				return $snapshot;
+			}
+		}
+
+		return array();
+	}
+
+	/**
+	 * Build stable lookup fingerprints for a read call.
+	 *
+	 * Includes both the requested tool name and the canonical operation name so
+	 * aliases can still find the same cached payload.
+	 *
+	 * @return string[]
+	 */
+	private function bundle_lookup_fingerprints( string $tool_name, array $args ): array {
+		if ( ! class_exists( 'PressArk_Read_Metadata' ) ) {
+			return array();
+		}
+
+		$names     = array( sanitize_key( $tool_name ) );
+		$operation = PressArk_Operation_Registry::resolve( $tool_name );
+		if ( $operation instanceof PressArk_Operation ) {
+			$names[] = sanitize_key( $operation->name );
+		}
+
+		$fingerprints = array();
+		foreach ( array_values( array_unique( array_filter( $names ) ) ) as $name ) {
+			$fingerprints[] = PressArk_Read_Metadata::build_query_fingerprint( 'tool', $name, $args );
+		}
+
+		return array_values( array_unique( array_filter( array_map( 'sanitize_text_field', $fingerprints ) ) ) );
+	}
+
+	/**
+	 * Compute alternate bundle IDs for canonical tool aliases.
+	 *
+	 * @return string[]
+	 */
+	private function bundle_alias_candidate_ids( string $tool_name, array $args ): array {
+		$operation = PressArk_Operation_Registry::resolve( $tool_name );
+		if ( ! ( $operation instanceof PressArk_Operation ) ) {
+			return array();
+		}
+
+		$canonical = sanitize_key( $operation->name );
+		if ( '' === $canonical || $canonical === sanitize_key( $tool_name ) ) {
+			return array();
+		}
+
+		return array( PressArk_Checkpoint::compute_bundle_id( $canonical, $args ) );
+	}
+
+	/**
+	 * Extract lookup fingerprints from a stored bundle payload.
+	 *
+	 * @return string[]
+	 */
+	private function bundle_payload_fingerprints( array $bundle ): array {
+		$fingerprints = array();
+
+		if ( class_exists( 'PressArk_Read_Metadata' ) ) {
+			$stored_meta = PressArk_Read_Metadata::sanitize_snapshot( $bundle['result']['read_meta'] ?? array() );
+			foreach ( array( $stored_meta['query_fingerprint'] ?? '', $stored_meta['handle'] ?? '' ) as $fingerprint ) {
+				$fingerprint = sanitize_text_field( (string) $fingerprint );
+				if ( '' !== $fingerprint ) {
+					$fingerprints[] = $fingerprint;
+				}
+			}
+		}
+
+		$stored_tool = sanitize_key( (string) ( $bundle['tool_name'] ?? '' ) );
+		$stored_args = is_array( $bundle['args'] ?? null ) ? (array) $bundle['args'] : array();
+		$fingerprints = array_merge( $fingerprints, $this->bundle_lookup_fingerprints( $stored_tool, $stored_args ) );
+
+		return array_values( array_unique( array_filter( array_map( 'sanitize_text_field', $fingerprints ) ) ) );
+	}
+
+	/**
+	 * Check whether a tool participates in read-result reuse.
+	 */
+	private function tool_supports_bundle_reuse( string $tool_name, array $args ): bool {
+		$contract = $this->resolve_tool_contract( $tool_name, $args );
+		if ( empty( $contract['readonly'] ) ) {
+			return false;
+		}
+
+		$tool_name = sanitize_key( $tool_name );
+		if ( 'read_content' === $tool_name ) {
+			return true;
+		}
+
+		$operation = PressArk_Operation_Registry::resolve( $tool_name );
+		return $operation instanceof PressArk_Operation && $operation->is_cacheable();
+	}
+
+	/**
+	 * Record a bundle payload after a successful reusable read.
 	 */
 	private function record_bundle( PressArk_Checkpoint $checkpoint, string $tool_name, array $args, array $result = array() ): void {
-		if ( 'read_content' !== $tool_name ) {
+		if ( ! $this->should_bundle_read_result( $tool_name, $args, $result ) ) {
 			return;
 		}
+
 		$checkpoint->remember_bundle( $tool_name, $args, $result );
 	}
 
@@ -3871,7 +6545,15 @@ class PressArk_Agent {
 			),
 			'inspector' => array(),
 		);
-		if ( $this->is_plan_mode() ) {
+		if ( defined( 'PRESSARK_DEBUG_ROUTE' ) && PRESSARK_DEBUG_ROUTE ) {
+			$log_path = defined( 'PRESSARK_DEBUG_ROUTE_LOG' ) ? (string) PRESSARK_DEBUG_ROUTE_LOG : '/tmp/pressark-route.log';
+			@file_put_contents(
+				$log_path,
+				sprintf( "[%s] AGENT planning_mode=%s mode=%s\n", date( 'H:i:s' ), $this->planning_mode, $this->mode ),
+				FILE_APPEND
+			);
+		}
+		if ( 'hard_plan' === $this->planning_mode ) {
 			self::ensure_plan_mode_loaded();
 			$this->append_round_prompt_section(
 				$sections['stable'],
@@ -3884,7 +6566,16 @@ class PressArk_Agent {
 				$sections['stable'],
 				$sections['labels']['stable'],
 				'soft_plan_mode',
-				"## Soft Plan Mode\nStart by briefly stating the contained plan you will follow, then continue automatically unless the scope expands into destructive, ambiguous, bulk, or multi-entity writes. Read the current target state before any write, use native WordPress/WooCommerce tools for domain data, preserve regular_price when removing a sale unless the user explicitly asked to change it, and if a tool fails or verification disagrees, stop repeating the same fix and choose a materially different next step. Escalate to a hard plan before any destructive, ambiguous, bulk, or multi-entity writes."
+				"## Soft Plan Mode\nStart by exploring the current state with relevant read tools before you commit to a plan or any write. Once the reads have grounded the request, briefly state the contained plan you will follow and then continue automatically. Trust the soft-plan route once it has been chosen, and do not stop for a hard plan just because the work spans several contained steps, previews, or closely related edits. Read the current target state before any write and use native WordPress/WooCommerce tools for domain data. For WooCommerce price work, explicit sale requests map to sale_price, increase/decrease/current-price or regular-price requests map to regular_price or a relative regular_price adjustment, and ambiguous wording about sale price vs regular price requires a brief clarification before any price write. Preserve regular_price when removing a sale unless the user explicitly asked to change it, and if a tool fails or verification disagrees, stop repeating the same fix and choose a materially different next step. Escalate to a hard plan only if the work turns destructive or the intended write target becomes clearly broad or ambiguous."
+			);
+		}
+		if ( 'none' !== $this->planning_mode ) {
+			$this->append_round_prompt_section(
+				$sections['stable'],
+				$sections['labels']['stable'],
+				'plan_execution_contract',
+				'## Plan Execution Contract' . "\n"
+				. 'For tasks with 3+ steps: you may use read-only tools (and discover_tools / load_tools) freely BEFORE calling update_plan to gather grounding context. Once you call update_plan, every subsequent tool call must match the in_progress step (or you must call update_plan again to change steps). Keep exactly one step in_progress at a time. Use activeForm to describe the live step you are working on. Mark non-preview steps completed immediately after real success. For preview-required steps, do not mark them completed until the change was actually applied through the preview/confirm flow. Include tool_name when known so the harness can keep you on the correct step.'
 			);
 		}
 		$site_notes      = $this->resolve_site_notes( $message );
@@ -3970,12 +6661,55 @@ class PressArk_Agent {
 		);
 
 		$execution_guard = PressArk_Execution_Ledger::build_runtime_guard( $checkpoint->get_execution() );
+		$approved_artifact = $this->plan_artifact_from_checkpoint( $checkpoint );
+		if ( ! $this->is_plan_mode()
+			&& ! empty( $approved_artifact )
+			&& 'executing' === $checkpoint->get_plan_phase()
+		) {
+			$this->append_round_prompt_section(
+				$sections['stable'],
+				$sections['labels']['stable'],
+				'approved_plan_execution',
+				"## Approved Plan Execution\nA plan is already approved and in progress. Continue executing that plan instead of proposing a new one. Reuse the grounded reads already present in the transcript and read-state blocks before calling more read tools; only reread when a needed fact is missing or marked stale. Do not stop for another plan or approval boundary unless the user's goal changed or the approved plan became materially unsafe because the target or scope is now broad, destructive, or ambiguous."
+			);
+		}
 		if ( ! empty( $execution_guard ) && self::is_continuation_message( $message ) ) {
 			$this->append_round_prompt_section(
 				$sections['volatile'],
 				$sections['labels']['volatile'],
 				'execution_guard',
 				$execution_guard
+			);
+		}
+
+		$recent_approved_writes = array();
+		if ( self::is_continuation_message( $message ) && method_exists( $checkpoint, 'get_approval_outcomes' ) ) {
+			foreach ( array_slice( (array) $checkpoint->get_approval_outcomes(), -6 ) as $approval_outcome ) {
+				if ( ! is_array( $approval_outcome ) ) {
+					continue;
+				}
+				if ( 'approved' !== sanitize_key( (string) ( $approval_outcome['status'] ?? '' ) ) ) {
+					continue;
+				}
+
+				$action = sanitize_key( (string) ( $approval_outcome['action'] ?? 'write' ) );
+				$scope  = sanitize_key( (string) ( $approval_outcome['scope'] ?? '' ) );
+				$line   = '' !== $action ? $action : 'write';
+				if ( '' !== $scope ) {
+					$line .= ' via ' . $scope;
+				}
+				$recent_approved_writes[] = $line;
+			}
+		}
+		if ( ! empty( $recent_approved_writes ) ) {
+			$this->append_round_prompt_section(
+				$sections['volatile'],
+				$sections['labels']['volatile'],
+				'recent_approved_writes',
+				"## Recent Approved Writes\n"
+				. "These approvals were already settled and the underlying writes were applied in this run:\n- "
+				. implode( "\n- ", array_values( array_unique( $recent_approved_writes ) ) )
+				. "\nDo not ask for the same preview or confirmation again unless you are proposing a new write outside that settled scope."
 			);
 		}
 
@@ -3997,7 +6731,6 @@ class PressArk_Agent {
 			);
 		}
 
-		$approved_artifact = $this->plan_artifact_from_checkpoint( $checkpoint );
 		if ( ! empty( $approved_artifact ) && 'executing' === $checkpoint->get_plan_phase() && class_exists( 'PressArk_Plan_Artifact' ) ) {
 			$plan_block = PressArk_Plan_Artifact::to_prompt_block( $approved_artifact );
 			$this->append_round_prompt_section(
@@ -4020,6 +6753,22 @@ class PressArk_Agent {
 				$sections['labels']['volatile'],
 				'execution_plan',
 				$plan_block
+			);
+		}
+		if ( $this->should_inject_plan_summary_prompt( $checkpoint ) ) {
+			$this->append_round_prompt_section(
+				$sections['volatile'],
+				$sections['labels']['volatile'],
+				'plan_summary',
+				$this->build_plan_prompt_summary_block( $checkpoint )
+			);
+		}
+		if ( '' !== $this->plan_stall_message ) {
+			$this->append_round_prompt_section(
+				$sections['volatile'],
+				$sections['labels']['volatile'],
+				'plan_stall',
+				'## Plan Stall' . "\n" . $this->plan_stall_message
 			);
 		}
 
@@ -5266,7 +8015,18 @@ class PressArk_Agent {
 				);
 			}
 		}
-		$fallback_messages[] = array( 'role' => 'user', 'content' => $message );
+		// Only append the incoming message when it isn't already the last
+		// user message in history. The chat handler typically persists the
+		// user's prompt to history before invoking the loop, so appending
+		// unconditionally produces a duplicate user turn that the model sees
+		// twice in row.
+		$last = end( $fallback_messages );
+		$last_is_same_user = is_array( $last )
+			&& 'user' === ( $last['role'] ?? '' )
+			&& trim( (string) ( $last['content'] ?? '' ) ) === trim( $message );
+		if ( ! $last_is_same_user ) {
+			$fallback_messages[] = array( 'role' => 'user', 'content' => $message );
+		}
 
 		$messages = $fallback_messages;
 		if ( self::is_continuation_message( $message ) && class_exists( 'PressArk_Replay_Integrity' ) ) {
@@ -5292,7 +8052,14 @@ class PressArk_Agent {
 
 			if ( ! empty( $replay_messages ) ) {
 				$messages   = PressArk_Replay_Integrity::canonicalize_messages( $replay_messages );
-				$messages[] = array( 'role' => 'user', 'content' => $message );
+				$messages   = $this->strip_replay_checkpoint_headers( $messages );
+				$replay_last = end( $messages );
+				$replay_last_same = is_array( $replay_last )
+					&& 'user' === ( $replay_last['role'] ?? '' )
+					&& trim( (string) ( $replay_last['content'] ?? '' ) ) === trim( $message );
+				if ( ! $replay_last_same ) {
+					$messages[] = array( 'role' => 'user', 'content' => $message );
+				}
 			}
 
 			$resume_event['message_count_before'] = $this->count_replay_messages( $messages );
@@ -5319,6 +8086,54 @@ class PressArk_Agent {
 		}
 
 		return count( PressArk_Replay_Integrity::canonicalize_messages( $messages ) );
+	}
+
+	/**
+	 * Drop synthetic checkpoint header messages from persisted replay state.
+	 *
+	 * These headers are useful when compressing a live conversation for a
+	 * single provider request, but once they are stored inside replay state
+	 * they can become stale and contradict the current execution phase on
+	 * continuation turns. The current checkpoint and system prompt already
+	 * carry the authoritative state, so replay can safely omit them.
+	 *
+	 * @param array $messages Replay transcript candidate.
+	 * @return array
+	 */
+	private function strip_replay_checkpoint_headers( array $messages ): array {
+		if ( empty( $messages ) ) {
+			return $messages;
+		}
+
+		$filtered = array();
+		$changed  = false;
+
+		foreach ( $messages as $message ) {
+			if ( ! is_array( $message ) ) {
+				$filtered[] = $message;
+				continue;
+			}
+
+			$role    = sanitize_key( (string) ( $message['role'] ?? '' ) );
+			$content = (string) ( $message['content'] ?? '' );
+
+			if ( 'user' === $role && self::is_synthetic_checkpoint_header_message( $content ) ) {
+				$changed = true;
+				continue;
+			}
+
+			$filtered[] = $message;
+		}
+
+		return $changed ? array_values( $filtered ) : $messages;
+	}
+
+	/**
+	 * Synthetic checkpoint headers always start with the standard
+	 * conversation-state prefix emitted by PressArk_Checkpoint::to_context_header().
+	 */
+	private static function is_synthetic_checkpoint_header_message( string $content ): bool {
+		return 1 === preg_match( '/^\[Conversation State \(turn \d+\)\]/', ltrim( $content ) );
 	}
 
 	/**
@@ -5374,6 +8189,7 @@ class PressArk_Agent {
 			return;
 		}
 
+		$messages            = $this->strip_replay_checkpoint_headers( $messages );
 		$state               = $checkpoint->get_replay_state();
 		$snapshot            = PressArk_Replay_Integrity::snapshot_messages( $messages );
 		$state['messages']   = (array) ( $snapshot['messages'] ?? array() );
@@ -5744,6 +8560,246 @@ private function compact_loop_messages_legacy( array $messages, int $round = 0, 
 	/**
 	 * Compact messages mid-loop while preserving whole assistant API rounds.
 	 */
+	private function apply_lightweight_compaction( array $messages, int $round, ?PressArk_Checkpoint $checkpoint = null ): array {
+		if ( count( $messages ) <= 5 ) {
+			return $messages;
+		}
+
+		$continue_fence = -1;
+		foreach ( $messages as $index => $message ) {
+			if ( 'user' !== ( $message['role'] ?? '' ) ) {
+				continue;
+			}
+
+			$content = trim( (string) ( $message['content'] ?? '' ) );
+			if ( str_starts_with( $content, '[Continue]' ) ) {
+				$continue_fence = $index;
+			}
+		}
+
+		$protected_start = max( 0, count( $messages ) - 3 );
+		$sort_args       = static function ( $value ) use ( &$sort_args ) {
+			if ( ! is_array( $value ) ) {
+				return $value;
+			}
+
+			foreach ( $value as $key => $child ) {
+				$value[ $key ] = $sort_args( $child );
+			}
+
+			if ( ! empty( $value ) && array_keys( $value ) !== range( 0, count( $value ) - 1 ) ) {
+				ksort( $value );
+			}
+
+			return $value;
+		};
+		$build_tool_call_map = static function ( array $source_messages ) use ( $sort_args ): array {
+			$tool_call_map = array();
+
+			foreach ( $source_messages as $assistant_index => $message ) {
+				if ( 'assistant' !== ( $message['role'] ?? '' ) || empty( $message['tool_calls'] ) || ! is_array( $message['tool_calls'] ) ) {
+					continue;
+				}
+
+				foreach ( $message['tool_calls'] as $call_index => $call ) {
+					$tool_call_id = sanitize_text_field( (string) ( $call['id'] ?? '' ) );
+					if ( '' === $tool_call_id ) {
+						continue;
+					}
+
+					$tool_name = sanitize_key( (string) ( $call['function']['name'] ?? '' ) );
+					$args      = json_decode( (string) ( $call['function']['arguments'] ?? '' ), true );
+					if ( ! is_array( $args ) ) {
+						$args = array();
+					}
+
+					$args = $sort_args( $args );
+					$tool_call_map[ $tool_call_id ] = array(
+						'assistant_index' => $assistant_index,
+						'call_index'      => $call_index,
+						'tool_name'       => $tool_name,
+						'args_hash'       => md5( (string) wp_json_encode( $args ) ),
+					);
+				}
+			}
+
+			return $tool_call_map;
+		};
+
+		$tool_call_map         = $build_tool_call_map( $messages );
+		$duplicate_groups      = array();
+		$assistant_call_prunes = array();
+		$dropped_tool_indexes  = array();
+
+		foreach ( $messages as $index => $message ) {
+			if (
+				$index <= $continue_fence
+				|| $index >= $protected_start
+				|| 'tool' !== ( $message['role'] ?? '' )
+			) {
+				continue;
+			}
+
+			$tool_call_id = sanitize_text_field( (string) ( $message['tool_call_id'] ?? '' ) );
+			if ( '' === $tool_call_id || empty( $tool_call_map[ $tool_call_id ] ) ) {
+				continue;
+			}
+
+			$meta = $tool_call_map[ $tool_call_id ];
+			if ( $meta['assistant_index'] <= $continue_fence || $meta['assistant_index'] >= $protected_start ) {
+				continue;
+			}
+
+			$key = $meta['tool_name'] . '|' . $meta['args_hash'];
+			$duplicate_groups[ $key ][] = array(
+				'tool_index'       => $index,
+				'assistant_index'  => $meta['assistant_index'],
+				'call_index'       => $meta['call_index'],
+			);
+		}
+
+		foreach ( $duplicate_groups as $entries ) {
+			if ( count( $entries ) < 2 ) {
+				continue;
+			}
+
+			$latest = array_pop( $entries );
+			unset( $latest );
+
+			foreach ( $entries as $entry ) {
+				$dropped_tool_indexes[ $entry['tool_index'] ] = true;
+				$assistant_call_prunes[ $entry['assistant_index'] ][ $entry['call_index'] ] = true;
+			}
+		}
+
+		if ( ! empty( $dropped_tool_indexes ) ) {
+			$before_messages = $messages;
+			$deduped         = array();
+
+			foreach ( $messages as $index => $message ) {
+				if ( isset( $dropped_tool_indexes[ $index ] ) ) {
+					continue;
+				}
+
+				if ( isset( $assistant_call_prunes[ $index ] ) && 'assistant' === ( $message['role'] ?? '' ) && ! empty( $message['tool_calls'] ) && is_array( $message['tool_calls'] ) ) {
+					$pruned_calls = array();
+					foreach ( $message['tool_calls'] as $call_index => $call ) {
+						if ( isset( $assistant_call_prunes[ $index ][ $call_index ] ) ) {
+							continue;
+						}
+
+						$pruned_calls[] = $call;
+					}
+
+					if ( empty( $pruned_calls ) ) {
+						continue;
+					}
+
+					$message['tool_calls'] = array_values( $pruned_calls );
+				}
+
+				$deduped[] = $message;
+			}
+
+			$messages = $deduped;
+			if ( $checkpoint ) {
+				$this->record_compaction_event(
+					$checkpoint,
+					$round,
+					'lightweight_dedup',
+					$before_messages,
+					$messages,
+					array(),
+					'',
+					'lightweight_dedup'
+				);
+			}
+		}
+
+		$tool_call_map      = $build_tool_call_map( $messages );
+		$user_after_counts  = array_fill( 0, count( $messages ), 0 );
+		$assist_after_counts = array_fill( 0, count( $messages ), 0 );
+		$user_after         = 0;
+		$assistant_after    = 0;
+
+		for ( $index = count( $messages ) - 1; $index >= 0; $index-- ) {
+			$user_after_counts[ $index ]   = $user_after;
+			$assist_after_counts[ $index ] = $assistant_after;
+
+			$role = $messages[ $index ]['role'] ?? '';
+			if ( 'user' === $role ) {
+				$user_after++;
+			} elseif ( 'assistant' === $role ) {
+				$assistant_after++;
+			}
+		}
+
+		$before_summary_messages = $messages;
+		$condensed               = false;
+		foreach ( $messages as $index => &$message ) {
+			if ( $index <= $continue_fence || 'tool' !== ( $message['role'] ?? '' ) ) {
+				continue;
+			}
+
+			$tool_call_id = sanitize_text_field( (string) ( $message['tool_call_id'] ?? '' ) );
+			if ( '' === $tool_call_id || empty( $tool_call_map[ $tool_call_id ] ) ) {
+				continue;
+			}
+
+			$meta = $tool_call_map[ $tool_call_id ];
+			if ( 'update_plan' === $meta['tool_name'] ) {
+				continue;
+			}
+
+			if ( $user_after_counts[ $index ] < 3 || $assist_after_counts[ $index ] < 3 ) {
+				continue;
+			}
+
+			$decoded = json_decode( (string) ( $message['content'] ?? '' ), true );
+			if ( ! is_array( $decoded ) ) {
+				continue;
+			}
+
+			$summary = '';
+			if ( ! empty( $decoded['read_meta']['summary'] ) ) {
+				$summary = (string) $decoded['read_meta']['summary'];
+			} elseif ( ! empty( $decoded['summary'] ) ) {
+				$summary = (string) $decoded['summary'];
+			} elseif ( ! empty( $decoded['message'] ) ) {
+				$summary = (string) $decoded['message'];
+			}
+
+			$summary = trim( preg_replace( '/\s+/u', ' ', wp_strip_all_tags( $summary ) ) );
+			if ( '' === $summary ) {
+				continue;
+			}
+
+			$message['content'] = (string) wp_json_encode(
+				array(
+					'success' => array_key_exists( 'success', $decoded ) ? (bool) $decoded['success'] : true,
+					'summary' => $summary,
+				)
+			);
+			$condensed = true;
+		}
+		unset( $message );
+
+		if ( $condensed && $checkpoint ) {
+			$this->record_compaction_event(
+				$checkpoint,
+				$round,
+				'lightweight_summary',
+				$before_summary_messages,
+				$messages,
+				array(),
+				'',
+				'lightweight_summary'
+			);
+		}
+
+		return $messages;
+	}
+
 	private function compact_loop_messages( array $messages, int $round = 0, ?PressArk_Checkpoint $checkpoint = null, array $request_budget = array(), string $reason = 'message_threshold' ): array {
 		if ( count( $messages ) <= 5 ) {
 			return $messages;
@@ -5866,6 +8922,38 @@ private function compact_loop_messages_legacy( array $messages, int $round = 0, 
 		$historical_tasks  = $this->extract_historical_requests( $messages, $task );
 		$target_label      = $this->format_capsule_target( $checkpoint );
 		$preserved_details = $this->collect_preserved_detail_lines( $checkpoint, $messages );
+
+		// Fresh-source the active_request_verbatim from the earliest user
+		// message in this compaction's input, so cascading compactions can't
+		// truncate or paraphrase the original ask. If no user message is
+		// found, leave preserved_details unchanged.
+		$earliest_user_content = '';
+		foreach ( $messages as $msg ) {
+			if ( ( $msg['role'] ?? '' ) === 'user' ) {
+				$candidate = is_string( $msg['content'] ?? null ) ? trim( (string) $msg['content'] ) : '';
+				// Skip if this message is itself a prior compaction summary
+				// (those start with a context-boundary marker our code emits).
+				if ( '' !== $candidate && strpos( $candidate, '[Context compaction boundary' ) === false ) {
+					$earliest_user_content = $candidate;
+					break;
+				}
+			}
+		}
+		if ( '' !== $earliest_user_content ) {
+			$verbatim_line = 'active_request_verbatim: ' . $earliest_user_content;
+			// Replace any existing active_request_verbatim line, or prepend if none.
+			$replaced = false;
+			foreach ( $preserved_details as $i => $line ) {
+				if ( is_string( $line ) && strpos( $line, 'active_request_verbatim:' ) === 0 ) {
+					$preserved_details[ $i ] = $verbatim_line;
+					$replaced                = true;
+					break;
+				}
+			}
+			if ( ! $replaced ) {
+				array_unshift( $preserved_details, $verbatim_line );
+			}
+		}
 		$state_lines       = array();
 
 		if ( '' !== $task ) {
@@ -5926,15 +9014,26 @@ private function compact_loop_messages_legacy( array $messages, int $round = 0, 
 			return array();
 		}
 
-		$to_summarize = trim( implode( "\n\n", $payload_parts ) );
-		if ( mb_strlen( $to_summarize ) > 4500 ) {
-			$to_summarize = mb_substr( $to_summarize, 0, 4500 ) . '...';
+		$state_block      = ! empty( $state_lines ) ? "STATE\n" . implode( "\n", $state_lines ) : '';
+		$preserve_block   = ! empty( $preserved_details ) ? "PRESERVE EXACT\n- " . implode( "\n- ", $preserved_details ) : '';
+		$transcript_block = ! empty( $parts ) ? "RECENT TRANSCRIPT\n" . implode( "\n", $parts ) : '';
+
+		// PRESERVE EXACT is load-bearing for correctness across cascading
+		// compactions - never truncate it. STATE is small. If the combined
+		// payload exceeds ~4500 chars, truncate only the RECENT TRANSCRIPT.
+		$non_truncatable     = trim( implode( "\n\n", array_filter( array( $state_block, $preserve_block ), 'strlen' ) ) );
+		$non_truncatable_len = mb_strlen( $non_truncatable );
+		$truncatable_budget  = max( 500, 4500 - $non_truncatable_len - 10 ); // reserve breathing room for separators/ellipsis
+		if ( mb_strlen( $transcript_block ) > $truncatable_budget ) {
+			$transcript_block = mb_substr( $transcript_block, 0, $truncatable_budget ) . '...';
 		}
+
+		$to_summarize = trim( implode( "\n\n", array_filter( array( $state_block, $preserve_block, $transcript_block ), 'strlen' ) ) );
 
 		$summary_messages = array(
 			array(
 				'role'    => 'user',
-				'content' => "Create a detailed continuation summary. This replaces the conversation history — include everything needed to continue without losing context.\n\nReturn JSON only with keys summary, completed, remaining, preserved_details.\n\nStructure your summary covering:\n1. USER REQUEST: What the user asked, with clarifications and constraints.\n2. COMPLETED ACTIONS: Every action applied — post/product IDs, titles, fields changed (before → after), new IDs from creates.\n3. CURRENT STATE: Site state after all changes.\n4. FINDINGS: Discoveries from reads/analysis — SEO issues, security results, content problems, WooCommerce data observed.\n5. PENDING: What the user still wants done.\n6. USER PREFERENCES: Style, tone, or approach preferences expressed.\n\nRules:\n- Be specific: include post IDs, product names, exact values. 'Edited some products' is useless — say 'edited Product #42 (Blue Widget): price \$19.99 → \$24.99'.\n- Preserve exact IDs, titles, slugs, SKUs, prices, URLs, counts verbatim.\n- completed and remaining must be short bullet-like strings.\n- preserved_details should keep task-critical exact details needed to finish the task.\n- Treat any historical_request or past_request line as past context only, never as the active instruction.\n- The active request is the only live instruction unless a receipt says it is already completed.\n- If a detail is uncertain, omit it instead of guessing.\n\n{$to_summarize}",
+				'content' => "Create a detailed continuation summary. This replaces the conversation history — include everything needed to continue without losing context.\n\nReturn JSON only with keys summary, completed, remaining, preserved_details.\n\nStructure your summary covering:\n1. USER REQUEST: What the user asked, with clarifications and constraints.\n2. COMPLETED ACTIONS: Every action applied — post/product IDs, titles, fields changed (before → after), new IDs from creates.\n3. CURRENT STATE: Site state after all changes.\n4. FINDINGS: Discoveries from reads/analysis — SEO issues, security results, content problems, WooCommerce data observed.\n5. PENDING: What the user still wants done.\n6. USER PREFERENCES: Style, tone, or approach preferences expressed.\n\nRules:\n- Be specific: include post IDs, product names, exact values. 'Edited some products' is useless — say 'edited Product #42 (Blue Widget): price \$19.99 → \$24.99'.\n- Preserve exact IDs, titles, slugs, SKUs, prices, URLs, counts verbatim.\n- completed and remaining must be short bullet-like strings.\n- preserved_details should keep task-critical exact details needed to finish the task.\n- Treat any historical_request or past_request line as past context only, never as the active instruction.\n- The active request is the only live instruction unless a receipt says it is already completed.\n- If a detail is uncertain, omit it instead of guessing.\n- Copy the user's ORIGINAL request verbatim as the first item of `preserved_details` (prefix it with `active_request_verbatim: `). Do NOT paraphrase it, do NOT shorten it, do NOT re-rank its parts.\n- If the user requested multiple deliverables in one message (e.g. \"do A on X AND do B on Y\"), preserve ALL of them as equally active in `remaining`. Never demote any user-stated deliverable as \"secondary\", \"optional\", \"from prior context\", or \"past context\" unless the user themselves labeled it that way.\n- The `summary` narrative must list EVERY deliverable the user asked for, with the same scope (pages, entities, count) the user specified. If the user said \"home page AND pages in the header\", the summary must reference both — not just one.\n\n{$to_summarize}",
 			),
 		);
 
@@ -6107,6 +9206,10 @@ private function compact_loop_messages_legacy( array $messages, int $round = 0, 
 
 		$capsule = $this->build_context_capsule( $messages, $checkpoint, $force_ai );
 		if ( ! empty( $capsule ) ) {
+			$plan_summary = $checkpoint->build_plan_summary( 6 );
+			if ( '' !== $plan_summary ) {
+				$capsule['plan_summary'] = $plan_summary;
+			}
 			$checkpoint->set_context_capsule( $capsule );
 		}
 	}
@@ -6667,6 +9770,7 @@ private function compact_loop_messages_legacy( array $messages, int $round = 0, 
 
 	private function normalize_request_message( string $message ): string {
 		$normalized = trim( preg_replace( '/^\[(?:Continue|Confirmed)\]\s*/i', '', $message ) );
+		$normalized = preg_replace( '/\s*Do not repeat completed steps or recreate completed content\.?/i', '', $normalized );
 		$normalized = preg_replace( '/Please continue with the remaining steps from my original request\.?$/i', '', $normalized );
 		return sanitize_text_field( trim( (string) $normalized ) );
 	}
@@ -6779,6 +9883,7 @@ private function compact_loop_messages_legacy( array $messages, int $round = 0, 
 			'update_theme_setting'    => 'Preparing theme changes',
 			'discover_tools'          => 'Searching for tools',
 			'load_tools'              => 'Loading tools',
+			'update_plan'             => 'Updating plan',
 			'_context_compaction'     => 'Compressing context…',
 		);
 
@@ -6848,6 +9953,7 @@ private function compact_loop_messages_legacy( array $messages, int $round = 0, 
 			'update_theme_setting'    => 'Preparing theme changes',
 			'discover_tools'          => 'Searching for tools',
 			'load_tools'              => 'Loading tools',
+			'update_plan'             => 'Updating plan',
 			'_context_compaction'     => 'Compressing context…',
 		);
 
@@ -6974,11 +10080,7 @@ private function compact_loop_messages_legacy( array $messages, int $round = 0, 
 		// Trivial messages: skip the AI call entirely.
 		$trimmed = trim( $message );
 		if ( mb_strlen( $trimmed ) < 15 ) {
-			return array(
-				'task_type' => self::classify_task( $message, $conversation ),
-				'steps'     => array(),
-				'groups'    => array(),
-			);
+			return $this->plan_local_fallback( $message, $conversation );
 		}
 
 		$local_plan = $this->plan_local_fallback( $message, $conversation );
@@ -7084,7 +10186,7 @@ private function compact_loop_messages_legacy( array $messages, int $round = 0, 
 	 * @return array{task_type: string, steps: string[], groups: string[]}
 	 */
 	private function plan_local_fallback( string $message, array $conversation ): array {
-		$task   = self::classify_task( $message, $conversation );
+		$task   = self::refine_chat_task_type( $message, self::classify_task( $message, $conversation ) );
 		$groups = $this->refine_preload_groups(
 			$message,
 			$task,
@@ -7260,6 +10362,7 @@ private function compact_loop_messages_legacy( array $messages, int $round = 0, 
 		self::ensure_plan_mode_loaded();
 
 		$message = PressArk_Plan_Mode::strip_plan_directive( $message );
+		$task_type = self::refine_chat_task_type( $message, $task_type );
 		$msg     = strtolower( trim( $message ) );
 		if ( '' === $msg || 'chat' === $task_type ) {
 			return array();
@@ -7351,6 +10454,10 @@ private function compact_loop_messages_legacy( array $messages, int $round = 0, 
 			return $is_bulk ? 'the affected content items' : 'the current content';
 		}
 
+		if ( preg_match( '/\bhero|section|banner|cta|button|header|footer|layout\b/i', $message ) ) {
+			return 'the relevant page section';
+		}
+
 		if ( preg_match( '/\bseo\b|meta.?title|meta.?desc|canonical|robots\.txt|schema|search.?engine/i', $message )
 			|| in_array( 'seo', $groups, true )
 		) {
@@ -7437,7 +10544,7 @@ private function compact_loop_messages_legacy( array $messages, int $round = 0, 
 
 	private static function mentions_content_surface( string $message ): bool {
 		return (bool) preg_match(
-			'/\b(post|page|article|blog(?:\s+post)?|homepage|home\s+page|landing\s+page|about\s+page|contact\s+page|services\s+page|sales\s+page|content|copy|headline|excerpt|slug)\b/i',
+			'/\b(post|page|article|blog(?:\s+post)?|homepage|home\s+page|landing\s+page|about\s+page|contact\s+page|services\s+page|sales\s+page|content|copy|headline|excerpt|slug|hero|section|banner|cta|button|header|footer|layout)\b/i',
 			$message
 		);
 	}
@@ -7494,6 +10601,11 @@ private function compact_loop_messages_legacy( array $messages, int $round = 0, 
 		// Edit: change existing content, update, fix, modify, delete.
 		if ( preg_match( '/\b(edit|updat|chang|modif|delet|fix|replac|rewrit|improv|optimiz|refactor|remov|add.+to|set.+to|enabl|disabl|toggle|publish|unpublish)/i', $msg ) ) {
 			return 'edit';
+		}
+
+		$refined_task = self::refine_chat_task_type( $message, 'chat' );
+		if ( 'chat' !== $refined_task ) {
+			return $refined_task;
 		}
 
 		// Classify: short messages, greetings, simple questions.

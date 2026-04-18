@@ -549,13 +549,19 @@ class PressArk_Stream_Connector {
 
 		add_action( 'http_api_curl', $configure_curl, 10, 3 );
 
+		// Simulator observers (Claude Code sub-agents) respond on human-turn
+		// latency, not API latency. Bump the HTTP read timeout to match the
+		// agent-loop wall-clock budget in that mode; otherwise keep the normal
+		// 120s cap that matches OpenRouter's streaming window.
+		$stream_timeout = PressArk_AI_Connector::simulator_active() ? 1800 : 120;
+
 		try {
 			$response = wp_remote_post(
 				$endpoint,
 				array(
 					'headers'     => $this->build_wp_remote_headers( $headers ),
 					'body'        => $body,
-					'timeout'     => 120,
+					'timeout'     => $stream_timeout,
 					'httpversion' => '1.1',
 					'redirection' => 0,
 					'blocking'    => true,

@@ -139,9 +139,10 @@ class PressArk_Plan_Mode {
 				'Act like a senior WordPress operator: resolve exact targets, IDs, current state, and native domain APIs before proposing steps.',
 				'Plans must name the objects and fields affected, the main risk checks, and the verification reads you will run after execution.',
 				'Prefer WordPress-native tools over raw content/meta edits when a dedicated domain tool exists.',
-				'For WooCommerce price or sale work, plan to read the product first. Do not use plain price for writes: choose regular_price for the base price, sale_price for a sale amount, or clear_sale=true to remove a sale. Empty sale_price is legacy compatibility only, not the planned path. Preserve regular_price unless explicitly changing it, and never set prices to 0 unless the goal is a free product.',
+				'For WooCommerce price or sale work, plan to read the product first. Do not use plain price for writes: choose regular_price for the base price, sale_price for a sale amount, or clear_sale=true to remove a sale. If the request explicitly says sale, plan around sale_price. If it says increase, decrease, raise, lower, or current/regular price, plan around regular_price or a relative regular_price adjustment. If the wording is ambiguous about sale price vs regular price, ask a clarification in the plan instead of guessing. Empty sale_price is legacy compatibility only, not the planned path. Preserve regular_price unless explicitly changing it, and never set prices to 0 unless the goal is a free product.',
 				'If a prior attempt or hypothesis already failed, do not restate the same fix; revise the plan with a different diagnostic step or safer alternative.',
 				'If you need more context, keep exploring with read tools only.',
+				'Do not output the checklist until you have first used the relevant read-only tools and incorporated those read results into the plan.',
 				'When you are ready, output a numbered checklist plan and stop so the user can explicitly approve execution.',
 			)
 		);

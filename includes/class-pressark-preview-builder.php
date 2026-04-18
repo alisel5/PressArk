@@ -67,11 +67,30 @@ class PressArk_Preview_Builder {
 	 * @return array Preview data including 'type' and 'changes'.
 	 */
 	public function build( array $action ): array {
-		$type    = $action['type'] ?? '';
+		$type    = sanitize_key( (string) ( $action['type'] ?? '' ) );
 		$preview = array( 'type' => $type );
 
 		// Normalize params — support both nested and flat formats.
 		$params = $action['params'] ?? $action;
+		$params = is_array( $params ) ? $params : array();
+
+		if ( class_exists( 'PressArk_Operation_Registry' ) && '' !== $type ) {
+			$type            = PressArk_Operation_Registry::resolve_alias( $type );
+			$preview['type'] = $type;
+			$validation      = PressArk_Operation_Registry::validate_input( $type, $params );
+			if ( ! ( $validation['valid'] ?? true ) ) {
+				return array_merge(
+					$preview,
+					$this->build_validation_preview(
+						sanitize_text_field( (string) ( $validation['message'] ?? __( 'Invalid input for this action.', 'pressark' ) ) )
+					)
+				);
+			}
+
+			if ( isset( $validation['params'] ) && is_array( $validation['params'] ) ) {
+				$params = $validation['params'];
+			}
+		}
 
 		// Look up the operation in the registry.
 		$op = PressArk_Operation_Registry::resolve( $type );
@@ -89,6 +108,20 @@ class PressArk_Preview_Builder {
 		}
 
 		return array_merge( $preview, $handler->default_preview( $type, $params ) );
+	}
+
+	private function build_validation_preview( string $message ): array {
+		return array(
+			'post_title'       => '',
+			'validation_error' => $message,
+			'changes'          => array(
+				array(
+					'field'  => __( 'Validation', 'pressark' ),
+					'before' => __( '(blocked)', 'pressark' ),
+					'after'  => $message,
+				),
+			),
+		);
 	}
 
 	/**

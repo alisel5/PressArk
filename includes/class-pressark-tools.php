@@ -512,11 +512,31 @@ class PressArk_Tools {
 
 		foreach ( $tools as $tool ) {
 			if ( is_object( $tool ) && method_exists( $tool, 'to_legacy_definition' ) ) {
-				$definitions[] = $tool->to_legacy_definition();
+				$definitions[] = self::normalize_tool_definition( $tool->to_legacy_definition() );
 			}
 		}
 
 		return $definitions;
+	}
+
+	private static function normalize_tool_definition( array $tool ): array {
+		if ( 'get_menus' !== (string) ( $tool['name'] ?? '' ) ) {
+			return $tool;
+		}
+
+		$tool['description'] = 'List classic or FSE menus and theme locations. Without menu_id, full auto-inlines up to 50 items for the only menu or location-assigned menus; use summary for counts only.';
+
+		if ( ! empty( $tool['params'] ) && is_array( $tool['params'] ) ) {
+			foreach ( $tool['params'] as $index => $param ) {
+				if ( ! is_array( $param ) || 'mode' !== (string) ( $param['name'] ?? '' ) ) {
+					continue;
+				}
+
+				$tool['params'][ $index ]['desc'] = 'summary|full - summary returns counts only. Without menu_id, full auto-inlines up to 50 items for the only menu or location-assigned menus. (default: full)';
+			}
+		}
+
+		return $tool;
 	}
 
 	public static function describe_tool_definition( array $tool ): string {
@@ -979,7 +999,12 @@ class PressArk_Tools {
 	 * @since 5.5.0
 	 */
 	private static function get_tool_description( array $tool ): string {
+		$tool = self::normalize_tool_definition( $tool );
 		$name        = (string) ( $tool['name'] ?? '' );
+		if ( 'get_menus' === $name ) {
+			return trim( (string) ( $tool['description'] ?? '' ) );
+		}
+
 		$metadata    = class_exists( 'PressArk_Operation_Registry' )
 			? PressArk_Operation_Registry::get_authoritative_discovery_metadata( $name )
 			: null;
@@ -1021,6 +1046,7 @@ class PressArk_Tools {
 	 * @return array<int, array{name: string, required: bool, desc: string}>
 	 */
 	private static function get_tool_prompt_params( array $tool ): array {
+		$tool = self::normalize_tool_definition( $tool );
 		$contract = self::get_tool_parameter_contract( $tool );
 		if ( is_array( $contract ) && is_array( $contract['properties'] ?? null ) ) {
 			$required = array_values( array_filter( array_map(
@@ -1068,6 +1094,7 @@ class PressArk_Tools {
 	 * @since 5.5.0
 	 */
 	private static function build_parameter_schema( array $tool ): array {
+		$tool = self::normalize_tool_definition( $tool );
 		$name = (string) ( $tool['name'] ?? '' );
 		if ( '' !== $name && class_exists( 'PressArk_Operation_Registry' ) ) {
 			$data = PressArk_Operation_Registry::get_authoritative_provider_schema_data( $name );

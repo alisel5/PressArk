@@ -460,7 +460,7 @@ class PressArk_Automation_Dispatcher {
 	 *
 	 * @since 4.3.1
 	 */
-	private static function cancel_wake( string $automation_id ): void {
+	public static function cancel_wake( string $automation_id ): void {
 		$hook = 'pressark_automation_wake';
 		$args = array( $automation_id );
 
@@ -625,6 +625,10 @@ class PressArk_Automation_Dispatcher {
 	 */
 	public static function next_run_for_resume( array $automation, ?string $reference_utc = null ): ?string {
 		$reference = $reference_utc ?: current_time( 'mysql', true );
+
+		if ( ! empty( $automation['event_trigger'] ) && empty( $automation['next_run_at'] ) ) {
+			return null;
+		}
 
 		if ( 'once' === ( $automation['cadence_type'] ?? '' ) ) {
 			if ( ! empty( $automation['last_success_at'] ) ) {

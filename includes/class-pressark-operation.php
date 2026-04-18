@@ -24,7 +24,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 class PressArk_Operation {
 
 	/** @var string[] Tool names classified as meta-tools (loader/discovery). */
-	private const META_TOOLS = array( 'discover_tools', 'load_tools', 'load_tool_group' );
+	private const META_TOOLS = array( 'discover_tools', 'load_tools', 'load_tool_group', 'update_plan' );
 
 	// ── Execution contract defaults ────────────────────────────────
 

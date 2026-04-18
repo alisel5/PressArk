@@ -250,11 +250,28 @@ class PressArk_Pipeline {
 		$pending = array();
 
 		foreach ( $tool_calls as $tool_call ) {
+			$action_type   = sanitize_key( (string) ( $tool_call['name'] ?? $tool_call['type'] ?? '' ) );
+			$action_params = is_array( $tool_call['arguments'] ?? null ) ? $tool_call['arguments'] : ( $tool_call['params'] ?? array() );
+			if ( ! is_array( $action_params ) ) {
+				$action_params = array();
+			}
+
+			$validation_error = '';
+			if ( class_exists( 'PressArk_Operation_Registry' ) && '' !== $action_type ) {
+				$action_type = PressArk_Operation_Registry::resolve_alias( $action_type );
+				$validation  = PressArk_Operation_Registry::validate_input( $action_type, $action_params );
+				if ( ! ( $validation['valid'] ?? true ) ) {
+					$validation_error = sanitize_text_field( (string) ( $validation['message'] ?? __( 'Invalid input for this action.', 'pressark' ) ) );
+				} elseif ( isset( $validation['params'] ) && is_array( $validation['params'] ) ) {
+					$action_params = $validation['params'];
+				}
+			}
+
 			$action_data = array(
-				'type'   => $tool_call['name'] ?? $tool_call['type'] ?? '',
-				'params' => $tool_call['arguments'] ?? $tool_call['params'] ?? array(),
+				'type'   => $action_type,
+				'params' => $action_params,
 			);
-			$permission_decision = class_exists( 'PressArk_Permission_Service' )
+			$permission_decision = '' === $validation_error && class_exists( 'PressArk_Permission_Service' )
 				? PressArk_Permission_Service::evaluate(
 					(string) ( $action_data['type'] ?? '' ),
 					(array) ( $action_data['params'] ?? array() ),
@@ -264,10 +281,14 @@ class PressArk_Pipeline {
 				)
 				: array();
 			$preview   = call_user_func( $preview_fn, $action_data );
+			if ( '' !== $validation_error && is_array( $preview ) ) {
+				$preview['validation_error'] = $validation_error;
+			}
 			$pending[] = array(
 				'action'              => $action_data,
 				'preview'             => $preview,
-				'status'              => 'pending_confirmation',
+				'status'              => '' === $validation_error ? 'pending_confirmation' : 'invalid_input',
+				'validation_error'    => $validation_error,
 				'permission_decision' => $permission_decision,
 				'risk_receipt'        => self::build_risk_receipt(
 					$action_data,

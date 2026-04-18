@@ -170,9 +170,10 @@ class PressArk_Tool_Catalog {
 			}
 		}
 
-		// Always include the meta-tools (v2.3.1: discover_tools + load_tools).
+		// Always include the meta-tools (v2.3.1+: discovery/load/plan state).
 		$tool_names[] = 'discover_tools';
 		$tool_names[] = 'load_tools';
+		$tool_names[] = 'update_plan';
 
 		return array_values( array_unique( $tool_names ) );
 	}
@@ -201,6 +202,7 @@ class PressArk_Tool_Catalog {
 			$normalized[] = 'discover_tools';
 			$normalized[] = 'load_tools';
 			$normalized[] = 'load_tool_group';
+			$normalized[] = 'update_plan';
 		}
 
 		return array_values( array_unique( $normalized ) );
@@ -226,7 +228,7 @@ class PressArk_Tool_Catalog {
 		foreach ( $requested as $requested_name ) {
 			$name = PressArk_Operation_Registry::resolve_alias( $requested_name );
 			$tool = $this->resolve_tool_object( $name );
-			if ( in_array( $name, array( 'discover_tools', 'load_tools', 'load_tool_group' ), true ) ) {
+			if ( in_array( $name, array( 'discover_tools', 'load_tools', 'load_tool_group', 'update_plan' ), true ) ) {
 				continue;
 			}
 
@@ -258,8 +260,8 @@ class PressArk_Tool_Catalog {
 			$schemas[] = $schema;
 		}
 
-		// Add meta-tool schemas (v2.3.1: discover_tools + load_tools).
-		if ( isset( $tool_names_set['discover_tools'] ) || isset( $tool_names_set['load_tools'] ) ) {
+		// Add meta-tool schemas (v2.3.1+: discover_tools/load_tools/update_plan).
+		if ( isset( $tool_names_set['discover_tools'] ) || isset( $tool_names_set['load_tools'] ) || isset( $tool_names_set['update_plan'] ) ) {
 			foreach ( $this->get_meta_tools_schemas() as $meta_schema ) {
 				$schemas[] = $meta_schema;
 			}
@@ -1197,13 +1199,51 @@ class PressArk_Tool_Catalog {
 	}
 
 	/**
-	 * Get the discover_tools + load_tools meta-tool schemas.
+	 * Get the discover_tools + load_tools + update_plan meta-tool schemas.
 	 * Replaces the single load_tool_group meta-tool for v2.3.1.
 	 *
 	 * @since 2.3.1
 	 * @return array[] Two OpenAI function schemas.
 	 */
 	public function get_meta_tools_schemas(): array {
+		$update_plan_description = 'Update the todo list for the current session. To be used proactively and often to track progress and pending tasks. The FIRST update_plan call in plan mode may list all steps as "pending" — this submits the plan for user approval. On every subsequent call the plan MUST keep exactly one step with status="in_progress" at a time. Always provide both content (imperative) and activeForm (present continuous) for each task.';
+		$update_plan_prompt      = <<<'PROMPT'
+Use this tool to create and manage a structured task list for your current WordPress session. This helps you track progress, organize complex tasks, and demonstrate thoroughness to the user.
+
+## When to Use This Tool
+Use this tool proactively in these scenarios:
+1. Complex multi-step tasks - When a task requires 3 or more distinct steps
+2. User provides multiple items - "update header, footer, and style.css"
+3. After receiving new instructions - Immediately capture requirements as todos
+4. When you start working on a task - Mark it as in_progress BEFORE beginning work. Ideally you should only have one todo as in_progress at a time
+5. After completing a task - Mark it as completed and add any new follow-up tasks
+
+## Task States
+- pending: Task not yet started
+- in_progress: Currently working on (limit to ONE task at a time)
+- completed: Task finished successfully
+
+IMPORTANT: Task descriptions must have two forms:
+- content: "Edit header.php"
+- activeForm: "Editing header.php"
+
+## WordPress Rules
+- For any step that changes content, set preview_required: true
+- Do NOT mark a preview_required step as completed until the user has approved the preview and the apply succeeded
+- For read-only steps, mark completed immediately after success
+
+## Examples
+User: update header.php, footer.php, style.css then run build
+Assistant: *Calls update_plan with:*
+1. Editing header.php (in_progress)
+2. Editing footer.php (pending)
+3. Editing style.css (pending)
+4. Running build (pending)
+*Then edits header.php*
+
+When in doubt, use this tool. Being proactive with task management demonstrates attentiveness.
+PROMPT;
+
 		return array(
 			array(
 				'type'     => 'function',
@@ -1226,7 +1266,7 @@ class PressArk_Tool_Catalog {
 				'type'     => 'function',
 				'function' => array(
 					'name'        => 'load_tools',
-					'description' => 'Load additional tool schemas into your active set. Use discover_tools first to find which tools or groups you need, then load them here. Tools persist across conversation turns. Provide either group or tools (or both).',
+					'description' => 'Load additional tool schemas into your active set. Use discover_tools first to find which tools or groups you need, then load them here. Tools persist across conversation turns. Provide either group or tools (or both). Check the tools you already have available before calling this — loading an already-loaded group wastes a round.',
 					'parameters'  => array(
 						'type'       => 'object',
 						'properties' => array(
@@ -1241,6 +1281,54 @@ class PressArk_Tool_Catalog {
 							),
 						),
 						'required' => array(),
+					),
+				),
+			),
+			array(
+				'type'     => 'function',
+				'function' => array(
+					'name'        => 'update_plan',
+					'description' => $update_plan_description,
+					'parameters'  => array(
+						'type'       => 'object',
+						'properties' => array(
+							'steps' => array(
+								'type'        => 'array',
+								'description' => $update_plan_prompt,
+								'items'       => array(
+									'type'       => 'object',
+									'properties' => array(
+										'content' => array(
+											'type'        => 'string',
+											'description' => 'Canonical step text in base form, for example "Edit the homepage hero copy".',
+										),
+										'activeForm' => array(
+											'type'        => 'string',
+											'description' => 'Present-progress rendering of the same step, for example "Editing the homepage hero copy".',
+										),
+										'status' => array(
+											'type'        => 'string',
+											'enum'        => array( 'pending', 'in_progress', 'completed' ),
+											'description' => 'Current state of the step.',
+										),
+										'post_id' => array(
+											'type'        => 'integer',
+											'description' => 'Optional post/product ID this step targets.',
+										),
+										'tool_name' => array(
+											'type'        => 'string',
+											'description' => 'Optional canonical tool name expected for this step.',
+										),
+										'preview_required' => array(
+											'type'        => 'boolean',
+											'description' => 'Whether this step requires preview/confirm apply before it can be considered complete.',
+										),
+									),
+									'required' => array( 'content', 'activeForm', 'status', 'preview_required' ),
+								),
+							),
+						),
+						'required' => array( 'steps' ),
 					),
 				),
 			),
@@ -1318,7 +1406,7 @@ class PressArk_Tool_Catalog {
 
 		foreach ( $legacy as $tool ) {
 			$name = sanitize_key( (string) ( $tool['name'] ?? '' ) );
-			if ( '' === $name || in_array( $name, array( 'discover_tools', 'load_tools', 'load_tool_group' ), true ) ) {
+			if ( '' === $name || in_array( $name, array( 'discover_tools', 'load_tools', 'load_tool_group', 'update_plan' ), true ) ) {
 				continue;
 			}
 

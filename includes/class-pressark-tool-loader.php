@@ -828,7 +828,7 @@ class PressArk_Tool_Loader {
 		$deferred_tool_names       = array();
 
 		foreach ( $this->normalize_tool_names( $tool_names ) as $tool_name ) {
-			if ( in_array( $tool_name, array( 'discover_tools', 'load_tools', 'load_tool_group' ), true ) ) {
+			if ( in_array( $tool_name, array( 'discover_tools', 'load_tools', 'load_tool_group', 'update_plan' ), true ) ) {
 				$selected_tool_names[] = $tool_name;
 				$always_load_tool_names[] = $tool_name;
 				continue;

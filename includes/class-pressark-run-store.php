@@ -337,6 +337,49 @@ class PressArk_Run_Store {
 	}
 
 	/**
+	 * Mark a run as explicitly cancelled by the user.
+	 *
+	 * @param string $run_id Run ID.
+	 * @return bool True when the run is cancelled or was already cancelled.
+	 */
+	public function mark_cancelled( string $run_id ): bool {
+		$rows = $this->write_query(
+			'UPDATE ' . self::table_sql() . "
+			 SET status = 'cancelled', updated_at = %s
+			 WHERE run_id = %s
+			 AND status IN ('running', 'awaiting_preview', 'awaiting_confirm', 'partially_confirmed')",
+			array( current_time( 'mysql', true ), $run_id )
+		);
+
+		if ( (int) $rows >= 1 ) {
+			$this->publish_transition_event(
+				$run_id,
+				'run.completed',
+				'run',
+				'cancelled',
+				'user_cancelled',
+				array(
+					'status' => 'cancelled',
+				),
+				'Run cancelled.'
+			);
+			return true;
+		}
+
+		return $this->is_cancelled( $run_id );
+	}
+
+	/**
+	 * Check whether a run has been explicitly cancelled.
+	 *
+	 * @param string $run_id Run ID.
+	 * @return bool
+	 */
+	public function is_cancelled( string $run_id ): bool {
+		return 'cancelled' === $this->get_status( $run_id );
+	}
+
+	/**
 	 * Find the newest cancellable run for a user, optionally scoped to a chat.
 	 *
 	 * Cancellable means the run is still in a pre-terminal state, including

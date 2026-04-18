@@ -324,26 +324,84 @@ class PressArk_Action_Engine {
 
 		} catch ( \TypeError $e ) {
 			PressArk_Error_Tracker::error( 'ActionEngine', 'TypeError executing action', array( 'action_type' => $action['type'] ?? 'unknown', 'error' => $e->getMessage() ) );
-			return array(
-				'success'     => false,
-				'message'     => __( 'Something went wrong executing that action. Please try rephrasing your request.', 'pressark' ),
-				'action_type' => $action['type'] ?? 'unknown',
+			return $this->build_execution_error_result(
+				$e,
+				$action,
+				__( 'Something went wrong executing that action. Please try rephrasing your request.', 'pressark' ),
+				'action_type_error'
 			);
 		} catch ( \Exception $e ) {
 			PressArk_Error_Tracker::error( 'ActionEngine', 'Exception executing action', array( 'action_type' => $action['type'] ?? 'unknown', 'error' => $e->getMessage() ) );
-			return array(
-				'success'     => false,
-				'message'     => __( 'An unexpected error occurred. Please try again.', 'pressark' ),
-				'action_type' => $action['type'] ?? 'unknown',
+			return $this->build_execution_error_result(
+				$e,
+				$action,
+				__( 'An unexpected error occurred. Please try again.', 'pressark' ),
+				'action_exception'
 			);
 		} catch ( \Error $e ) {
 			PressArk_Error_Tracker::critical( 'ActionEngine', 'Fatal error executing action', array( 'action_type' => $action['type'] ?? 'unknown', 'error' => $e->getMessage() ) );
-			return array(
-				'success'     => false,
-				'message'     => __( 'Something went wrong. Please try again or rephrase your request.', 'pressark' ),
-				'action_type' => $action['type'] ?? 'unknown',
+			return $this->build_execution_error_result(
+				$e,
+				$action,
+				__( 'Something went wrong. Please try again or rephrase your request.', 'pressark' ),
+				'action_fatal_error'
 			);
 		}
+	}
+
+	/**
+	 * Build a stable tool-result payload for caught execution failures.
+	 *
+	 * In normal production flows we preserve the friendly fallback message.
+	 * During simulator/debug runs we surface the real exception text so
+	 * observer sessions can diagnose the underlying failure directly.
+	 *
+	 * @param \Throwable $error            Caught exception or fatal.
+	 * @param mixed      $action           Original action payload.
+	 * @param string     $fallback_message User-safe fallback text.
+	 * @param string     $error_code       Stable machine-readable code.
+	 * @return array
+	 */
+	private function build_execution_error_result( \Throwable $error, $action, string $fallback_message, string $error_code ): array {
+		$action_type = sanitize_text_field( (string) ( $action['type'] ?? 'unknown' ) );
+		$detail      = sanitize_text_field( trim( $error->getMessage() ) );
+		$show_detail = $this->should_surface_execution_error_details();
+
+		$result = array(
+			'success'     => false,
+			'message'     => ( $show_detail && '' !== $detail ) ? $detail : $fallback_message,
+			'action_type' => '' !== $action_type ? $action_type : 'unknown',
+			'error_code'  => sanitize_key( $error_code ),
+		);
+
+		if ( $show_detail && '' !== $detail ) {
+			$result['error']      = $detail;
+			$result['error_type'] = sanitize_text_field( get_class( $error ) );
+		} else {
+			$result['hint'] = __( 'Check the PressArk activity log for diagnostics if this keeps happening.', 'pressark' );
+		}
+
+		return $result;
+	}
+
+	/**
+	 * Whether this request should receive the raw execution error detail.
+	 *
+	 * @return bool
+	 */
+	private function should_surface_execution_error_details(): bool {
+		if ( defined( 'PRESSARK_DEBUG' ) && PRESSARK_DEBUG ) {
+			return true;
+		}
+
+		if ( class_exists( 'PressArk_AI_Connector' )
+			&& method_exists( 'PressArk_AI_Connector', 'simulator_active' )
+			&& PressArk_AI_Connector::simulator_active()
+		) {
+			return true;
+		}
+
+		return ( defined( 'WP_DEBUG' ) && WP_DEBUG && function_exists( 'current_user_can' ) && current_user_can( 'manage_options' ) );
 	}
 
 	/**

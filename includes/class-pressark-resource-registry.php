@@ -769,46 +769,59 @@ class PressArk_Resource_Registry {
 		$stylesheet = get_stylesheet();
 		$cached     = get_transient( 'pressark_customizer_schema_' . $stylesheet );
 		if ( false !== $cached ) {
-			return $cached;
+			$normalized = self::normalize_customizer_schema_cache( $cached );
+			if ( null !== $normalized ) {
+				return $normalized;
+			}
 		}
 
 		// Build schema via Customizer API (expensive — requires full manager init).
-		require_once ABSPATH . WPINC . '/class-wp-customize-manager.php';
-		$wp_customize = new WP_Customize_Manager();
-		// phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- Core Customizer registrations are attached to this WordPress hook.
-		do_action( 'customize_register', $wp_customize );
+		try {
+			if ( ! class_exists( 'WP_Customize_Manager' ) ) {
+				require_once ABSPATH . WPINC . '/class-wp-customize-manager.php';
+			}
+			$wp_customize = new WP_Customize_Manager( array(
+				'messenger_channel' => false,
+			) );
+			self::bootstrap_customizer_manager( $wp_customize );
+			self::prime_customizer_support_loaders( $wp_customize );
+			// phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- Core Customizer registrations are attached to this WordPress hook.
+			do_action( 'customize_register', $wp_customize );
 
-		$schema = array();
-		foreach ( $wp_customize->sections() as $section ) {
-			$controls = array();
-			foreach ( $wp_customize->controls() as $control ) {
-				if ( $control->section !== $section->id ) {
-					continue;
+			$schema = array();
+			foreach ( $wp_customize->sections() as $section ) {
+				$controls = array();
+				foreach ( $wp_customize->controls() as $control ) {
+					if ( $control->section !== $section->id ) {
+						continue;
+					}
+					// Skip nav menus and widgets.
+					if ( str_starts_with( $control->id, 'nav_menu' ) || str_starts_with( $control->id, 'widget_' ) ) {
+						continue;
+					}
+					$controls[] = array(
+						'id'      => $control->id,
+						'type'    => $control->type,
+						'label'   => $control->label,
+						'value'   => get_theme_mod( $control->id, $control->setting->default ?? '' ),
+						'choices' => $control->choices ?? array(),
+					);
 				}
-				// Skip nav menus and widgets.
-				if ( str_starts_with( $control->id, 'nav_menu' ) || str_starts_with( $control->id, 'widget_' ) ) {
-					continue;
+				if ( ! empty( $controls ) ) {
+					$schema[] = array(
+						'section'  => $section->id,
+						'title'    => $section->title,
+						'controls' => $controls,
+					);
 				}
-				$controls[] = array(
-					'id'      => $control->id,
-					'type'    => $control->type,
-					'label'   => $control->label,
-					'value'   => get_theme_mod( $control->id, $control->setting->default ?? '' ),
-					'choices' => $control->choices ?? array(),
-				);
 			}
-			if ( ! empty( $controls ) ) {
-				$schema[] = array(
-					'section'  => $section->id,
-					'title'    => $section->title,
-					'controls' => $controls,
-				);
-			}
+
+			set_transient( 'pressark_customizer_schema_' . $stylesheet, $schema, HOUR_IN_SECONDS );
+
+			return $schema;
+		} catch ( \Throwable $e ) {
+			return self::build_customizer_schema_fallback( $e );
 		}
-
-		set_transient( 'pressark_customizer_schema_' . $stylesheet, $schema, HOUR_IN_SECONDS );
-
-		return $schema;
 	}
 
 	/**
@@ -1111,6 +1124,216 @@ class PressArk_Resource_Registry {
 	private static function cache_key( string $uri ): string {
 		// Transient keys max 172 chars. Use hash for safety.
 		return self::CACHE_PREFIX . substr( md5( $uri ), 0, 16 );
+	}
+
+	/**
+	 * Normalize the shared customizer transient into the resource schema format.
+	 *
+	 * Handler_System stores a richer grouped payload under the same transient key.
+	 * Resource reads expect the lighter section/control schema shape.
+	 *
+	 * @param mixed $cached Cached transient value.
+	 * @return array|null
+	 */
+	private static function normalize_customizer_schema_cache( $cached ): ?array {
+		if ( ! is_array( $cached ) ) {
+			return null;
+		}
+
+		if ( isset( $cached[0] ) && is_array( $cached[0] ) && isset( $cached[0]['section'], $cached[0]['controls'] ) ) {
+			return $cached;
+		}
+
+		$grouped = $cached['grouped'] ?? null;
+		if ( empty( $cached['success'] ) || ! is_array( $grouped ) ) {
+			return null;
+		}
+
+		$schema = array();
+		foreach ( $grouped as $group_title => $controls ) {
+			if ( ! is_array( $controls ) || empty( $controls ) ) {
+				continue;
+			}
+
+			$section_controls = array();
+			foreach ( $controls as $control ) {
+				if ( ! is_array( $control ) ) {
+					continue;
+				}
+
+				$section_controls[] = array(
+					'id'          => (string) ( $control['id'] ?? '' ),
+					'type'        => (string) ( $control['type'] ?? '' ),
+					'label'       => (string) ( $control['label'] ?? ( $control['id'] ?? '' ) ),
+					'value'       => $control['current'] ?? null,
+					'choices'     => is_array( $control['choices'] ?? null ) ? $control['choices'] : array(),
+					'description' => $control['description'] ?? null,
+					'default'     => $control['default'] ?? null,
+				);
+			}
+
+			if ( empty( $section_controls ) ) {
+				continue;
+			}
+
+			$schema[] = array(
+				'section'  => sanitize_title( (string) $group_title ),
+				'title'    => (string) $group_title,
+				'controls' => $section_controls,
+			);
+		}
+
+		return empty( $schema ) ? null : $schema;
+	}
+
+	/**
+	 * Build a resilient Customizer schema fallback from saved theme mods.
+	 *
+	 * Some classic themes/plugins register Customizer controls through globals that
+	 * are unavailable outside the full customize.php lifecycle. When that happens,
+	 * fall back to a stable theme_mod snapshot instead of surfacing a fatal.
+	 *
+	 * @param \Throwable $error Schema bootstrap error.
+	 * @return array
+	 */
+	private static function build_customizer_schema_fallback( \Throwable $error ): array {
+		$controls = array();
+		$mods     = class_exists( 'PressArk_Themes' )
+			? ( new PressArk_Themes() )->get_customizer_settings()
+			: (array) get_theme_mods();
+
+		foreach ( $mods as $key => $value ) {
+			$key = (string) $key;
+			if ( '' === $key || str_starts_with( $key, 'nav_menu_locations' ) || str_starts_with( $key, 'widget_' ) ) {
+				continue;
+			}
+
+			$controls[] = array(
+				'id'      => $key,
+				'type'    => self::infer_customizer_fallback_control_type( $value ),
+				'label'   => self::humanize_customizer_setting_label( $key ),
+				'value'   => $value,
+				'choices' => array(),
+			);
+		}
+
+		return array(
+			array(
+				'section'         => 'pressark_theme_mods_fallback',
+				'title'           => __( 'Theme Mods Snapshot', 'pressark' ),
+				'controls'        => $controls,
+				'fallback'        => true,
+				'fallback_reason' => sprintf( __( 'Customizer controls could not be fully registered: %s', 'pressark' ), $error->getMessage() ),
+				'fallback_hint'   => __( 'Using saved theme_mod values instead. For a richer view, try get_theme_settings in the active admin site context.', 'pressark' ),
+			),
+		);
+	}
+
+	/**
+	 * Infer a lightweight control type for fallback theme_mod snapshots.
+	 *
+	 * @param mixed $value Saved theme_mod value.
+	 * @return string
+	 */
+	private static function infer_customizer_fallback_control_type( $value ): string {
+		if ( is_bool( $value ) ) {
+			return 'checkbox';
+		}
+
+		if ( is_int( $value ) || is_float( $value ) ) {
+			return 'number';
+		}
+
+		if ( is_array( $value ) ) {
+			return 'json';
+		}
+
+		return 'text';
+	}
+
+	/**
+	 * Convert a setting key into a readable fallback label.
+	 *
+	 * @param string $key Customizer setting key.
+	 * @return string
+	 */
+	private static function humanize_customizer_setting_label( string $key ): string {
+		$label = str_replace( array( '-', '_' ), ' ', $key );
+		$label = preg_replace( '/\s+/', ' ', $label );
+
+		return ucwords( trim( (string) $label ) );
+	}
+
+	/**
+	 * Prepare a Customizer manager for schema inspection outside customize.php.
+	 *
+	 * @param \WP_Customize_Manager $wp_customize Manager instance.
+	 * @return void
+	 */
+	private static function bootstrap_customizer_manager( \WP_Customize_Manager $wp_customize ): void {
+		$GLOBALS['wp_customize'] = $wp_customize;
+
+		if ( method_exists( $wp_customize, 'setup_theme' ) ) {
+			$wp_customize->setup_theme();
+		}
+
+		if ( method_exists( $wp_customize, 'after_setup_theme' ) ) {
+			$wp_customize->after_setup_theme();
+		}
+
+		if ( method_exists( $wp_customize, 'register_controls' ) ) {
+			$wp_customize->register_controls();
+			if ( function_exists( 'remove_action' ) ) {
+				remove_action( 'customize_register', array( $wp_customize, 'register_controls' ) );
+			}
+		}
+	}
+
+	/**
+	 * Prime theme/plugin support loaders that only register in admin/customizer context.
+	 *
+	 * @param \WP_Customize_Manager $wp_customize Manager instance.
+	 * @return void
+	 */
+	private static function prime_customizer_support_loaders( \WP_Customize_Manager $wp_customize ): void {
+		global $wp_filter;
+
+		$callbacks = $wp_filter['customize_register']->callbacks ?? array();
+		$callbacks = is_array( $callbacks ) ? $callbacks : array();
+
+		$objects         = array();
+		$methods_by_hash = array();
+
+		foreach ( $callbacks as $rows ) {
+			if ( ! is_array( $rows ) ) {
+				continue;
+			}
+
+			foreach ( $rows as $row ) {
+				$callback = $row['function'] ?? null;
+				if ( ! is_array( $callback ) || ! is_object( $callback[0] ?? null ) || ! is_string( $callback[1] ?? null ) ) {
+					continue;
+				}
+
+				$hash                      = spl_object_hash( $callback[0] );
+				$objects[ $hash ]          = $callback[0];
+				$methods_by_hash[ $hash ][] = $callback[1];
+			}
+		}
+
+		foreach ( $objects as $hash => $object ) {
+			$methods = array_unique( $methods_by_hash[ $hash ] ?? array() );
+			if ( ! method_exists( $object, 'include_configurations' ) || in_array( 'include_configurations', $methods, true ) ) {
+				continue;
+			}
+
+			$reflection = new \ReflectionMethod( $object, 'include_configurations' );
+			if ( $reflection->getNumberOfParameters() > 0 ) {
+				$reflection->invoke( $object, $wp_customize );
+			} else {
+				$reflection->invoke( $object );
+			}
+		}
 	}
 
 	private static function cache_payload( $data ): array {

@@ -22,16 +22,12 @@ class PressArk_Checkpoint {
 	private const MAX_BUNDLES             = 20;
 	private const BUNDLE_TTL              = 86400;
 
-	private string $goal        = '';
-	private array  $entities    = array(); // [ ['id' => int, 'title' => string, 'type' => string], ... ]
-	private array  $facts       = array(); // [ ['key' => string, 'value' => string], ... ]
-	private array  $pending     = array(); // [ ['action' => string, 'target' => string, 'detail' => string], ... ]
-	private array  $constraints = array(); // [ string, ... ]
-	private array  $outcomes    = array(); // [ ['action' => string, 'result' => string], ... ]
-	private array  $retrieval   = array(); // [ 'kind' => string, 'query' => string, 'count' => int, 'source_ids' => [], 'source_titles' => [] ]
-	private array  $execution   = array(); // Durable task ledger for continuation safety.
-	private int    $turn        = 0;
-	private string $updated_at  = '';      // v3.3.0: ISO timestamp of last mutation.
+	private PressArk_Conversation_Checkpoint_Store $conversation_state;
+	private PressArk_Approval_State_Store          $approval_state;
+	private PressArk_Plan_State_Store              $plan_state_store;
+	private PressArk_Tool_Session_State_Store      $tool_session_state;
+	private int                                    $turn       = 0;
+	private string                                 $updated_at = '';
 
 	// v3.7.0: Extended typed state for memory hardening.
 	private array  $selected_target    = array(); // [ 'id' => int, 'title' => string, 'type' => string ]
@@ -48,6 +44,23 @@ class PressArk_Checkpoint {
 
 	// v5.3.0: Run-scoped planning state — separates exploration from execution.
 	private array  $plan_state         = array(); // [ 'phase' => '', 'plan_text' => '', 'entered_at' => '', 'approved_at' => '' ]
+	private array  $plan_steps         = array(); // Durable externalized execution checklist.
+
+	public function __construct() {
+		$this->conversation_state = new PressArk_Conversation_Checkpoint_Store();
+		$this->approval_state     = new PressArk_Approval_State_Store();
+		$this->plan_state_store   = new PressArk_Plan_State_Store();
+		$this->tool_session_state = new PressArk_Tool_Session_State_Store();
+		// Keep the legacy mirror fields defined for fresh checkpoints during the staged store migration.
+		$this->sync_legacy_fields_from_stores();
+	}
+
+	public function __clone() {
+		$this->conversation_state = clone $this->conversation_state;
+		$this->approval_state     = clone $this->approval_state;
+		$this->plan_state_store   = clone $this->plan_state_store;
+		$this->tool_session_state = clone $this->tool_session_state;
+	}
 
 	// ── Factory / Serialization ─────────────────────────────────────
 
@@ -55,44 +68,14 @@ class PressArk_Checkpoint {
 	 * Create from array (deserialization from frontend round-trip).
 	 */
 	public static function from_array( array $data ): self {
-		$cp              = new self();
-		$cp->goal        = sanitize_text_field( $data['goal'] ?? '' );
-		$cp->entities    = self::sanitize_entities( $data['entities'] ?? array() );
-		$cp->facts       = self::sanitize_key_value_pairs( $data['facts'] ?? array() );
-		$cp->pending     = self::sanitize_pending( $data['pending'] ?? array() );
-		$cp->constraints = array_map( 'sanitize_text_field', array_slice( $data['constraints'] ?? array(), 0, 20 ) );
-		$cp->outcomes    = self::sanitize_outcomes( $data['outcomes'] ?? array() );
-
-		$retrieval       = self::sanitize_retrieval( $data['retrieval'] ?? array() );
-		$execution       = PressArk_Execution_Ledger::sanitize( $data['execution'] ?? array() );
-
-		$cp->retrieval  = self::retrieval_is_empty( $retrieval ) ? array() : $retrieval;
-		$cp->execution  = PressArk_Execution_Ledger::is_empty( $execution ) ? array() : $execution;
-		$cp->turn       = absint( $data['turn'] ?? 0 );
-		$cp->updated_at = sanitize_text_field( $data['updated_at'] ?? '' );
-
-		// v3.7.0: Extended state.
-		$cp->selected_target    = self::sanitize_selected_target( $data['selected_target'] ?? array() );
-		$cp->workflow_stage     = self::sanitize_stage( $data['workflow_stage'] ?? '' );
-		$cp->approvals          = self::sanitize_approvals( $data['approvals'] ?? array() );
-		$cp->approval_outcomes  = self::sanitize_approval_outcomes( $data['approval_outcomes'] ?? array() );
-		$cp->blockers           = array_map( 'sanitize_text_field', array_slice( $data['blockers'] ?? array(), 0, 10 ) );
-		$cp->context_capsule    = self::sanitize_context_capsule( $data['context_capsule'] ?? array() );
-		$cp->loaded_tool_groups = array_map( 'sanitize_text_field', array_slice( $data['loaded_tool_groups'] ?? array(), 0, 15 ) );
-		$cp->bundle_ids         = array_map( 'sanitize_text_field', array_slice( $data['bundle_ids'] ?? array(), 0, 20 ) );
-		$cp->replay_state       = class_exists( 'PressArk_Replay_Integrity' )
-			? PressArk_Replay_Integrity::sanitize_state( $data['replay_state'] ?? array() )
-			: array();
-		$cp->read_state        = class_exists( 'PressArk_Read_Metadata' )
-			? PressArk_Read_Metadata::sanitize_snapshot_collection( $data['read_state'] ?? array() )
-			: array();
-		$cp->read_invalidation_log = class_exists( 'PressArk_Read_Metadata' )
-			? PressArk_Read_Metadata::sanitize_invalidation_log( $data['read_invalidation_log'] ?? array() )
-			: array();
-
-		// v5.3.0: Plan state.
-		$cp->plan_state         = self::sanitize_plan_state( $data['plan_state'] ?? array() );
-
+		$cp                     = new self();
+		$cp->conversation_state = PressArk_Conversation_Checkpoint_Store::from_checkpoint_array( $data );
+		$cp->approval_state     = PressArk_Approval_State_Store::from_checkpoint_array( $data );
+		$cp->plan_state_store   = PressArk_Plan_State_Store::from_checkpoint_array( $data );
+		$cp->tool_session_state = PressArk_Tool_Session_State_Store::from_checkpoint_array( $data );
+		$cp->turn               = absint( $data['turn'] ?? 0 );
+		$cp->updated_at         = sanitize_text_field( $data['updated_at'] ?? '' );
+		$cp->sync_legacy_fields_from_stores();
 		return $cp;
 	}
 
@@ -100,29 +83,36 @@ class PressArk_Checkpoint {
 	 * Export to array (serialization for REST response / frontend storage).
 	 */
 	public function to_array(): array {
+		$this->sync_stores_from_legacy_fields();
+		$conversation = $this->conversation_state->to_checkpoint_array();
+		$approval     = $this->approval_state->to_checkpoint_array();
+		$plan         = $this->plan_state_store->to_checkpoint_array();
+		$tool_session = $this->tool_session_state->to_checkpoint_array();
+
 		return array(
-			'goal'               => $this->goal,
-			'entities'           => $this->entities,
-			'facts'              => $this->facts,
-			'pending'            => $this->pending,
-			'constraints'        => $this->constraints,
-			'outcomes'           => $this->outcomes,
-			'retrieval'          => $this->retrieval,
-			'execution'          => $this->execution,
+			'goal'               => $conversation['goal'],
+			'entities'           => $conversation['entities'],
+			'facts'              => $conversation['facts'],
+			'pending'            => $conversation['pending'],
+			'constraints'        => $conversation['constraints'],
+			'outcomes'           => $conversation['outcomes'],
+			'retrieval'          => $conversation['retrieval'],
+			'execution'          => $plan['execution'],
 			'turn'               => $this->turn,
 			'updated_at'         => $this->updated_at,
-			'selected_target'    => $this->selected_target,
-			'workflow_stage'     => $this->workflow_stage,
-			'approvals'          => $this->approvals,
-			'approval_outcomes'  => $this->approval_outcomes,
-			'blockers'           => $this->blockers,
-			'context_capsule'    => $this->context_capsule,
-			'loaded_tool_groups' => $this->loaded_tool_groups,
-			'bundle_ids'         => $this->bundle_ids,
-			'replay_state'       => $this->replay_state,
-			'read_state'         => $this->read_state,
-			'read_invalidation_log' => $this->read_invalidation_log,
-			'plan_state'         => $this->plan_state,
+			'selected_target'    => $plan['selected_target'],
+			'workflow_stage'     => $plan['workflow_stage'],
+			'approvals'          => $approval['approvals'],
+			'approval_outcomes'  => $approval['approval_outcomes'],
+			'blockers'           => $approval['blockers'],
+			'context_capsule'    => $conversation['context_capsule'],
+			'loaded_tool_groups' => $tool_session['loaded_tool_groups'],
+			'bundle_ids'         => $tool_session['bundle_ids'],
+			'replay_state'       => $plan['replay_state'],
+			'read_state'         => $tool_session['read_state'],
+			'read_invalidation_log' => $tool_session['read_invalidation_log'],
+			'plan_state'         => $plan['plan_state'],
+			'plan_steps'         => $plan['plan_steps'],
 		);
 	}
 
@@ -334,24 +324,9 @@ class PressArk_Checkpoint {
 			} elseif ( 'exploring' === $phase ) {
 				$parts[] = 'MODE: Read-only exploration. Do not propose writes until a plan is formed and approved.';
 			}
-			if ( ! empty( $artifact['steps'] ) ) {
-				$plan_rows = array_slice( (array) ( class_exists( 'PressArk_Plan_Artifact' )
-					? PressArk_Plan_Artifact::to_plan_steps( $artifact )
-					: array() ), 0, 6 );
-				if ( ! empty( $plan_rows ) ) {
-					$parts[] = 'PLAN TASKS: ' . implode(
-						'; ',
-						array_map(
-							static function ( array $row ): string {
-								$text = sanitize_text_field( (string) ( $row['text'] ?? '' ) );
-								$kind = sanitize_key( (string) ( $row['kind'] ?? '' ) );
-								$group = sanitize_key( (string) ( $row['group'] ?? '' ) );
-								return trim( '[' . $kind . '/' . $group . '] ' . $text );
-							},
-							$plan_rows
-						)
-					);
-				}
+			$plan_summary = $this->build_plan_summary( 6 );
+			if ( '' !== $plan_summary ) {
+				$parts[] = 'PLAN TASKS: ' . $plan_summary;
 			}
 		}
 
@@ -532,9 +507,14 @@ class PressArk_Checkpoint {
 	 */
 	public function sync_execution_goal( string $message ): void {
 		$this->execution = PressArk_Execution_Ledger::bootstrap( $this->execution, $message );
+		$is_continuation = 1 === preg_match( '/^\[(?:Continue|Confirmed)\]\s*/i', trim( $message ) );
 		$normalized = trim( preg_replace( '/^\[(?:Continue|Confirmed)\]\s*/i', '', $message ) );
+		$normalized = preg_replace( '/\s*Do not repeat completed steps or recreate completed content\.?/i', '', $normalized );
 		$normalized = preg_replace( '/Please continue with the remaining steps from my original request\.?$/i', '', $normalized );
 		$normalized = sanitize_text_field( trim( (string) $normalized ) );
+		if ( $is_continuation && '' !== trim( $this->goal ) ) {
+			return;
+		}
 		if ( '' !== $normalized ) {
 			$this->set_goal( mb_substr( $normalized, 0, 200 ) );
 		}
@@ -600,54 +580,39 @@ class PressArk_Checkpoint {
 	}
 
 	public function get_read_state(): array {
-		return $this->read_state;
+		$this->sync_stores_from_legacy_fields();
+		return $this->tool_session_state->get_read_state();
 	}
 
 	public function get_read_invalidation_log(): array {
-		return $this->read_invalidation_log;
+		$this->sync_stores_from_legacy_fields();
+		return $this->tool_session_state->get_read_invalidation_log();
 	}
 
 	public function record_read_snapshot( array $snapshot ): void {
-		if ( ! class_exists( 'PressArk_Read_Metadata' ) ) {
-			return;
-		}
-		$clean = PressArk_Read_Metadata::sanitize_snapshot( $snapshot );
-		if ( empty( $clean['handle'] ) ) {
-			return;
-		}
-		$items = PressArk_Read_Metadata::sanitize_snapshot_collection( array_merge( $this->read_state, array( $clean ) ) );
-		$this->read_state = $items;
+		$this->sync_stores_from_legacy_fields();
+		$this->tool_session_state->record_read_snapshot( $snapshot );
+		$this->sync_legacy_fields_from_stores();
 	}
 
 	public function set_read_state( array $read_state ): void {
-		$this->read_state = class_exists( 'PressArk_Read_Metadata' )
-			? PressArk_Read_Metadata::sanitize_snapshot_collection( $read_state )
-			: array();
+		$this->sync_stores_from_legacy_fields();
+		$this->tool_session_state->set_read_state( $read_state );
+		$this->sync_legacy_fields_from_stores();
 	}
 
 	public function apply_write_invalidation( string $tool_name, array $args, array $result ): void {
-		if ( ! class_exists( 'PressArk_Read_Metadata' ) ) {
-			return;
-		}
-		$descriptor = PressArk_Read_Metadata::build_invalidation_from_write( $tool_name, $args, $result );
-		if ( empty( $descriptor['id'] ) ) {
-			return;
-		}
-		$applied                     = PressArk_Read_Metadata::apply_invalidation( $this->read_state, $descriptor );
-		$this->read_state            = $applied['snapshots'] ?? array();
-		$this->read_invalidation_log = PressArk_Read_Metadata::sanitize_invalidation_log(
-			array_merge( $this->read_invalidation_log, array( $applied['invalidation'] ?? array() ) )
-		);
-		if ( class_exists( 'PressArk_Resource_Registry' ) ) {
-			PressArk_Resource_Registry::apply_invalidation( $applied['invalidation'] ?? array() );
-		}
+		$this->sync_stores_from_legacy_fields();
+		$this->tool_session_state->apply_write_invalidation( $tool_name, $args, $result );
+		$this->sync_legacy_fields_from_stores();
 	}
 
 	/**
 	 * Expose the execution ledger to callers that build continuation payloads.
 	 */
 	public function get_execution(): array {
-		return $this->execution;
+		$this->sync_stores_from_legacy_fields();
+		return $this->plan_state_store->get_execution();
 	}
 
 	/**
@@ -659,25 +624,33 @@ class PressArk_Checkpoint {
 	 * @since 5.3.0
 	 */
 	public function set_execution( array $execution ): void {
-		$this->execution = PressArk_Execution_Ledger::sanitize( $execution );
+		$this->sync_stores_from_legacy_fields();
+		$this->plan_state_store->set_execution( $execution );
+		$this->sync_legacy_fields_from_stores();
 	}
 
 	// ── v3.7.0: Extended State Mutators ──────────────────────────────
 
 	public function set_selected_target( array $target ): void {
-		$this->selected_target = self::sanitize_selected_target( $target );
+		$this->sync_stores_from_legacy_fields();
+		$this->plan_state_store->set_selected_target( $target );
+		$this->sync_legacy_fields_from_stores();
 	}
 
 	public function get_selected_target(): array {
-		return $this->selected_target;
+		$this->sync_stores_from_legacy_fields();
+		return $this->plan_state_store->get_selected_target();
 	}
 
 	public function set_workflow_stage( string $stage ): void {
-		$this->workflow_stage = self::sanitize_stage( $stage );
+		$this->sync_stores_from_legacy_fields();
+		$this->plan_state_store->set_workflow_stage( $stage );
+		$this->sync_legacy_fields_from_stores();
 	}
 
 	public function get_workflow_stage(): string {
-		return $this->workflow_stage;
+		$this->sync_stores_from_legacy_fields();
+		return $this->plan_state_store->get_workflow_stage();
 	}
 
 	public function add_approval( string $action ): void {
@@ -744,42 +717,9 @@ class PressArk_Checkpoint {
 	}
 
 	public function record_approval_outcome( string $action, string $status, array $meta = array() ): void {
-		if ( ! class_exists( 'PressArk_Permission_Decision' ) ) {
-			return;
-		}
-
-		$action  = sanitize_key( $action );
-		$outcome = PressArk_Permission_Decision::approval_outcome(
-			$status,
-			array_merge(
-				$meta,
-				array(
-					'action' => $action,
-				)
-			)
-		);
-		if ( empty( $outcome ) ) {
-			return;
-		}
-
-		$exists = false;
-		foreach ( $this->approval_outcomes as $existing ) {
-			if (
-				( $existing['action'] ?? '' ) === ( $outcome['action'] ?? '' )
-				&& ( $existing['status'] ?? '' ) === ( $outcome['status'] ?? '' )
-				&& ( $existing['source'] ?? '' ) === ( $outcome['source'] ?? '' )
-			) {
-				$exists = true;
-				break;
-			}
-		}
-
-		if ( $exists ) {
-			return;
-		}
-
-		$this->approval_outcomes[] = $outcome;
-		$this->approval_outcomes   = array_slice( $this->approval_outcomes, -12 );
+		$this->sync_stores_from_legacy_fields();
+		$this->approval_state->record_approval_outcome( $action, $status, $meta );
+		$this->sync_legacy_fields_from_stores();
 	}
 
 	public function merge_approval_outcomes( array $outcomes ): void {
@@ -800,14 +740,9 @@ class PressArk_Checkpoint {
 	}
 
 	public function add_blocker( string $blocker ): void {
-		$blocker = sanitize_text_field( $blocker );
-		if ( '' === $blocker || count( $this->blockers ) >= 10 ) {
-			return;
-		}
-		if ( in_array( $blocker, $this->blockers, true ) ) {
-			return;
-		}
-		$this->blockers[] = $blocker;
+		$this->sync_stores_from_legacy_fields();
+		$this->approval_state->add_blocker( $blocker );
+		$this->sync_legacy_fields_from_stores();
 	}
 
 	public function merge_blockers( array $blockers ): void {
@@ -817,7 +752,9 @@ class PressArk_Checkpoint {
 	}
 
 	public function clear_blockers(): void {
-		$this->blockers = array();
+		$this->sync_stores_from_legacy_fields();
+		$this->approval_state->clear_blockers();
+		$this->sync_legacy_fields_from_stores();
 	}
 
 	public function get_blockers(): array {
@@ -825,99 +762,70 @@ class PressArk_Checkpoint {
 	}
 
 	public function set_context_capsule( array $capsule ): void {
-		$this->context_capsule = self::sanitize_context_capsule( $capsule );
+		$this->sync_stores_from_legacy_fields();
+		$this->conversation_state->set_context_capsule( $capsule );
+		$this->sync_legacy_fields_from_stores();
 	}
 
 	public function get_context_capsule(): array {
-		return $this->context_capsule;
+		$this->sync_stores_from_legacy_fields();
+		return $this->conversation_state->get_context_capsule();
 	}
 
 	public function clear_context_capsule(): void {
-		$this->context_capsule = array();
+		$this->sync_stores_from_legacy_fields();
+		$this->conversation_state->clear_context_capsule();
+		$this->sync_legacy_fields_from_stores();
 	}
 
 	public function set_replay_state( array $state ): void {
-		$this->replay_state = class_exists( 'PressArk_Replay_Integrity' )
-			? PressArk_Replay_Integrity::sanitize_state( $state )
-			: array();
+		$this->sync_stores_from_legacy_fields();
+		$this->plan_state_store->set_replay_state( $state );
+		$this->sync_legacy_fields_from_stores();
 	}
 
 	public function get_replay_state(): array {
-		return $this->replay_state;
+		$this->sync_stores_from_legacy_fields();
+		return $this->plan_state_store->get_replay_state();
 	}
 
 	public function set_replay_messages( array $messages ): void {
-		$state             = $this->replay_state;
-		$state['messages'] = class_exists( 'PressArk_Replay_Integrity' )
-			? PressArk_Replay_Integrity::sanitize_messages( $messages )
-			: array();
-		$state['updated_at'] = gmdate( 'c' );
-		$this->set_replay_state( $state );
+		$this->sync_stores_from_legacy_fields();
+		$this->plan_state_store->set_replay_messages( $messages );
+		$this->sync_legacy_fields_from_stores();
 	}
 
 	public function get_replay_messages(): array {
-		return (array) ( $this->replay_state['messages'] ?? array() );
+		$this->sync_stores_from_legacy_fields();
+		return $this->plan_state_store->get_replay_messages();
 	}
 
 	public function merge_replay_replacements( array $entries ): void {
-		$state = $this->replay_state;
-		$state['replacement_journal'] = class_exists( 'PressArk_Replay_Integrity' )
-			? PressArk_Replay_Integrity::sanitize_replacement_journal(
-				array_merge(
-					(array) ( $state['replacement_journal'] ?? array() ),
-					$entries
-				)
-			)
-			: array();
-		$state['updated_at'] = gmdate( 'c' );
-		$this->set_replay_state( $state );
+		$this->sync_stores_from_legacy_fields();
+		$this->plan_state_store->merge_replay_replacements( $entries );
+		$this->sync_legacy_fields_from_stores();
 	}
 
 	public function get_replay_replacements(): array {
-		return (array) ( $this->replay_state['replacement_journal'] ?? array() );
+		$this->sync_stores_from_legacy_fields();
+		return $this->plan_state_store->get_replay_replacements();
 	}
 
 	public function add_replay_event( array $event ): void {
-		if ( ! class_exists( 'PressArk_Replay_Integrity' ) ) {
-			return;
-		}
-
-		$event = PressArk_Replay_Integrity::sanitize_event( $event );
-		if ( empty( $event['type'] ) ) {
-			return;
-		}
-
-		$state = $this->replay_state;
-		$events = (array) ( $state['events'] ?? array() );
-		$events[] = $event;
-
-		$state['events']      = array_slice( $events, -16 );
-		$state['updated_at']  = gmdate( 'c' );
-		$this->set_replay_state( $state );
+		$this->sync_stores_from_legacy_fields();
+		$this->plan_state_store->add_replay_event( $event );
+		$this->sync_legacy_fields_from_stores();
 	}
 
 	public function set_last_replay_resume( array $resume ): void {
-		if ( ! class_exists( 'PressArk_Replay_Integrity' ) ) {
-			return;
-		}
-
-		$resume = PressArk_Replay_Integrity::sanitize_event( $resume, 'resume' );
-		if ( empty( $resume['type'] ) ) {
-			return;
-		}
-
-		$state                = $this->replay_state;
-		$state['last_resume'] = $resume;
-		$state['updated_at']  = gmdate( 'c' );
-		$this->set_replay_state( $state );
+		$this->sync_stores_from_legacy_fields();
+		$this->plan_state_store->set_last_replay_resume( $resume );
+		$this->sync_legacy_fields_from_stores();
 	}
 
 	public function get_replay_sidecar(): array {
-		if ( ! class_exists( 'PressArk_Replay_Integrity' ) ) {
-			return array();
-		}
-
-		return PressArk_Replay_Integrity::debug_sidecar( $this->replay_state );
+		$this->sync_stores_from_legacy_fields();
+		return $this->plan_state_store->get_replay_sidecar();
 	}
 
 	// ── v5.3.0: Plan State ──────────────────────────────────────────
@@ -984,6 +892,118 @@ class PressArk_Checkpoint {
 
 	public function get_plan_status(): string {
 		return sanitize_key( (string) ( $this->plan_state['status'] ?? '' ) );
+	}
+
+	public function set_plan_steps( array $steps ): void {
+		$this->plan_steps = self::sanitize_plan_steps( $steps, $this->plan_state );
+	}
+
+	public function get_plan_steps(): array {
+		if ( ! empty( $this->plan_steps ) ) {
+			return $this->plan_steps;
+		}
+
+		return $this->derive_plan_steps_from_artifact();
+	}
+
+	public function clear_plan_steps(): void {
+		$this->plan_steps = array();
+	}
+
+	public function get_in_progress_plan_step_count(): int {
+		return count(
+			array_filter(
+				$this->get_plan_steps(),
+				static fn( array $step ): bool => 'in_progress' === ( $step['status'] ?? '' )
+			)
+		);
+	}
+
+	public function get_active_plan_step(): array {
+		$index = $this->get_active_plan_step_index();
+		if ( $index < 0 ) {
+			return array();
+		}
+
+		$steps = $this->get_plan_steps();
+		return is_array( $steps[ $index ] ?? null ) ? $steps[ $index ] : array();
+	}
+
+	public function get_active_plan_step_index(): int {
+		$steps = $this->get_plan_steps();
+		foreach ( $steps as $index => $step ) {
+			if ( 'in_progress' === ( $step['status'] ?? '' ) ) {
+				return (int) $index;
+			}
+		}
+
+		foreach ( $steps as $index => $step ) {
+			if ( 'pending' === ( $step['status'] ?? '' ) ) {
+				return (int) $index;
+			}
+		}
+
+		return -1;
+	}
+
+	public function build_plan_summary( int $limit = 4 ): string {
+		$rows = array_slice( $this->get_plan_steps(), 0, max( 1, $limit ) );
+		if ( empty( $rows ) ) {
+			return '';
+		}
+
+		$summary = array();
+		foreach ( $rows as $index => $step ) {
+			$content = sanitize_text_field( (string) ( $step['content'] ?? '' ) );
+			if ( '' === $content ) {
+				continue;
+			}
+
+			$status = sanitize_key( (string) ( $step['status'] ?? 'pending' ) );
+			$summary[] = sprintf(
+				'%d[%s] %s',
+				$index + 1,
+				$status,
+				$content
+			);
+		}
+
+		return implode( '; ', $summary );
+	}
+
+	public function record_plan_apply_success( string $tool_name, array $args = array(), array $result = array() ): void {
+		$tool_name = sanitize_key( $tool_name );
+		if ( '' === $tool_name ) {
+			return;
+		}
+
+		$steps   = $this->get_plan_steps();
+		$updated = false;
+
+		foreach ( $steps as $index => $step ) {
+			if ( ! is_array( $step ) || 'in_progress' !== ( $step['status'] ?? '' ) ) {
+				continue;
+			}
+
+			if ( ! self::step_matches_plan_target( $step, $tool_name, $args ) ) {
+				continue;
+			}
+
+			$steps[ $index ]['apply_succeeded'] = ! empty( $result['success'] );
+			$steps[ $index ]['applied_tool_name'] = $tool_name;
+			$steps[ $index ]['updated_at'] = gmdate( 'c' );
+
+			if ( ! empty( $step['preview_required'] ) && ! empty( $result['success'] ) ) {
+				$steps[ $index ]['status'] = 'completed';
+			}
+
+			$updated = true;
+			break;
+		}
+
+		if ( $updated ) {
+			$this->set_plan_steps( $steps );
+		}
 	}
 
 	public function set_plan_status( string $status ): void {
@@ -1163,9 +1183,9 @@ class PressArk_Checkpoint {
 	 * @since 5.3.0
 	 */
 	public function clear_plan_state(): void {
-		$this->archive_current_plan_artifact( 'cleared' );
-		$history = $this->get_plan_history();
-		$this->plan_state = empty( $history ) ? array() : array( 'history' => $history );
+		$this->sync_stores_from_legacy_fields();
+		$this->plan_state_store->clear_plan_state();
+		$this->sync_legacy_fields_from_stores();
 	}
 
 	private function archive_current_plan_artifact( string $status, array $meta = array() ): void {
@@ -1190,32 +1210,29 @@ class PressArk_Checkpoint {
 	}
 
 	public function set_loaded_tool_groups( array $groups ): void {
-		$clean = array();
-		foreach ( array_slice( $groups, 0, 15 ) as $group ) {
-			$group = sanitize_text_field( (string) $group );
-			if ( '' !== $group && ! in_array( $group, $clean, true ) ) {
-				$clean[] = $group;
-			}
-		}
-		$this->loaded_tool_groups = $clean;
+		$this->sync_stores_from_legacy_fields();
+		$this->tool_session_state->set_loaded_tool_groups( $groups );
+		$this->sync_legacy_fields_from_stores();
 	}
 
 	public function get_loaded_tool_groups(): array {
-		return $this->loaded_tool_groups;
+		$this->sync_stores_from_legacy_fields();
+		return $this->tool_session_state->get_loaded_tool_groups();
 	}
 
 	public function add_bundle_id( string $bundle_id ): void {
-		$bundle_id = sanitize_text_field( $bundle_id );
-		if ( in_array( $bundle_id, $this->bundle_ids, true ) ) {
+		$this->sync_stores_from_legacy_fields();
+		if ( $this->tool_session_state->has_bundle( $bundle_id ) ) {
 			return;
 		}
-		if ( count( $this->bundle_ids ) >= self::MAX_BUNDLES ) {
-			$evicted = array_shift( $this->bundle_ids ); // Evict oldest.
+		if ( count( $this->tool_session_state->get_bundle_ids() ) >= self::MAX_BUNDLES ) {
+			$evicted = $this->tool_session_state->remove_oldest_bundle_id();
 			if ( $evicted ) {
 				self::delete_bundle_payload( $evicted );
 			}
 		}
-		$this->bundle_ids[] = $bundle_id;
+		$this->tool_session_state->add_bundle_id( $bundle_id );
+		$this->sync_legacy_fields_from_stores();
 	}
 
 	public function merge_bundle_ids( array $bundle_ids ): void {
@@ -1225,11 +1242,13 @@ class PressArk_Checkpoint {
 	}
 
 	public function get_bundle_ids(): array {
-		return $this->bundle_ids;
+		$this->sync_stores_from_legacy_fields();
+		return $this->tool_session_state->get_bundle_ids();
 	}
 
 	public function has_bundle( string $bundle_id ): bool {
-		return in_array( $bundle_id, $this->bundle_ids, true );
+		$this->sync_stores_from_legacy_fields();
+		return $this->tool_session_state->has_bundle( $bundle_id );
 	}
 
 	public function remember_bundle( string $tool_name, array $args, array $result ): string {
@@ -1518,6 +1537,9 @@ class PressArk_Checkpoint {
 		if ( self::plan_state_is_empty( $server->plan_state ) && ! self::plan_state_is_empty( $client->plan_state ) ) {
 			$merged->plan_state = $client->plan_state;
 		}
+		if ( empty( $server->plan_steps ) && ! empty( $client->plan_steps ) ) {
+			$merged->plan_steps = $client->plan_steps;
+		}
 
 		$merged->updated_at = gmdate( 'c' );
 
@@ -1574,6 +1596,76 @@ class PressArk_Checkpoint {
 		$this->read_state         = $other->read_state;
 		$this->read_invalidation_log = $other->read_invalidation_log;
 		$this->plan_state         = $other->plan_state;
+		$this->plan_steps         = $other->plan_steps;
+		$this->sync_stores_from_legacy_fields();
+	}
+
+	/**
+	 * Stage 3 compatibility bridge:
+	 * Keep the typed stores synchronized with the legacy in-memory fields
+	 * until all checkpoint mutation paths are migrated to store-owned writes.
+	 */
+	private function sync_stores_from_legacy_fields(): void {
+		$legacy                   = array(
+			'goal'                  => $this->goal,
+			'entities'              => $this->entities,
+			'facts'                 => $this->facts,
+			'pending'               => $this->pending,
+			'constraints'           => $this->constraints,
+			'outcomes'              => $this->outcomes,
+			'retrieval'             => $this->retrieval,
+			'execution'             => $this->execution,
+			'selected_target'       => $this->selected_target,
+			'workflow_stage'        => $this->workflow_stage,
+			'approvals'             => $this->approvals,
+			'approval_outcomes'     => $this->approval_outcomes,
+			'blockers'              => $this->blockers,
+			'context_capsule'       => $this->context_capsule,
+			'loaded_tool_groups'    => $this->loaded_tool_groups,
+			'bundle_ids'            => $this->bundle_ids,
+			'replay_state'          => $this->replay_state,
+			'read_state'            => $this->read_state,
+			'read_invalidation_log' => $this->read_invalidation_log,
+			'plan_state'            => $this->plan_state,
+			'plan_steps'            => $this->plan_steps,
+		);
+		$this->conversation_state = PressArk_Conversation_Checkpoint_Store::from_checkpoint_array( $legacy );
+		$this->approval_state     = PressArk_Approval_State_Store::from_checkpoint_array( $legacy );
+		$this->plan_state_store   = PressArk_Plan_State_Store::from_checkpoint_array( $legacy );
+		$this->tool_session_state = PressArk_Tool_Session_State_Store::from_checkpoint_array( $legacy );
+	}
+
+	/**
+	 * Stage 3 compatibility bridge:
+	 * Rehydrate legacy fields from the typed stores so untouched runtime paths
+	 * continue to see the historical checkpoint shape during the staged split.
+	 */
+	private function sync_legacy_fields_from_stores(): void {
+		$conversation              = $this->conversation_state->to_checkpoint_array();
+		$approval                  = $this->approval_state->to_checkpoint_array();
+		$plan                      = $this->plan_state_store->to_checkpoint_array();
+		$tool_session              = $this->tool_session_state->to_checkpoint_array();
+		$this->goal                = (string) ( $conversation['goal'] ?? '' );
+		$this->entities            = (array) ( $conversation['entities'] ?? array() );
+		$this->facts               = (array) ( $conversation['facts'] ?? array() );
+		$this->pending             = (array) ( $conversation['pending'] ?? array() );
+		$this->constraints         = (array) ( $conversation['constraints'] ?? array() );
+		$this->outcomes            = (array) ( $conversation['outcomes'] ?? array() );
+		$this->retrieval           = (array) ( $conversation['retrieval'] ?? array() );
+		$this->execution           = (array) ( $plan['execution'] ?? array() );
+		$this->selected_target     = (array) ( $plan['selected_target'] ?? array() );
+		$this->workflow_stage      = (string) ( $plan['workflow_stage'] ?? '' );
+		$this->approvals           = (array) ( $approval['approvals'] ?? array() );
+		$this->approval_outcomes   = (array) ( $approval['approval_outcomes'] ?? array() );
+		$this->blockers            = (array) ( $approval['blockers'] ?? array() );
+		$this->context_capsule     = (array) ( $conversation['context_capsule'] ?? array() );
+		$this->loaded_tool_groups  = (array) ( $tool_session['loaded_tool_groups'] ?? array() );
+		$this->bundle_ids          = (array) ( $tool_session['bundle_ids'] ?? array() );
+		$this->replay_state        = (array) ( $plan['replay_state'] ?? array() );
+		$this->read_state          = (array) ( $tool_session['read_state'] ?? array() );
+		$this->read_invalidation_log = (array) ( $tool_session['read_invalidation_log'] ?? array() );
+		$this->plan_state          = (array) ( $plan['plan_state'] ?? array() );
+		$this->plan_steps          = (array) ( $plan['plan_steps'] ?? array() );
 	}
 
 	/**
@@ -1596,6 +1688,7 @@ class PressArk_Checkpoint {
 			'read_state',
 			'read_invalidation_log',
 			'plan_state',
+			'plan_steps',
 			'approval_outcomes',
 		) as $key ) {
 			if ( array_key_exists( $key, $snapshot ) ) {
@@ -1831,6 +1924,124 @@ class PressArk_Checkpoint {
 				&& empty( $state['plan_text'] )
 				&& empty( $state['current_artifact'] )
 			);
+	}
+
+	private function derive_plan_steps_from_artifact(): array {
+		if ( ! class_exists( 'PressArk_Plan_Artifact' ) ) {
+			return array();
+		}
+
+		$artifact = $this->get_plan_artifact();
+		if ( empty( $artifact ) ) {
+			return array();
+		}
+
+		$derived = array();
+		foreach ( PressArk_Plan_Artifact::to_plan_steps( $artifact ) as $row ) {
+			$content = sanitize_text_field( (string) ( $row['text'] ?? '' ) );
+			if ( '' === $content ) {
+				continue;
+			}
+
+			$kind   = sanitize_key( (string) ( $row['kind'] ?? '' ) );
+			$status = self::sanitize_plan_step_status( (string) ( $row['status'] ?? 'pending' ) );
+			$derived[] = array(
+				'content'          => $content,
+				'activeForm'       => 'completed' === $status ? 'Completed: ' . $content : ( 'in_progress' === $status ? 'Working on: ' . $content : 'Work on: ' . $content ),
+				'status'           => $status,
+				'post_id'          => 0,
+				'tool_name'        => '',
+				'preview_required' => in_array( $kind, array( 'preview', 'confirm', 'write' ), true ),
+				'apply_succeeded'  => in_array( $kind, array( 'preview', 'confirm', 'write' ), true ) ? 'completed' === $status : true,
+			);
+		}
+
+		return array_slice( $derived, 0, 12 );
+	}
+
+	private static function sanitize_plan_steps( $raw, array $plan_state = array() ): array {
+		if ( ! is_array( $raw ) || empty( $raw ) ) {
+			return array();
+		}
+
+		$steps = array();
+		foreach ( array_slice( $raw, 0, 12 ) as $step ) {
+			if ( ! is_array( $step ) ) {
+				continue;
+			}
+
+			$content = sanitize_text_field( (string) ( $step['content'] ?? '' ) );
+			if ( '' === $content ) {
+				continue;
+			}
+
+			$status = self::sanitize_plan_step_status( (string) ( $step['status'] ?? 'pending' ) );
+			$steps[] = array(
+				'content'          => $content,
+				'activeForm'       => sanitize_text_field( (string) ( $step['activeForm'] ?? $content ) ),
+				'status'           => $status,
+				'post_id'          => absint( $step['post_id'] ?? 0 ),
+				'tool_name'        => sanitize_key( (string) ( $step['tool_name'] ?? '' ) ),
+				'preview_required' => ! empty( $step['preview_required'] ),
+				'apply_succeeded'  => ! empty( $step['apply_succeeded'] ),
+				'applied_tool_name'=> sanitize_key( (string) ( $step['applied_tool_name'] ?? '' ) ),
+				'updated_at'       => sanitize_text_field( (string) ( $step['updated_at'] ?? '' ) ),
+			);
+		}
+
+		if ( empty( $steps ) ) {
+			return array();
+		}
+
+		$phase = sanitize_key( (string) ( $plan_state['phase'] ?? '' ) );
+		if ( 'executing' === $phase ) {
+			$has_in_progress = false;
+			foreach ( $steps as $step ) {
+				if ( 'in_progress' === ( $step['status'] ?? '' ) ) {
+					$has_in_progress = true;
+					break;
+				}
+			}
+
+			if ( ! $has_in_progress ) {
+				foreach ( $steps as $index => $step ) {
+					if ( 'pending' === ( $step['status'] ?? '' ) ) {
+						$steps[ $index ]['status'] = 'in_progress';
+						break;
+					}
+				}
+			}
+		}
+
+		return $steps;
+	}
+
+	private static function sanitize_plan_step_status( string $status ): string {
+		$status = sanitize_key( $status );
+		if ( in_array( $status, array( 'done', 'verified' ), true ) ) {
+			$status = 'completed';
+		}
+
+		return in_array( $status, array( 'pending', 'in_progress', 'completed' ), true )
+			? $status
+			: 'pending';
+	}
+
+	private static function step_matches_plan_target( array $step, string $tool_name, array $args ): bool {
+		$expected_tool = sanitize_key( (string) ( $step['tool_name'] ?? '' ) );
+		if ( '' !== $expected_tool && $expected_tool !== $tool_name ) {
+			return false;
+		}
+
+		$expected_post_id = absint( $step['post_id'] ?? 0 );
+		if ( $expected_post_id > 0 ) {
+			$actual_post_id = absint( $args['post_id'] ?? $args['id'] ?? $args['product_id'] ?? 0 );
+			if ( $actual_post_id > 0 && $actual_post_id !== $expected_post_id ) {
+				return false;
+			}
+		}
+
+		return true;
 	}
 
 	private static function sanitize_approvals( array $raw ): array {

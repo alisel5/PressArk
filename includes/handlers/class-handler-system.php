@@ -417,8 +417,9 @@ class PressArk_Handler_System extends PressArk_Handler_Base {
 		}
 
 		// List all menus.
-		$menus = wp_get_nav_menus();
-		$list  = array();
+		$menus            = wp_get_nav_menus();
+		$list             = array();
+		$single_menu_site = 1 === count( $menus );
 
 		foreach ( $menus as $menu ) {
 			$items_count = 0;
@@ -434,12 +435,34 @@ class PressArk_Handler_System extends PressArk_Handler_Base {
 				}
 			}
 
-			$list[] = array(
+			$entry = array(
 				'id'          => $menu->term_id,
 				'name'        => $menu->name,
 				'item_count'  => $items_count,
 				'locations'   => $assigned,
 			);
+
+			if ( 'summary' !== $mode && ( $single_menu_site || ! empty( $assigned ) ) ) {
+				$item_list = array();
+				if ( $items ) {
+					foreach ( $items as $item ) {
+						$item_list[] = array(
+							'id'        => $item->ID,
+							'title'     => $item->title,
+							'url'       => $item->url,
+							'type'      => $item->type,
+							'object'    => $item->object,
+							'object_id' => (int) $item->object_id,
+							'parent'    => (int) $item->menu_item_parent,
+							'position'  => (int) $item->menu_order,
+						);
+					}
+				}
+
+				$entry = array_merge( $entry, $this->get_inlined_menu_items_payload( $item_list ) );
+			}
+
+			$list[] = $entry;
 		}
 
 		return array(
@@ -455,10 +478,29 @@ class PressArk_Handler_System extends PressArk_Handler_Base {
 	}
 
 	/**
+	 * Inline at most 50 menu items and expose truncation metadata when needed.
+	 */
+	private function get_inlined_menu_items_payload( array $items ): array {
+		$items       = array_values( $items );
+		$items_total = count( $items );
+		$payload     = array(
+			'items' => array_slice( $items, 0, 50 ),
+		);
+
+		if ( $items_total > 50 ) {
+			$payload['items_truncated'] = true;
+			$payload['items_total']     = $items_total;
+		}
+
+		return $payload;
+	}
+
+	/**
 	 * Read FSE block-based navigation (wp_navigation CPT).
 	 */
 	private function get_fse_navigation( array $params ): array {
 		$menu_id = absint( $params['menu_id'] ?? 0 );
+		$mode    = sanitize_text_field( $params['mode'] ?? 'full' );
 
 		// Single navigation by ID.
 		if ( $menu_id > 0 ) {
@@ -498,7 +540,9 @@ class PressArk_Handler_System extends PressArk_Handler_Base {
 			'update_post_term_cache' => false,
 		) );
 
-		$menus = array();
+		$menus                = array();
+		$single_menu_site     = 1 === count( $navigations );
+		$navigation_locations = $this->get_fse_navigation_locations_map();
 		foreach ( $navigations as $nav ) {
 			$blocks = parse_blocks( $nav->post_content );
 			$items  = array();
@@ -508,14 +552,21 @@ class PressArk_Handler_System extends PressArk_Handler_Base {
 				$items[] = $this->nav_block_to_item( $block );
 			}
 
-			$menus[] = array(
+			$locations = $navigation_locations[ $nav->ID ] ?? array();
+			$entry     = array(
 				'id'         => $nav->ID,
 				'name'       => $nav->post_title ?: __( '(untitled navigation)', 'pressark' ),
 				'type'       => 'fse_navigation',
 				'item_count' => count( $items ),
-				'items'      => $items,
+				'locations'  => $locations,
 				'edit_url'   => admin_url( 'site-editor.php?path=%2Fwp_navigation' ),
 			);
+
+			if ( 'summary' !== $mode && ( $single_menu_site || ! empty( $locations ) ) ) {
+				$entry = array_merge( $entry, $this->get_inlined_menu_items_payload( $items ) );
+			}
+
+			$menus[] = $entry;
 		}
 
 		return array(
@@ -527,6 +578,60 @@ class PressArk_Handler_System extends PressArk_Handler_Base {
 			/* translators: %d: number of FSE navigation menus found. */
 			'message'     => sprintf( __( 'Found %d FSE navigation menu(s).', 'pressark' ), count( $menus ) ),
 		);
+	}
+
+	/**
+	 * Map FSE navigation posts to template part area locations.
+	 */
+	private function get_fse_navigation_locations_map(): array {
+		$template_parts = get_posts( array(
+			'post_type'              => 'wp_template_part',
+			'post_status'            => 'publish',
+			'posts_per_page'         => -1,
+			'update_post_meta_cache' => false,
+			'update_post_term_cache' => false,
+		) );
+		$locations_map  = array();
+
+		foreach ( $template_parts as $template_part ) {
+			$areas = wp_get_post_terms( $template_part->ID, 'wp_template_part_area', array( 'fields' => 'slugs' ) );
+			if ( is_wp_error( $areas ) ) {
+				$areas = array();
+			}
+
+			$this->collect_fse_navigation_locations_from_blocks(
+				parse_blocks( $template_part->post_content ),
+				array_values( array_unique( array_map( 'strval', (array) $areas ) ) ),
+				$locations_map
+			);
+		}
+
+		foreach ( $locations_map as $nav_id => $areas ) {
+			$locations_map[ $nav_id ] = array_values( array_unique( array_map( 'strval', $areas ) ) );
+		}
+
+		return $locations_map;
+	}
+
+	/**
+	 * Recursively collect navigation refs from template part blocks.
+	 */
+	private function collect_fse_navigation_locations_from_blocks( array $blocks, array $areas, array &$locations_map ): void {
+		foreach ( $blocks as $block ) {
+			if ( 'core/navigation' === ( $block['blockName'] ?? '' ) ) {
+				$ref = absint( $block['attrs']['ref'] ?? 0 );
+				if ( $ref > 0 ) {
+					if ( ! isset( $locations_map[ $ref ] ) || ! is_array( $locations_map[ $ref ] ) ) {
+						$locations_map[ $ref ] = array();
+					}
+					$locations_map[ $ref ] = array_merge( $locations_map[ $ref ], $areas );
+				}
+			}
+
+			if ( ! empty( $block['innerBlocks'] ) && is_array( $block['innerBlocks'] ) ) {
+				$this->collect_fse_navigation_locations_from_blocks( $block['innerBlocks'], $areas, $locations_map );
+			}
+		}
 	}
 
 	/**

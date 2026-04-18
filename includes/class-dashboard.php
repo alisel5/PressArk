@@ -91,7 +91,7 @@ class PressArk_Dashboard {
 		$error_count  = PressArk_Error_Tracker::count();
 		$recent_errors = PressArk_Error_Tracker::get_recent( 10 );
 
-		$has_api_key = PressArk_AI_Connector::is_proxy_mode() || (bool) get_option( 'pressark_byok_enabled', false ) || ! empty( get_option( 'pressark_api_key', '' ) );
+		$has_api_key = PressArk_AI_Connector::simulator_active() || PressArk_AI_Connector::is_proxy_mode() || (bool) get_option( 'pressark_byok_enabled', false ) || ! empty( get_option( 'pressark_api_key', '' ) );
 		$logo_url    = $this->find_brand_image( array( 'WHITE-APP-LOGO', 'icon', 'app-icon', 'favicon' ) );
 		?>
 		<style>

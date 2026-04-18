@@ -1975,6 +1975,47 @@ body.pressark-panel-active .pressark-toggle-btn {
 	/* Text segments between inline steps — no extra spacing needed */
 }
 
+.pressark-stream-text-segment--status {
+	opacity: 0.72;
+	font-style: italic;
+	font-size: 0.95em;
+	/* Preserve any existing spacing rules on the base class. */
+	max-height: 4.5em;
+	overflow: hidden;
+	position: relative;
+}
+
+.pressark-stream-text-segment--status::after {
+	content: "";
+	position: absolute;
+	bottom: 0;
+	right: 0;
+	left: 0;
+	height: 1.2em;
+	background: linear-gradient(to bottom, transparent, var(--pressark-bubble-bg, var(--pw-bg, #fff)));
+	pointer-events: none;
+}
+
+.pressark-stream-final-result {
+	margin-top: 14px;
+	padding-top: 12px;
+	border-top: 1px solid var(--pw-border-light);
+	display: grid;
+	gap: 8px;
+}
+
+.pressark-stream-final-result__label {
+	font-size: 11px;
+	font-weight: 700;
+	letter-spacing: 0.04em;
+	text-transform: uppercase;
+	color: var(--pw-text-muted);
+}
+
+.pressark-stream-final-result__body {
+	color: var(--pw-text);
+}
+
 /* ============ LIVE PREVIEW OVERLAY ============ */
 
 .pressark-preview-overlay {

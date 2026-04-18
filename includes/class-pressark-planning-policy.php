@@ -31,6 +31,7 @@ class PressArk_Planning_Policy {
 		$trimmed         = trim( $message );
 		$explicit_plan   = ! empty( $context['explicit_plan'] );
 		$suppress_plan   = ! empty( $context['suppress_plan'] ) || ! empty( $context['plan_execute'] );
+		$continuation_mode = sanitize_key( (string) ( $context['continuation_mode'] ?? '' ) );
 		$legacy_signal   = ! empty( $context['legacy_plan_signal'] );
 		$tool_candidates = $this->sanitize_tool_candidates( $context['predicted_tools'] ?? array() );
 		$groups          = $this->predict_groups( $trimmed, $permission_probe, $tool_candidates, $context );
@@ -90,6 +91,38 @@ class PressArk_Planning_Policy {
 				true,
 				true,
 				$reason_codes,
+				$complexity_score,
+				$risk_score,
+				$breadth_score,
+				$uncertainty_score,
+				$destructive_score,
+				$predicted_write_count,
+				$group_count
+			);
+		}
+
+		if ( 'plan' === $continuation_mode ) {
+			return $this->build_decision(
+				self::MODE_HARD_PLAN,
+				true,
+				true,
+				array_values( array_unique( array_merge( $reason_codes, array( 'continuation_plan_resume' ) ) ) ),
+				$complexity_score,
+				$risk_score,
+				$breadth_score,
+				$uncertainty_score,
+				$destructive_score,
+				$predicted_write_count,
+				$group_count
+			);
+		}
+
+		if ( 'execute' === $continuation_mode ) {
+			return $this->build_decision(
+				self::MODE_NONE,
+				false,
+				false,
+				array_values( array_unique( array_merge( $reason_codes, array( 'continuation_execute_resume' ) ) ) ),
 				$complexity_score,
 				$risk_score,
 				$breadth_score,
@@ -161,10 +194,32 @@ class PressArk_Planning_Policy {
 			|| $predicted_write_count >= 3
 			|| $breadth_score >= 6
 			|| $destructive_score >= 5
-			|| $uncertainty_score >= 6
-			|| ( $group_count >= 2 && $writes_likely )
 			|| ( $async_score >= $this->async_hard_threshold() && $writes_likely )
 			|| ( $needs_discovery && $writes_likely && $risk_score >= 5 );
+
+		if ( defined( 'PRESSARK_DEBUG_ROUTE' ) && PRESSARK_DEBUG_ROUTE ) {
+			$log_path = defined( 'PRESSARK_DEBUG_ROUTE_LOG' ) ? (string) PRESSARK_DEBUG_ROUTE_LOG : '/tmp/pressark-route.log';
+			@file_put_contents(
+				$log_path,
+				sprintf(
+					"[%s] POLICY hp=%d legacy=%d writes=%d breadth=%d destructive=%d uncertainty=%d async=%d writes_likely=%d discovery=%d risk=%d groups=%d complexity=%d\n",
+					date( 'H:i:s' ),
+					$hard_plan ? 1 : 0,
+					$legacy_signal ? 1 : 0,
+					$predicted_write_count,
+					$breadth_score,
+					$destructive_score,
+					$uncertainty_score,
+					$async_score,
+					$writes_likely ? 1 : 0,
+					$needs_discovery ? 1 : 0,
+					$risk_score,
+					$group_count,
+					$complexity_score
+				),
+				FILE_APPEND
+			);
+		}
 
 		if ( $hard_plan ) {
 			return $this->build_decision(
@@ -536,6 +591,9 @@ class PressArk_Planning_Policy {
 		return 1 === preg_match(
 			'/^\s*(?:please\s+)?(?:update|change|edit|modify|rewrite|replace|delete|remove|create|add|set|publish|increase|decrease|raise|lower|append|prepend|rename|move|fix|make)\b/i',
 			$message
+		) || (
+			1 === preg_match( '/\b(?:product|products|catalog|catalogue|store|shop|woo|woocommerce)\b/i', $message )
+			&& 1 === preg_match( '/\b(?:price|pricing|sale|discount|markdown|markup|off|regular price|sale price)\b/i', $message )
 		);
 	}
 

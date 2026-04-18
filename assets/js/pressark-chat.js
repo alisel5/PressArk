@@ -1121,7 +1121,12 @@
 			this.messagesEl.appendChild(msgEl);
 			this.scrollToBottom();
 
-			if (!skipSave) {
+			// Errors are ephemeral UI artifacts — never persist them as chat
+			// history. Otherwise pre-flight gates like the missing-API-key
+			// banner end up stored as user messages, polluting the next run's
+			// conversation context (the prompt then sees the error string
+			// instead of the user's actual goal).
+			if (!skipSave && type !== 'error') {
 				this.autoSaveChat();
 			}
 
@@ -1329,12 +1334,16 @@
 			var executeEndpoint = planData.execute_endpoint || planData.executeEndpoint || approveEndpoint || '';
 			var reviseEndpoint = planData.revise_endpoint || planData.reviseEndpoint || '';
 			var rejectEndpoint = planData.reject_endpoint || planData.rejectEndpoint || '';
-			var approvalLevel = String(planData.approval_level || planData.approvalLevel || 'hard');
-			var planPhase = String(planData.plan_phase || planData.planPhase || 'planning');
+			var approvalLevel = String(planData.approval_level || planData.approvalLevel || '');
+			var planPhase = String(planData.plan_phase || planData.planPhase || (approveEndpoint || reviseEndpoint || rejectEndpoint ? 'planning' : 'executing'));
 			var artifact = planData.plan_artifact && typeof planData.plan_artifact === 'object' ? planData.plan_artifact : {};
-			var summaryText = artifact.request_summary || planData.request_summary || planData.reply || planData.message || 'Plan ready.';
+			var summaryText = artifact.request_summary || planData.request_summary || planData.reply || planData.message || '';
 			var planVersion = artifact.version ? String(artifact.version) : '';
 			var canExecute = !!approveEndpoint && planData.can_execute !== false && steps.length > 0;
+			var isExecutionOnly = planPhase === 'executing' && !canExecute && !reviseEndpoint && !rejectEndpoint;
+			if (!summaryText) {
+				summaryText = isExecutionOnly ? 'Working through the current checklist.' : 'Plan ready.';
+			}
 			var existing = null;
 			var cards = container.querySelectorAll('.pressark-plan-card');
 
@@ -1356,7 +1365,7 @@
 				stepsHtml += '<li class="step-' + this.escapeHtml(steps[s].status || 'pending') + '">' + this.escapeHtml(steps[s].text) + '</li>';
 			}
 
-			var summary = 'Plan ready';
+			var summary = isExecutionOnly ? 'Execution plan' : 'Plan ready';
 			if (steps.length > 0) {
 				summary += ' - ' + steps.length + ' step' + (steps.length === 1 ? '' : 's');
 			}
@@ -1368,14 +1377,14 @@
 				executing: 'Executing'
 			};
 			var phaseLabel = phaseLabelMap[planPhase] || 'Planning';
-			var approvalLabel = approvalLevel === 'soft' ? 'Soft plan' : 'Hard approval';
+			var approvalLabel = approvalLevel === 'soft' ? 'Soft plan' : (approvalLevel === 'hard' ? 'Hard approval' : '');
 			var approveLabel = approvalLevel === 'soft' ? 'Execute' : 'Approve & Execute';
 
 			var bodyHtml = '';
 			bodyHtml +=
 				'<div class="pressark-plan-meta">' +
 				'<span class="pressark-plan-badge pressark-plan-phase">' + this.escapeHtml(phaseLabel) + '</span>' +
-				'<span class="pressark-plan-badge pressark-plan-approval">' + this.escapeHtml(approvalLabel) + '</span>' +
+				(approvalLabel ? '<span class="pressark-plan-badge pressark-plan-approval">' + this.escapeHtml(approvalLabel) + '</span>' : '') +
 				(planVersion ? '<span class="pressark-plan-badge pressark-plan-version">v' + this.escapeHtml(planVersion) + '</span>' : '') +
 				'</div>';
 
@@ -1743,6 +1752,27 @@
 				.replace(/'/g, '&#39;');
 		},
 
+		formatPreviewValue: function (value) {
+			if (value === null || typeof value === 'undefined') {
+				return '(empty)';
+			}
+
+			if (typeof value === 'string') {
+				return value === '' ? '(empty)' : value;
+			}
+
+			if (typeof value === 'number' || typeof value === 'boolean') {
+				return String(value);
+			}
+
+			try {
+				var json = JSON.stringify(value);
+				return json ? json : '(empty)';
+			} catch (e) {
+				return '[unrenderable value]';
+			}
+		},
+
 		addActionResult: function (result) {
 			var msgEl = document.createElement('div');
 			msgEl.dataset.timestamp = String(Date.now());
@@ -1798,6 +1828,8 @@
 			var preview = pendingAction.preview;
 			var action = pendingAction.action;
 			var riskReceipt = pendingAction.risk_receipt || null;
+			var validationError = pendingAction.validation_error || (preview && preview.validation_error) || '';
+			var canApply = !validationError && pendingAction.status !== 'invalid_input';
 
 			// Store action in JS-side map instead of HTML attribute (A13: prevents XSS).
 			var actionId = 'action_' + (++this.actionIdCounter);
@@ -1816,16 +1848,18 @@
 			if (preview.changes && preview.changes.length > 0) {
 				for (var i = 0; i < preview.changes.length; i++) {
 					var change = preview.changes[i];
+					var beforeValue = this.formatPreviewValue(change.before);
+					var afterValue = this.formatPreviewValue(change.after);
 					changesHTML +=
 						'<div class="pressark-preview-change">' +
 						'<div class="pressark-preview-field">' + this.escapeHtml(change.field) + '</div>' +
 						'<div class="pressark-preview-before">' +
 						'<span class="pressark-preview-label">Before: </span>' +
-						'<span class="pressark-preview-value">' + this.escapeHtml(change.before) + '</span>' +
+						'<span class="pressark-preview-value">' + this.escapeHtml(beforeValue) + '</span>' +
 						'</div>' +
 						'<div class="pressark-preview-after">' +
 						'<span class="pressark-preview-label">After: </span>' +
-						'<span class="pressark-preview-value">' + this.escapeHtml(change.after) + '</span>' +
+						'<span class="pressark-preview-value">' + this.escapeHtml(afterValue) + '</span>' +
 						'</div>' +
 						'</div>';
 				}
@@ -1854,6 +1888,19 @@
 				? 'Proposed changes to "' + this.escapeHtml(preview.post_title) + '"'
 				: 'Proposed changes';
 			var riskHtml = this.renderRiskReceipt(riskReceipt);
+			var validationHtml = validationError
+				? '<div class="pressark-action-result pressark-action-fail"><span>' + pwIcon('x') + ' ' + this.escapeHtml(validationError) + '</span></div>'
+				: '';
+			var actionsHtml = canApply
+				? '<button type="button" class="pressark-preview-confirm">' +
+					this.getPreviewButtonContent('&#10003;', 'Apply Changes') +
+					'</button>' +
+					'<button type="button" class="pressark-preview-cancel">' +
+					this.getPreviewButtonContent('&#10005;', 'Cancel') +
+					'</button>'
+				: '<button type="button" class="pressark-preview-cancel">' +
+					this.getPreviewButtonContent('&#10005;', 'Dismiss') +
+					'</button>';
 
 			card.innerHTML =
 				'<div class="pressark-preview-header">' +
@@ -1863,54 +1910,53 @@
 				'<div class="pressark-preview-changes">' + changesHTML + '</div>' +
 				warningsHTML +
 				riskHtml +
+				validationHtml +
 				'<div class="pressark-preview-actions">' +
-				'<button type="button" class="pressark-preview-confirm">' +
-				this.getPreviewButtonContent('&#10003;', 'Apply Changes') +
-				'</button>' +
-				'<button type="button" class="pressark-preview-cancel">' +
-				this.getPreviewButtonContent('&#10005;', 'Cancel') +
-				'</button>' +
+				actionsHtml +
 				'</div>';
 
-			card.querySelector('.pressark-preview-confirm').addEventListener('click', function (e) {
-				var btn = e.currentTarget;
-				var actionData = self.pendingActions[actionId];
-				var actionRunId = self.pendingRunIds[actionId] || '';
-				var actionPendingIndex = self.pendingActionIndices[actionId] || 0;
-				btn.textContent = 'Applying...';
-				btn.disabled = true;
-				card.querySelector('.pressark-preview-cancel').disabled = true;
+			var previewConfirmBtn = card.querySelector('.pressark-preview-confirm');
+			if (previewConfirmBtn) {
+				previewConfirmBtn.addEventListener('click', function (e) {
+					var btn = e.currentTarget;
+					var actionData = self.pendingActions[actionId];
+					var actionRunId = self.pendingRunIds[actionId] || '';
+					var actionPendingIndex = self.pendingActionIndices[actionId] || 0;
+					btn.textContent = 'Applying...';
+					btn.disabled = true;
+					card.querySelector('.pressark-preview-cancel').disabled = true;
 
-				self.confirmAction(actionData, true, actionRunId, actionPendingIndex, card).then(function (result) {
-					var previewData = self.pendingPreviews[actionId];
-					self.renderConfirmResult(card, result, previewData);
-					delete self.pendingActions[actionId];
-					delete self.pendingPreviews[actionId];
-					delete self.pendingRunIds[actionId];
-					delete self.pendingActionIndices[actionId];
+					self.confirmAction(actionData, true, actionRunId, actionPendingIndex, card).then(function (result) {
+						var previewData = self.pendingPreviews[actionId];
+						self.renderConfirmResult(card, result, previewData);
+						delete self.pendingActions[actionId];
+						delete self.pendingPreviews[actionId];
+						delete self.pendingRunIds[actionId];
+						delete self.pendingActionIndices[actionId];
 
-					if (result && result.checkpoint && typeof result.checkpoint === 'object') {
-						self.checkpoint = result.checkpoint;
-					}
+						if (result && result.checkpoint && typeof result.checkpoint === 'object') {
+							self.checkpoint = result.checkpoint;
+						}
 
-					// v3.7.3: Auto-resume with enriched continuation context.
-					// Uses [Continue] prefix so server-side classify_task detects
-					// this is a continuation and classifies based on the ORIGINAL
-					// user request (from conversation history), selecting the right
-					// model tier and domain skills for remaining steps.
-					if (result && result.success && !result.cancelled
-						&& (!self.getApprovalOutcomeStatus(result) || self.getApprovalOutcomeStatus(result) === 'approved')
-						&& self.shouldAutoResume(result)
-						&& Object.keys(self.pendingActions).length === 0) {
-						setTimeout(function () {
-							self.sendMessage(self.buildContinuationMessage(result, result.message || 'Action applied.'));
-						}, 600);
-					} else if (result && result.success && result.continuation && result.continuation.pause_message) {
-						self.addMessage('ai', result.continuation.pause_message);
-						self.conversation.push({ role: 'assistant', content: result.continuation.pause_message });
-					}
+						// v3.7.3: Auto-resume with enriched continuation context.
+						// Uses [Continue] prefix so server-side classify_task detects
+						// this is a continuation and classifies based on the ORIGINAL
+						// user request (from conversation history), selecting the right
+						// model tier and domain skills for remaining steps.
+						if (result && result.success && !result.cancelled
+							&& (!self.getApprovalOutcomeStatus(result) || self.getApprovalOutcomeStatus(result) === 'approved')
+							&& self.shouldAutoResume(result)
+							&& Object.keys(self.pendingActions).length === 0) {
+							setTimeout(function () {
+								self.sendMessage(self.buildContinuationMessage(result, result.message || 'Action applied.'));
+							}, 600);
+						} else if (result && result.success && result.continuation && result.continuation.pause_message) {
+							self.addMessage('ai', result.continuation.pause_message);
+							self.conversation.push({ role: 'assistant', content: result.continuation.pause_message });
+						}
+					});
 				});
-			});
+			}
 
 			card.querySelector('.pressark-preview-cancel').addEventListener('click', function () {
 				var cancelBtn = card.querySelector('.pressark-preview-cancel');
@@ -1955,7 +2001,7 @@
 			if (preview.changes && preview.changes.length > 0) {
 				for (var i = 0; i < preview.changes.length; i++) {
 					var c = preview.changes[i];
-					parts.push((c.field || '') + ': ' + (c.before || '(empty)') + ' \u2192 ' + (c.after || '(empty)'));
+					parts.push((c.field || '') + ': ' + this.formatPreviewValue(c.before) + ' \u2192 ' + this.formatPreviewValue(c.after));
 				}
 			}
 			return '[PRESSARK_CARD:' + status + ']' + parts.join('||');
@@ -2406,7 +2452,13 @@
 			if (!contentEl || !event) return null;
 
 			switch (event.type) {
+				case 'step':
+					this._markPriorTextSegmentsAsStatus(contentEl);
+					this._renderInlineStep(contentEl, event.data);
+					return null;
+
 				case 'tool_call':
+					this._markPriorTextSegmentsAsStatus(contentEl);
 					this._renderInlineStep(contentEl, {
 						status: 'reading',
 						label: event.data && event.data.name ? event.data.name.replace(/_/g, ' ') : 'Processing',
@@ -2446,6 +2498,7 @@
 						detailParts.push(progressData.errors + ' errors');
 					}
 
+					this._markPriorTextSegmentsAsStatus(contentEl);
 					this._renderInlineStep(contentEl, {
 						status: 'reading',
 						label: progressLabel,
@@ -2465,6 +2518,7 @@
 					if (doneKey && this._toolProgressState) {
 						delete this._toolProgressState[doneKey];
 					}
+					this._markPriorTextSegmentsAsStatus(contentEl);
 					this._renderInlineStep(contentEl, {
 						status: 'done',
 						label: (doneName || 'Action') + ' complete',
@@ -3409,8 +3463,8 @@
 						var item = d.items[j];
 						rows.push({
 							field: item.field || '',
-							before: item.old || item.before || '',
-							after: item['new'] || item.after || ''
+							before: Object.prototype.hasOwnProperty.call(item, 'old') ? item.old : item.before,
+							after: Object.prototype.hasOwnProperty.call(item, 'new') ? item['new'] : item.after
 						});
 					}
 				} else if (d.changes && Array.isArray(d.changes)) {
@@ -3419,16 +3473,16 @@
 						var change = d.changes[k];
 						rows.push({
 							field: change.field || '',
-							before: change.before || '',
-							after: change.after || ''
+							before: change.before,
+							after: change.after
 						});
 					}
 				} else {
 					// Already flat format (field, before, after)
 					rows.push({
 						field: d.field || '',
-						before: d.old || d.before || '',
-						after: d['new'] || d.after || ''
+						before: Object.prototype.hasOwnProperty.call(d, 'old') ? d.old : d.before,
+						after: Object.prototype.hasOwnProperty.call(d, 'new') ? d['new'] : d.after
 					});
 				}
 			}
@@ -3442,10 +3496,12 @@
 
 			for (var r = 0; r < rows.length; r++) {
 				var row = rows[r];
+				var diffBefore = this.formatPreviewValue(row.before);
+				var diffAfter = this.formatPreviewValue(row.after);
 				html += '<tr>';
 				html += '<td class="pressark-diff-field">' + this.escapeHtml(row.field) + '</td>';
-				html += '<td class="pressark-diff-before">' + this.escapeHtml(this.truncateText(row.before, 150)) + '</td>';
-				html += '<td class="pressark-diff-after">' + this.escapeHtml(this.truncateText(row.after, 150)) + '</td>';
+				html += '<td class="pressark-diff-before">' + this.escapeHtml(this.truncateText(diffBefore, 150)) + '</td>';
+				html += '<td class="pressark-diff-after">' + this.escapeHtml(this.truncateText(diffAfter, 150)) + '</td>';
 				html += '</tr>';
 			}
 
@@ -4123,15 +4179,21 @@
 			return true;
 		},
 
-		_findInlineStepRow: function (contentEl, toolKey, tool) {
+		_findInlineStepRow: function (contentEl, toolKey, tool, matcher) {
 			if (!contentEl) return null;
 			var rows = contentEl.querySelectorAll('.pressark-inline-step');
 			for (var i = rows.length - 1; i >= 0; i--) {
 				var row = rows[i];
 				if (toolKey && row.dataset.toolKey === toolKey) {
+					if (typeof matcher === 'function' && !matcher(row)) {
+						continue;
+					}
 					return row;
 				}
 				if (!toolKey && tool && row.dataset.tool === tool) {
+					if (typeof matcher === 'function' && !matcher(row)) {
+						continue;
+					}
 					return row;
 				}
 			}
@@ -4263,11 +4325,13 @@
 					break;
 
 				case 'step':
+					this._markPriorTextSegmentsAsStatus(contentEl);
 					this._renderInlineStep(contentEl, event.data);
 					this._streamSegmentText = ''; // Next tokens go in a new segment.
 					break;
 
 				case 'tool_call':
+					this._markPriorTextSegmentsAsStatus(contentEl);
 					this._renderInlineStep(contentEl, {
 						status: 'reading',
 						label: event.data.name ? event.data.name.replace(/_/g, ' ') : 'Processing',
@@ -4311,6 +4375,7 @@
 						progressDetail = detailParts.join(' · ');
 					}
 
+					this._markPriorTextSegmentsAsStatus(contentEl);
 					this._renderInlineStep(contentEl, {
 						status: 'reading',
 						label: progressLabel,
@@ -4331,6 +4396,7 @@
 					if (doneKey && this._toolProgressState) {
 						delete this._toolProgressState[doneKey];
 					}
+					this._markPriorTextSegmentsAsStatus(contentEl);
 					this._renderInlineStep(contentEl, {
 						status: 'done',
 						label: (doneName || 'Action') + ' complete',
@@ -4380,6 +4446,23 @@
 		},
 
 		/**
+		 * When a tool call / step / tool_result arrives, any text segments that
+		 * came before it are retroactively intermediate status, not final reply
+		 * text. Add the --status modifier so CSS can dim them. Safe to call
+		 * multiple times (idempotent via classList.add).
+		 */
+		_markPriorTextSegmentsAsStatus: function (contentEl) {
+			if (!contentEl) return;
+			var segs = contentEl.querySelectorAll(':scope > .pressark-stream-text-segment');
+			for (var i = 0; i < segs.length; i++) {
+				var seg = segs[i];
+				// Empty segments carry no information — do not visually flag them.
+				if (!seg.textContent || !seg.textContent.trim()) continue;
+				seg.classList.add('pressark-stream-text-segment--status');
+			}
+		},
+
+		/**
 		 * Render a collapsible execution plan card inline within the bubble.
 		 * @since 5.2.0
 		 */
@@ -4410,7 +4493,14 @@
 			var label = stepData.label || stepData.tool || '';
 			var tool = stepData.tool || '';
 			var toolKey = stepData.toolKey || tool;
-			var existingRow = this._findInlineStepRow(contentEl, toolKey, tool);
+			var existingRow = this._findInlineStepRow(
+				contentEl,
+				toolKey,
+				tool,
+				status === 'done'
+					? function (row) { return row.dataset.status === 'done'; }
+					: function (row) { return row.dataset.status !== 'done'; }
+			);
 			if (existingRow) {
 				this._applyInlineStepState(existingRow, status, label, stepData);
 				this.scrollToBottom();
@@ -4441,7 +4531,31 @@
 			this.scrollToBottom();
 		},
 
+		_normalizeStreamReplyText: function (text) {
+			return String(text || '').replace(/\s+/g, ' ').trim();
+		},
+
+		_streamReplyMatchesFinal: function (streamedText, replyText) {
+			return this._normalizeStreamReplyText(streamedText) === this._normalizeStreamReplyText(replyText);
+		},
+
+		_appendStreamFinalResult: function (contentEl, replyText) {
+			if (!contentEl || !replyText) return;
+			var existing = contentEl.querySelector('.pressark-stream-final-result');
+			if (existing && existing.parentNode) {
+				existing.parentNode.removeChild(existing);
+			}
+
+			var summary = document.createElement('div');
+			summary.className = 'pressark-stream-final-result';
+			summary.innerHTML =
+				'<div class="pressark-stream-final-result__label">Final result</div>' +
+				'<div class="pressark-stream-final-result__body">' + this.renderFormattedMessage(replyText) + '</div>';
+			contentEl.appendChild(summary);
+		},
+
 		finalizeStreamResponse: function (result, bubble) {
+			var streamedReplyText = this._streamText || '';
 			this.finishRequest();
 			this._streamText = '';
 			this._streamSegmentText = '';
@@ -4488,24 +4602,18 @@
 				var hadInlineSteps = inlineSteps.length > 0;
 
 				// Detach plan cards before clearing — they survive the finalize.
-				var planCards = contentEl.querySelectorAll('.pressark-plan-card');
-				var savedPlanCards = [];
-				for (var pc = 0; pc < planCards.length; pc++) {
-					savedPlanCards.push(planCards[pc].parentNode.removeChild(planCards[pc]));
-				}
+				var hadPlanCards = contentEl.querySelectorAll('.pressark-plan-card').length > 0;
+				var hadStreamedContent = !!this._normalizeStreamReplyText(streamedReplyText) || hadInlineSteps || hadPlanCards;
 
-				// Clear inline content and render final formatted text.
-				contentEl.innerHTML = this.renderFormattedMessage(replyText);
-
-				// Re-insert plan cards at the top.
-				for (var pc2 = savedPlanCards.length - 1; pc2 >= 0; pc2--) {
-					contentEl.insertBefore(savedPlanCards[pc2], contentEl.firstChild);
+				if (!hadStreamedContent || !this._normalizeStreamReplyText(contentEl.textContent)) {
+					contentEl.innerHTML = this.renderFormattedMessage(replyText);
+				} else if (!this._streamReplyMatchesFinal(streamedReplyText, replyText)) {
+					this._appendStreamFinalResult(contentEl, replyText);
 				}
 
 				// If there were inline steps, render the final activity strip above the bubble.
-				if (activityItems.length > 0) {
+				if (activityItems.length > 0 && !hadInlineSteps) {
 					this.renderActivityStripBefore(activityItems, bubble);
-				} else if (hadInlineSteps) {
 					// No final steps from server — remove inline steps (they're already cleared).
 				}
 
@@ -4537,7 +4645,7 @@
 					}
 				}
 			} else if (responseType === 'plan_ready') {
-				if (contentEl && !contentEl.querySelector('.pressark-plan-card')) {
+				if (contentEl) {
 					this._renderPlanCard(contentEl, result);
 				}
 			} else {

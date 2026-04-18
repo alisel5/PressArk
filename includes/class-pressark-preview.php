@@ -56,6 +56,19 @@ class PressArk_Preview {
 		$session_id = wp_generate_uuid4();
 		$user_id    = get_current_user_id();
 		$tool_calls = $this->normalize_preview_tool_calls( $tool_calls );
+		foreach ( $tool_calls as $tool_call ) {
+			$validation_error = is_array( $tool_call ) ? (string) ( $tool_call['_validation_error'] ?? '' ) : '';
+			if ( '' === $validation_error ) {
+				continue;
+			}
+
+			return array(
+				'success'   => false,
+				'error'     => 'invalid_preview_input',
+				'message'   => sanitize_text_field( $validation_error ),
+				'tool_calls'=> $tool_calls,
+			);
+		}
 
 		$layer = array(
 			'user_id'    => $user_id,
@@ -420,6 +433,8 @@ class PressArk_Preview {
 			$validation = PressArk_Operation_Registry::validate_input( $canonical, $args );
 			if ( ( $validation['valid'] ?? false ) && is_array( $validation['params'] ?? null ) ) {
 				$args = $validation['params'];
+			} elseif ( ! ( $validation['valid'] ?? true ) ) {
+				$call['_validation_error'] = sanitize_text_field( (string) ( $validation['message'] ?? __( 'Invalid input for this preview action.', 'pressark' ) ) );
 			}
 
 			$call['name']      = $canonical;

@@ -246,7 +246,7 @@ class PressArk {
 			'screenBase'     => $screen ? $screen->base : '',
 			'postId'         => $post_id,
 			'pageTitle'      => get_admin_page_title() ?: ( $screen ? $screen->id : '' ),
-			'hasApiKey'      => PressArk_AI_Connector::is_proxy_mode() || (bool) get_option( 'pressark_byok_enabled', false ) || ! empty( get_option( 'pressark_api_key', '' ) ),
+			'hasApiKey'      => PressArk_AI_Connector::simulator_active() || PressArk_AI_Connector::is_proxy_mode() || (bool) get_option( 'pressark_byok_enabled', false ) || ! empty( get_option( 'pressark_api_key', '' ) ),
 			'hasWooCommerce' => class_exists( 'WooCommerce' ),
 			'isOnboarded'    => ! empty( $onboarded ),
 			'usage'          => $usage,

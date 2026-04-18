@@ -51,8 +51,91 @@ class PressArk_AI_Connector {
 			return $base + 60; // Thinking overhead: +60s for internal reasoning.
 		}
 
+		// Observer sub-agents in the dev simulator are slow — bump the
+		// request timeout so wp_safe_remote_post doesn't abort mid-round.
+		if ( self::simulator_active() ) {
+			return max( $base, 600 );
+		}
+
 		return $base;
 	}
+
+	// ─── Dev Simulator (gated) ────────────────────────────────────────────
+	// Route OpenAI-format API calls to a local simulator proxy so a Claude
+	// Code (or similar) observer can replay the model's decisions per round.
+	// Two activation paths:
+	//   1. PRESSARK_SIMULATOR_URL constant in wp-config — always wins; used
+	//      for CI, ephemeral docker runs, headless dev.
+	//   2. pressark_simulator_enabled option + pressark_simulator_url option
+	//      — toggleable from the admin Settings → Developer section. Only
+	//      honored when BOTH WP_DEBUG is on AND home_url() resolves to a
+	//      local host (localhost, 127.0.0.1, ::1, *.local, *.test,
+	//      *.localhost). The settings section is also only shown in that
+	//      environment, so production installs can neither see nor run it.
+	// See _dev-simulator/ for the Python proxy + observer workflow.
+
+	/**
+	 * True when the current environment is considered a developer workstation.
+	 * Gates both the admin UI for the simulator and the DB-option activation
+	 * path so production sites can never accidentally route AI traffic through
+	 * a local proxy.
+	 */
+	public static function simulator_is_dev_environment(): bool {
+		if ( ! ( defined( 'WP_DEBUG' ) && WP_DEBUG ) ) {
+			return false;
+		}
+		$host = strtolower( (string) wp_parse_url( home_url(), PHP_URL_HOST ) );
+		if ( '' === $host ) {
+			return false;
+		}
+		if ( in_array( $host, array( 'localhost', '127.0.0.1', '::1' ), true ) ) {
+			return true;
+		}
+		foreach ( array( '.local', '.test', '.localhost' ) as $suffix ) {
+			if ( str_ends_with( $host, $suffix ) ) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/**
+	 * True when any simulator activation path is live (constant OR option).
+	 */
+	public static function simulator_active(): bool {
+		if ( defined( 'PRESSARK_SIMULATOR_URL' ) && PRESSARK_SIMULATOR_URL ) {
+			return true;
+		}
+		if ( ! self::simulator_is_dev_environment() ) {
+			return false;
+		}
+		if ( ! (bool) get_option( 'pressark_simulator_enabled', false ) ) {
+			return false;
+		}
+		return '' !== trim( (string) get_option( 'pressark_simulator_url', '' ) );
+	}
+
+	/**
+	 * Resolved simulator endpoint URL (constant wins over option).
+	 */
+	public static function simulator_endpoint(): string {
+		if ( defined( 'PRESSARK_SIMULATOR_URL' ) && PRESSARK_SIMULATOR_URL ) {
+			return (string) PRESSARK_SIMULATOR_URL;
+		}
+		return (string) get_option( 'pressark_simulator_url', '' );
+	}
+
+	/**
+	 * Resolve the chat-completions endpoint for the current provider, honoring
+	 * the simulator override when active.
+	 */
+	private static function resolve_endpoint( string $provider ): string {
+		if ( self::simulator_active() ) {
+			return self::simulator_endpoint();
+		}
+		return self::ENDPOINTS[ $provider ] ?? self::ENDPOINTS['openrouter'];
+	}
+	// ─── END Dev Simulator ────────────────────────────────────────────────
 
 	// Cache-control marker for Anthropic prompt caching.
 	private const CACHE_TYPE = 'ephemeral';
@@ -184,6 +267,18 @@ PROMPT;
 		$this->api_key  = ! empty( $encrypted ) ? PressArk_Usage_Tracker::decrypt_value( $encrypted ) : '';
 		$this->tier     = ! empty( $tier ) ? $tier : ( new PressArk_License() )->get_tier();
 		$this->model    = $this->resolve_model();
+
+		// Dev simulator bypasses provider auth — the proxy accepts any key.
+		// Populate a dummy value so the pre-flight guards don't reject the
+		// request and default the provider to something OpenAI-compatible.
+		if ( self::simulator_active() ) {
+			if ( empty( $this->api_key ) ) {
+				$this->api_key = 'sim-dummy-key';
+			}
+			if ( empty( $this->provider ) ) {
+				$this->provider = 'openrouter';
+			}
+		}
 	}
 
 	/**
@@ -1177,7 +1272,7 @@ PROMPT;
 			return $result;
 		}
 
-		$endpoint = self::ENDPOINTS[ $this->provider ] ?? self::ENDPOINTS['openrouter'];
+		$endpoint = self::resolve_endpoint( $this->provider );
 
 		$headers = array(
 			'Content-Type'  => 'application/json',
@@ -1194,11 +1289,15 @@ PROMPT;
 			'messages'     => $messages,
 		);
 
-		$response = wp_safe_remote_post( $endpoint, array(
+		$args = array(
 			'headers' => $headers,
 			'body'    => wp_json_encode( $body ),
 			'timeout' => $this->get_timeout(),
-		) );
+		);
+
+		$response = self::simulator_active()
+			? wp_remote_post( $endpoint, $args )
+			: wp_safe_remote_post( $endpoint, $args );
 
 		if ( is_wp_error( $response ) ) {
 			$wp_error_msg = $response->get_error_message();
@@ -1301,7 +1400,7 @@ PROMPT;
 			return $result;
 		}
 
-		$response = wp_safe_remote_post( self::ENDPOINTS['anthropic'], array(
+		$args = array(
 			'headers' => array(
 				'Content-Type'      => 'application/json',
 				'x-api-key'         => $this->api_key,
@@ -1309,7 +1408,11 @@ PROMPT;
 			),
 			'body'    => wp_json_encode( $body ),
 			'timeout' => $this->get_timeout(),
-		) );
+		);
+
+		$response = self::simulator_active()
+			? wp_remote_post( self::ENDPOINTS['anthropic'], $args )
+			: wp_safe_remote_post( self::ENDPOINTS['anthropic'], $args );
 
 		if ( is_wp_error( $response ) ) {
 			return array(
@@ -1457,7 +1560,7 @@ ELEMENTOR;
 
 Products: ALWAYS use edit_product — never edit_content or update_meta on products. WC's object model keeps price lookups, stock caches, and hooks in sync. Use create_product for new products (simple, variable, grouped, external).
 When the admin is editing a product, "this product", "that product", or a product request with no other clear target refers to the current editor product ID from context. Do NOT use plain "price" for WooCommerce writes. For products, variations, and bulk WooCommerce writes, choose the explicit field that matches intent: regular_price for the base price, sale_price for a sale amount, or clear_sale=true to remove a sale.
-For product price or sale changes, call get_product first unless the latest verified product read is already in context. When the user says remove/end/clear a sale, preserve regular_price and use clear_sale=true. Empty sale_price is legacy compatibility only and must not be the planned strategy. Never set a price to 0 unless the user explicitly wants a free product. After save, trust the returned/read-back pricing state (regular_price, sale_price, active price, on_sale, sale_from, sale_to) instead of assuming the submitted fields became customer-visible.
+For product price or sale changes, call get_product first unless the latest verified product read is already in context. When the user explicitly asks to apply or start a sale, set sale_price and preserve regular_price unless they also asked to change the base price. When the user asks to increase, decrease, raise, lower, or change the current/regular price, treat that as a regular_price change or a relative regular_price adjustment. If the wording does not clearly specify sale price vs regular price, ask a brief clarification before any price write. When the user says remove/end/clear a sale, preserve regular_price and use clear_sale=true. Empty sale_price is legacy compatibility only and must not be the planned strategy. Never set a price to 0 unless the user explicitly wants a free product. After save, trust the returned/read-back pricing state (regular_price, sale_price, active price, on_sale, sale_from, sale_to) instead of assuming the submitted fields became customer-visible.
 If two price-affecting writes on the same product remain uncertain, stop retrying WooCommerce price writes for that product and explain/escalate instead of issuing a third similar write.
 Broad catalog changes should prefer bulk_edit_products with scope="all" or scope="matching" plus shared changes, instead of enumerating products one by one. For relative price changes like "add 10 USD" or "raise prices by 5%", use changes.price_delta or changes.price_adjust_pct. Bulk results include per-product product types; if variable parents are hit, do not claim their child variation prices were updated. Use bulk_edit_variations when child variation prices need changing.
 
@@ -1520,6 +1623,11 @@ FSEPROMPT;
 	 * @since 5.0.0
 	 */
 	public static function is_proxy_mode(): bool {
+		// Dev simulator forces the direct provider path so resolve_endpoint()
+		// can swap in the simulator URL. Bank proxy would hide the override.
+		if ( self::simulator_active() ) {
+			return false;
+		}
 		if ( PressArk_Entitlements::is_byok() ) {
 			return false;
 		}
@@ -1535,7 +1643,7 @@ FSEPROMPT;
 	 * @since 4.4.0
 	 */
 	public function get_endpoint(): string {
-		return self::ENDPOINTS[ $this->provider ] ?? self::ENDPOINTS['openrouter'];
+		return self::resolve_endpoint( $this->provider );
 	}
 
 	/**
@@ -3751,7 +3859,7 @@ AUTOMATION;
 			}
 		}
 
-		$endpoint = self::ENDPOINTS[ $this->provider ] ?? self::ENDPOINTS['openrouter'];
+		$endpoint = self::resolve_endpoint( $this->provider );
 
 		$headers = array(
 			'Content-Type: application/json',
@@ -4067,11 +4175,15 @@ AUTOMATION;
 		}
 
 		$request  = $this->build_openai_request( $messages, $tools, $system_prompt );
-		$response = wp_safe_remote_post( $request['endpoint'], array(
+		$args = array(
 			'headers' => $this->build_wp_remote_headers( (array) ( $request['headers'] ?? array() ) ),
 			'body'    => wp_json_encode( (array) ( $request['body'] ?? array() ) ),
 			'timeout' => $this->get_timeout( true ),
-		) );
+		);
+
+		$response = self::simulator_active()
+			? wp_remote_post( $request['endpoint'], $args )
+			: wp_safe_remote_post( $request['endpoint'], $args );
 
 		if ( is_wp_error( $response ) ) {
 			$err = $response->get_error_message();
@@ -4184,11 +4296,15 @@ AUTOMATION;
 		}
 
 		$request  = $this->build_anthropic_request( $messages, $tools, $system_prompt );
-		$response = wp_safe_remote_post( $request['endpoint'], array(
+		$args = array(
 			'headers' => $this->build_wp_remote_headers( (array) ( $request['headers'] ?? array() ) ),
 			'body'    => wp_json_encode( (array) ( $request['body'] ?? array() ) ),
 			'timeout' => $this->get_timeout( true ),
-		) );
+		);
+
+		$response = self::simulator_active()
+			? wp_remote_post( $request['endpoint'], $args )
+			: wp_safe_remote_post( $request['endpoint'], $args );
 
 		if ( is_wp_error( $response ) ) {
 			$err = $response->get_error_message();

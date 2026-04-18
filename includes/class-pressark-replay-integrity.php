@@ -173,20 +173,23 @@ class PressArk_Replay_Integrity {
 		$repaired  = array();
 		$pending   = null;
 
-		$inserted_missing = 0;
-		$dropped_orphans  = 0;
-		$dropped_dupes    = 0;
+		$dropped_orphans           = 0;
+		$dropped_dupes             = 0;
+		$dropped_incomplete_rounds = 0;
+		$dropped_partial_results   = 0;
 
 		foreach ( $canonical as $message ) {
 			if ( self::assistant_has_tool_calls( $message ) ) {
 				if ( null !== $pending ) {
-					$inserted_missing += self::flush_pending_tool_results( $repaired, $pending );
+					$discarded = self::discard_pending_tool_round( $pending );
+					$dropped_incomplete_rounds += (int) ( $discarded['rounds'] ?? 0 );
+					$dropped_partial_results   += (int) ( $discarded['results'] ?? 0 );
 				}
 
-				$repaired[] = $message;
-				$pending    = array(
-					'ids'     => self::assistant_tool_call_ids( $message ),
-					'results' => array(),
+				$pending = array(
+					'assistant' => $message,
+					'ids'       => self::assistant_tool_call_ids( $message ),
+					'results'   => array(),
 				);
 				continue;
 			}
@@ -204,15 +207,16 @@ class PressArk_Replay_Integrity {
 
 				$pending['results'][ $tool_call_id ] = $message;
 				if ( count( $pending['results'] ) >= count( $pending['ids'] ) ) {
-					self::flush_pending_tool_results( $repaired, $pending );
+					self::flush_pending_tool_round( $repaired, $pending );
 					$pending = null;
 				}
 				continue;
 			}
 
 			if ( null !== $pending ) {
-				$inserted_missing += self::flush_pending_tool_results( $repaired, $pending );
-				$pending = null;
+				$discarded = self::discard_pending_tool_round( $pending );
+				$dropped_incomplete_rounds += (int) ( $discarded['rounds'] ?? 0 );
+				$dropped_partial_results   += (int) ( $discarded['results'] ?? 0 );
 			}
 
 			if ( 'tool' === ( $message['role'] ?? '' ) ) {
@@ -224,7 +228,9 @@ class PressArk_Replay_Integrity {
 		}
 
 		if ( null !== $pending ) {
-			$inserted_missing += self::flush_pending_tool_results( $repaired, $pending );
+			$discarded = self::discard_pending_tool_round( $pending );
+			$dropped_incomplete_rounds += (int) ( $discarded['rounds'] ?? 0 );
+			$dropped_partial_results   += (int) ( $discarded['results'] ?? 0 );
 		}
 
 		$changed = $canonical !== $repaired;
@@ -236,9 +242,10 @@ class PressArk_Replay_Integrity {
 				'phase'                   => $phase,
 				'message_count_before'    => count( $canonical ),
 				'message_count_after'     => count( $repaired ),
-				'inserted_missing_results'=> $inserted_missing,
 				'dropped_orphan_results'  => $dropped_orphans,
 				'dropped_duplicate_results'=> $dropped_dupes,
+				'dropped_incomplete_rounds' => $dropped_incomplete_rounds,
+				'dropped_partial_results' => $dropped_partial_results,
 				'at'                      => gmdate( 'c' ),
 			), 'repair' );
 		}
@@ -313,7 +320,7 @@ class PressArk_Replay_Integrity {
 	 * @return array{messages:array,trimmed:bool,dropped_messages:int,dropped_rounds:int}
 	 */
 	public static function snapshot_messages( array $messages ): array {
-		$canonical = self::canonicalize_messages( $messages );
+		$canonical = self::repair_messages( $messages, 'snapshot' )['messages'];
 		if ( count( $canonical ) <= self::MAX_REPLAY_MESSAGES ) {
 			return array(
 				'messages'         => array_slice( $canonical, -self::MAX_REPLAY_MESSAGES ),
@@ -361,6 +368,8 @@ class PressArk_Replay_Integrity {
 			'inserted_missing_results' => max( 0, (int) ( $raw['inserted_missing_results'] ?? 0 ) ),
 			'dropped_orphan_results'   => max( 0, (int) ( $raw['dropped_orphan_results'] ?? 0 ) ),
 			'dropped_duplicate_results'=> max( 0, (int) ( $raw['dropped_duplicate_results'] ?? 0 ) ),
+			'dropped_incomplete_rounds'=> max( 0, (int) ( $raw['dropped_incomplete_rounds'] ?? 0 ) ),
+			'dropped_partial_results'  => max( 0, (int) ( $raw['dropped_partial_results'] ?? 0 ) ),
 			'dropped_messages'         => max( 0, (int) ( $raw['dropped_messages'] ?? 0 ) ),
 			'dropped_rounds'           => max( 0, (int) ( $raw['dropped_rounds'] ?? 0 ) ),
 			'kept_rounds'              => max( 0, (int) ( $raw['kept_rounds'] ?? 0 ) ),
@@ -480,6 +489,10 @@ class PressArk_Replay_Integrity {
 		if ( 'tool' === $role ) {
 			$tool_call_id = self::sanitize_string( (string) ( $message['tool_call_id'] ?? '' ) );
 			if ( '' === $tool_call_id ) {
+				return array();
+			}
+
+			if ( self::is_replay_placeholder_tool_content( $message['content'] ?? '' ) ) {
 				return array();
 			}
 
@@ -662,39 +675,60 @@ class PressArk_Replay_Integrity {
 		return array_values( array_unique( $ids ) );
 	}
 
-	private static function flush_pending_tool_results( array &$messages, ?array &$pending ): int {
-		if ( empty( $pending['ids'] ) ) {
+	private static function flush_pending_tool_round( array &$messages, ?array &$pending ): void {
+		if ( empty( $pending['assistant'] ) || empty( $pending['ids'] ) ) {
 			$pending = null;
-			return 0;
+			return;
 		}
 
-		$inserted = 0;
+		$messages[] = $pending['assistant'];
 		foreach ( $pending['ids'] as $tool_call_id ) {
 			if ( isset( $pending['results'][ $tool_call_id ] ) ) {
 				$messages[] = $pending['results'][ $tool_call_id ];
-				continue;
 			}
-
-			$messages[] = self::build_placeholder_tool_message( $tool_call_id );
-			$inserted++;
 		}
 
 		$pending = null;
-		return $inserted;
 	}
 
-	private static function build_placeholder_tool_message( string $tool_call_id ): array {
-		$payload = array(
-			'success'            => false,
-			'message'            => self::MISSING_TOOL_RESULT_MESSAGE,
-			'replay_placeholder' => true,
+	private static function discard_pending_tool_round( ?array &$pending ): array {
+		if ( ! is_array( $pending ) ) {
+			return array(
+				'rounds'  => 0,
+				'results' => 0,
+			);
+		}
+
+		$discarded = array(
+			'rounds'  => empty( $pending['assistant'] ) ? 0 : 1,
+			'results' => count( (array) ( $pending['results'] ?? array() ) ),
 		);
 
-		return array(
-			'role'         => 'tool',
-			'tool_call_id' => self::sanitize_string( $tool_call_id ),
-			'content'      => wp_json_encode( $payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES ),
-		);
+		$pending = null;
+		return $discarded;
+	}
+
+	private static function is_replay_placeholder_tool_content( $content ): bool {
+		if ( is_string( $content ) ) {
+			$decoded = json_decode( $content, true );
+		} elseif ( is_array( $content ) ) {
+			$decoded = $content;
+		} else {
+			$decoded = null;
+		}
+
+		if ( is_array( $decoded ) ) {
+			if ( ! empty( $decoded['replay_placeholder'] ) ) {
+				return true;
+			}
+
+			$message = self::sanitize_string( (string) ( $decoded['message'] ?? '' ) );
+			if ( self::MISSING_TOOL_RESULT_MESSAGE === $message ) {
+				return true;
+			}
+		}
+
+		return false;
 	}
 
 	private static function sanitize_event_list( array $events ): array {

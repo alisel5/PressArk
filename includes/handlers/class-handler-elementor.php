@@ -120,7 +120,9 @@ class PressArk_Handler_Elementor extends PressArk_Handler_Base {
 		$elementor   = new PressArk_Elementor();
 		$post_id     = intval( $params['post_id'] ?? 0 );
 		$widget_type = sanitize_text_field( $params['widget_type'] ?? '' );
-		$max_depth   = absint( $params['max_depth'] ?? 0 );
+		$max_depth   = isset( $params['max_depth'] ) && is_numeric( $params['max_depth'] )
+			? (int) $params['max_depth']
+			: 0;
 		$result      = $elementor->read_page( $post_id );
 		if ( isset( $result['error'] ) ) {
 			return array( 'success' => false, 'message' => $result['error'] );

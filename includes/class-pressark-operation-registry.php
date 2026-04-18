@@ -459,7 +459,15 @@ class PressArk_Operation_Registry {
 	public static function validate_input( string $name, array $params ): array {
 		$op = self::resolve( $name );
 		if ( ! $op ) {
-			return array( 'valid' => true );
+			$resolved = self::resolve_alias( $name );
+			return array(
+				'valid'   => false,
+				'message' => sprintf(
+					/* translators: %s: tool name the model attempted to call */
+					__( 'Unknown tool "%s". Use discover_tools to find a valid tool, or load_tools to add a group.', 'pressark' ),
+					sanitize_text_field( $resolved !== '' ? $resolved : $name )
+				),
+			);
 		}
 		return $op->validate_input( $params );
 	}
@@ -822,6 +830,7 @@ class PressArk_Operation_Registry {
 			array( 'load_tool_group', 'discovery', 'read', 'discovery', 'load_tool_group',      'none', null, 'Load tool schemas by group name', false ),
 			array( 'discover_tools',  'discovery', 'read', 'discovery', 'handle_discover_tools', 'none', null, 'Search for tools by natural-language query', false ),
 			array( 'load_tools',      'discovery', 'read', 'discovery', 'handle_load_tools',     'none', null, 'Load tool schemas by group or specific tool names', false ),
+			array( 'update_plan',     'discovery', 'read', 'discovery', 'handle_update_plan',    'none', null, 'Persist the active multi-step execution plan and current in-progress step', false ),
 		) );
 
 		// ── Resource Bridge (v5.1.0) ────────────────────────────
@@ -1053,7 +1062,7 @@ class PressArk_Operation_Registry {
 			array( 'list_variations',         'woocommerce', 'read', 'woo', 'list_variations',         'none', 'woocommerce', 'All variations for a variable product with prices and stock' ),
 			array( 'get_top_sellers',         'woocommerce', 'read', 'woo', 'get_top_sellers',         'none', 'woocommerce', 'Top selling products by revenue or quantity for a period' ),
 			array( 'get_order_statuses',      'woocommerce', 'read', 'woo', 'get_order_statuses',      'none', 'woocommerce', 'All registered order statuses including custom ones' ),
-			array( 'get_products_on_sale',    'woocommerce', 'read', 'woo', 'get_products_on_sale',    'none', 'woocommerce', 'Products on sale with discount percentages and end dates' ),
+			array( 'get_products_on_sale',    'woocommerce', 'read', 'woo', 'get_products_on_sale',    'none', 'woocommerce', 'Products on sale with raw pricing fields, discount values, and end dates' ),
 			array( 'customer_insights',       'woocommerce', 'read', 'woo', 'customer_insights',       'none', 'woocommerce', 'Customer segmentation via RFM: active, cooling, at-risk, churned' ),
 			array( 'list_product_attributes', 'woocommerce', 'read', 'woo', 'list_product_attributes', 'none', 'woocommerce', 'Global product attributes (Color, Size) and their terms' ),
 			array( 'category_report',         'woocommerce', 'read', 'woo', 'category_report',         'none', 'woocommerce', 'Sales performance by product category' ),
@@ -1069,7 +1078,7 @@ class PressArk_Operation_Registry {
 			array( 'create_product',       'woocommerce', 'confirm', 'woo', 'create_product',       'none', 'woocommerce', 'Create product with explicit regular_price and/or sale_price fields' ),
 			array( 'bulk_edit_products',   'woocommerce', 'confirm', 'woo', 'bulk_edit_products',   'none', 'woocommerce', 'Bulk update multiple products with explicit WooCommerce pricing fields; use clear_sale to remove a sale' ),
 			array( 'update_order',         'woocommerce', 'confirm', 'woo', 'update_order',         'none', 'woocommerce', 'Update order status or add a note' ),
-			array( 'manage_coupon',        'woocommerce', 'confirm', 'woo', 'manage_coupon',        'none', 'woocommerce', 'Create, edit, delete, or list coupons' ),
+			array( 'manage_coupon',        'woocommerce', 'confirm', 'woo', 'manage_coupon',        'none', 'woocommerce', 'Create, edit, delete, or list coupons with explicit restriction controls' ),
 			array( 'email_customer',       'woocommerce', 'confirm', 'woo', 'email_customer',       'none', 'woocommerce', 'Send personalized email to a customer' ),
 			array( 'moderate_review',      'woocommerce', 'confirm', 'woo', 'moderate_review',      'none', 'woocommerce', 'Approve, reject, spam, trash, or reply to a review' ),
 			array( 'reply_review',         'woocommerce', 'confirm', 'woo', 'reply_review',         'none', 'woocommerce', 'Reply to a product review as the current admin user' ),
@@ -1155,6 +1164,8 @@ class PressArk_Operation_Registry {
 		self::alias( 'bulk_moderate_reviews', 'bulk_reply_reviews' );
 		self::alias( 'seo_analysis',  'analyze_seo' );
 		self::alias( 'security_scan', 'scan_security' );
+		self::alias( 'moderate_comment',  'moderate_comments' );
+		self::alias( 'database_cleanup',  'cleanup_database' );
 
 		// ── Virtual group aliases (cross-group supersets) ────────
 		// 'content' = core tools + get_revision_history (health) + search_knowledge (index)
@@ -1648,6 +1659,46 @@ class PressArk_Operation_Registry {
 
 			// ── Content writes (preview flow) ───────────────────────
 
+			'manage_coupon' => array(
+				'search_hint'   => 'create edit coupon discount restrictions free shipping',
+				'interrupt'     => 'cancel',
+				'tags'          => array( 'woocommerce', 'coupons', 'discounts' ),
+				'idempotent'    => false,
+				'parameter_contract' => self::manage_coupon_parameter_contract(),
+				'model_guidance'     => array(
+					'Use individual_use=true when the coupon must not stack with other coupons.',
+					'Use exclude_sale_items=true when sale items must stay out of the discount.',
+					'Use product IDs and product_cat term IDs for coupon restrictions, not names.',
+				),
+				'read_invalidation' => array(
+					'scope'  => 'site',
+					'reason' => 'Coupon writes can stale coupon reads and downstream discount behavior summaries.',
+				),
+				'verification'  => array(
+					'strategy'     => 'none',
+					'read_tool'    => '',
+					'read_args'    => array(),
+					'check_fields' => array(),
+					'intensity'    => 'thorough',
+					'nudge'        => true,
+				),
+				'validate'      => static function ( array $params ): array {
+					$operation = sanitize_text_field( (string) ( $params['operation'] ?? '' ) );
+
+					if ( 'get' === $operation && empty( $params['coupon_id'] ) && empty( $params['code'] ) ) {
+						return array(
+							'valid'   => false,
+							'message' => 'manage_coupon get requires coupon_id or code.',
+						);
+					}
+
+					return array(
+						'valid'  => true,
+						'params' => $params,
+					);
+				},
+			),
+
 			'edit_content' => array(
 				'search_hint'   => 'edit update post page title content excerpt',
 				'interrupt'     => 'block',
@@ -1925,6 +1976,17 @@ class PressArk_Operation_Registry {
 				'model_guidance' => array(
 					'Load the smallest group that unblocks the next deterministic step.',
 					'Prefer named tool loads when the exact tool is already known.',
+				),
+			),
+
+			'update_plan' => array(
+				'search_hint'   => 'update execution plan steps in progress completed preview required',
+				'cache_ttl'     => 0,
+				'defer'         => 'always_load',
+				'tags'          => array( 'meta', 'planning' ),
+				'model_guidance' => array(
+					'Use update_plan before starting multi-step work that spans three or more distinct steps.',
+					'Keep exactly one step in_progress at a time and advance it immediately after real progress.',
 				),
 			),
 
@@ -3519,6 +3581,165 @@ class PressArk_Operation_Registry {
 			'required'   => array( 'products' ),
 			'compatibility_aliases' => array(
 				'products' => array( 'items' ),
+			),
+		);
+	}
+
+	/**
+	 * Authoritative contract for manage_coupon.
+	 *
+	 * @since 5.6.0
+	 */
+	private static function manage_coupon_parameter_contract(): array {
+		$id_list_schema = array(
+			'type'        => 'array',
+			'items'       => array(
+				'type'    => 'integer',
+				'minimum' => 1,
+			),
+			'maxItems'    => 100,
+			'uniqueItems' => true,
+		);
+
+		return array(
+			'type'       => 'object',
+			'strict'     => true,
+			'properties' => array(
+				'operation'                   => array(
+					'type'        => 'string',
+					'description' => 'Coupon operation to run.',
+					'enum'        => array( 'get', 'list', 'create', 'edit', 'delete' ),
+				),
+				'coupon_id'                   => array(
+					'type'        => 'integer',
+					'description' => 'WooCommerce coupon ID.',
+					'minimum'     => 1,
+				),
+				'code'                        => array(
+					'type'        => 'string',
+					'description' => 'Coupon code. Required for create and optional for get lookup or edit rename.',
+					'minLength'   => 1,
+				),
+				'discount_type'               => array(
+					'type'        => 'string',
+					'description' => 'Coupon discount type.',
+					'enum'        => array( 'percent', 'fixed_cart', 'fixed_product' ),
+					'default'     => 'percent',
+				),
+				'amount'                      => array(
+					'type'        => array( 'number', 'string' ),
+					'description' => 'Discount amount.',
+				),
+				'usage_limit'                 => array(
+					'type'        => 'integer',
+					'description' => 'Maximum total uses. Use 0 for unlimited.',
+					'minimum'     => 0,
+				),
+				'usage_limit_per_user'        => array(
+					'type'        => 'integer',
+					'description' => 'Maximum uses per customer. Use 0 for unlimited.',
+					'minimum'     => 0,
+				),
+				'expiry_date'                 => array(
+					'type'        => 'string',
+					'description' => 'Coupon expiration date in Y-m-d format.',
+					'pattern'     => '^\\d{4}-\\d{2}-\\d{2}$',
+				),
+				'minimum_amount'              => array(
+					'type'        => array( 'number', 'string' ),
+					'description' => 'Minimum cart subtotal required for the coupon.',
+				),
+				'maximum_amount'              => array(
+					'type'        => array( 'number', 'string' ),
+					'description' => 'Maximum cart subtotal allowed for the coupon.',
+				),
+				'individual_use'              => array(
+					'type'        => 'boolean',
+					'description' => 'Whether the coupon blocks stacking with other coupons.',
+					'default'     => false,
+				),
+				'free_shipping'               => array(
+					'type'        => 'boolean',
+					'description' => 'Whether the coupon also grants free shipping.',
+					'default'     => false,
+				),
+				'exclude_sale_items'          => array(
+					'type'        => 'boolean',
+					'description' => 'Whether sale items are excluded from the coupon discount.',
+					'default'     => false,
+				),
+				'product_ids'                 => array_merge(
+					$id_list_schema,
+					array( 'description' => 'Allowed product IDs. Use [] to clear on edit.' )
+				),
+				'excluded_product_ids'        => array_merge(
+					$id_list_schema,
+					array( 'description' => 'Excluded product IDs. Use [] to clear on edit.' )
+				),
+				'product_categories'          => array_merge(
+					$id_list_schema,
+					array( 'description' => 'Allowed product_cat term IDs. Use [] to clear on edit.' )
+				),
+				'excluded_product_categories' => array_merge(
+					$id_list_schema,
+					array( 'description' => 'Excluded product_cat term IDs. Use [] to clear on edit.' )
+				),
+				'email_restrictions'          => array(
+					'type'        => 'array',
+					'description' => 'Allowed billing email restriction strings. Use [] to clear on edit.',
+					'items'       => array(
+						'type'      => 'string',
+						'minLength' => 1,
+					),
+					'maxItems'    => 50,
+					'uniqueItems' => true,
+				),
+				'limit'                       => array(
+					'type'        => 'integer',
+					'description' => 'Maximum coupons to list.',
+					'default'     => 20,
+					'minimum'     => 1,
+					'maximum'     => 50,
+				),
+				'orderby'                     => array(
+					'type'        => 'string',
+					'description' => 'List sort key such as date or title.',
+					'minLength'   => 1,
+				),
+			),
+			'required'   => array( 'operation' ),
+			'dependencies' => array(
+				array(
+					'field'   => 'operation',
+					'values'  => array( 'create' ),
+					'requires'=> array( 'code' ),
+					'message' => 'manage_coupon create requires code.',
+				),
+				array(
+					'field'   => 'operation',
+					'values'  => array( 'edit', 'delete' ),
+					'requires'=> array( 'coupon_id' ),
+					'message' => 'manage_coupon edit/delete requires coupon_id.',
+				),
+				array(
+					'field'        => 'limit',
+					'field_values' => array(
+						'operation' => array( 'list' ),
+					),
+					'message'      => 'limit only applies when operation is list.',
+				),
+				array(
+					'field'        => 'orderby',
+					'field_values' => array(
+						'operation' => array( 'list' ),
+					),
+					'message'      => 'orderby only applies when operation is list.',
+				),
+			),
+			'compatibility_aliases' => array(
+				'operation'   => array( 'action' ),
+				'coupon_id'   => array( 'id' ),
+				'expiry_date' => array( 'date_expires' ),
 			),
 		);
 	}

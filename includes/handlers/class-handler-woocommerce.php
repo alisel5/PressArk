@@ -1785,29 +1785,7 @@ class PressArk_Handler_WooCommerce extends PressArk_Handler_Base {
 
 				return array(
 					'success' => true,
-					'data'    => array(
-						'id'                   => $coupon->get_id(),
-						'code'                 => $coupon->get_code(),
-						'discount_type'        => $coupon->get_discount_type(),
-						'amount'               => $coupon->get_amount(),
-						'usage_count'          => $coupon->get_usage_count(),
-						'usage_limit'          => $coupon->get_usage_limit() ?: 'unlimited',
-						'usage_limit_per_user' => $coupon->get_usage_limit_per_user() ?: 'unlimited',
-						'is_expired'           => $coupon->get_date_expires()
-							&& $coupon->get_date_expires()->getTimestamp() < time(),
-						'date_expires'         => $coupon->get_date_expires()
-							? $coupon->get_date_expires()->date( 'Y-m-d' )
-							: null,
-						'minimum_amount'       => $coupon->get_minimum_amount(),
-						'maximum_amount'       => $coupon->get_maximum_amount(),
-						'individual_use'       => $coupon->get_individual_use(),
-						'free_shipping'        => $coupon->get_free_shipping(),
-						'exclude_sale_items'   => $coupon->get_exclude_sale_items(),
-						'email_restrictions'   => $coupon->get_email_restrictions(),
-						'product_ids'          => $coupon->get_product_ids(),
-						'product_categories'   => $coupon->get_product_categories(),
-						'used_by_count'        => count( $coupon->get_used_by() ),
-					),
+					'data'    => $this->coupon_snapshot( $coupon ),
 				);
 
 			case 'list':
@@ -1815,7 +1793,7 @@ class PressArk_Handler_WooCommerce extends PressArk_Handler_Base {
 					'post_type'              => 'shop_coupon',
 					'post_status'            => 'publish',
 					'numberposts'            => min( absint( $params['limit'] ?? 20 ), 50 ),
-					'orderby'                => $params['orderby'] ?? 'date',
+					'orderby'                => sanitize_key( (string) ( $params['orderby'] ?? 'date' ) ),
 					'order'                  => 'DESC',
 					'update_post_meta_cache' => false,
 				) );
@@ -1845,30 +1823,17 @@ class PressArk_Handler_WooCommerce extends PressArk_Handler_Base {
 
 				$coupon = new \WC_Coupon();
 				$coupon->set_code( $code );
-				$coupon->set_discount_type( sanitize_text_field( $params['discount_type'] ?? 'percent' ) );
-				if ( isset( $params['amount'] ) ) {
-					$coupon->set_amount( floatval( $params['amount'] ) );
-				}
-				if ( isset( $params['usage_limit'] ) ) {
-					$coupon->set_usage_limit( absint( $params['usage_limit'] ) );
-				}
-				if ( ! empty( $params['expiry_date'] ) ) {
-					$coupon->set_date_expires( sanitize_text_field( $params['expiry_date'] ) );
-				}
-				if ( isset( $params['minimum_amount'] ) ) {
-					$coupon->set_minimum_amount( floatval( $params['minimum_amount'] ) );
-				}
-				if ( isset( $params['individual_use'] ) ) {
-					$coupon->set_individual_use( (bool) $params['individual_use'] );
-				}
+				$this->apply_coupon_changes( $coupon, $params );
 
 				$coupon->save();
 				$this->logger->log( 'manage_coupon', $coupon->get_id(), 'shop_coupon', null, wp_json_encode( array( 'code' => $code, 'operation' => 'create' ) ) );
 
 				return array(
-					'success' => true,
+					'success'   => true,
+					'coupon_id' => $coupon->get_id(),
+					'data'      => $this->coupon_snapshot( $coupon ),
 					/* translators: 1: coupon code, 2: coupon ID. */
-					'message' => sprintf( __( 'Created coupon "%1$s" (ID: %2$d).', 'pressark' ), $code, $coupon->get_id() ),
+					'message'   => sprintf( __( 'Created coupon "%1$s" (ID: %2$d).', 'pressark' ), $code, $coupon->get_id() ),
 				);
 
 			case 'edit':
@@ -1880,33 +1845,15 @@ class PressArk_Handler_WooCommerce extends PressArk_Handler_Base {
 				if ( ! $coupon->get_id() ) {
 					return array( 'success' => false, 'message' => __( 'Coupon not found.', 'pressark' ) );
 				}
-				if ( isset( $params['code'] ) ) {
-					$coupon->set_code( sanitize_text_field( $params['code'] ) );
-				}
-				if ( isset( $params['discount_type'] ) ) {
-					$coupon->set_discount_type( sanitize_text_field( $params['discount_type'] ) );
-				}
-				if ( isset( $params['amount'] ) ) {
-					$coupon->set_amount( floatval( $params['amount'] ) );
-				}
-				if ( isset( $params['usage_limit'] ) ) {
-					$coupon->set_usage_limit( absint( $params['usage_limit'] ) );
-				}
-				if ( ! empty( $params['expiry_date'] ) ) {
-					$coupon->set_date_expires( sanitize_text_field( $params['expiry_date'] ) );
-				}
-				if ( isset( $params['minimum_amount'] ) ) {
-					$coupon->set_minimum_amount( floatval( $params['minimum_amount'] ) );
-				}
-				if ( isset( $params['individual_use'] ) ) {
-					$coupon->set_individual_use( (bool) $params['individual_use'] );
-				}
+				$this->apply_coupon_changes( $coupon, $params );
 				$coupon->save();
 
 				return array(
-					'success' => true,
+					'success'   => true,
+					'coupon_id' => $coupon->get_id(),
+					'data'      => $this->coupon_snapshot( $coupon ),
 					/* translators: %s: coupon code. */
-					'message' => sprintf( __( 'Updated coupon "%s".', 'pressark' ), $coupon->get_code() ),
+					'message'   => sprintf( __( 'Updated coupon "%s".', 'pressark' ), $coupon->get_code() ),
 				);
 
 			case 'delete':
@@ -1930,6 +1877,154 @@ class PressArk_Handler_WooCommerce extends PressArk_Handler_Base {
 				/* translators: %s: requested coupon operation name. */
 				return array( 'success' => false, 'message' => sprintf( __( 'Unknown coupon operation: %s', 'pressark' ), $operation ) );
 		}
+	}
+
+
+	/**
+	 * Apply explicit coupon field changes for create/edit flows.
+	 */
+	private function apply_coupon_changes( \WC_Coupon $coupon, array $params ): void {
+		if ( array_key_exists( 'code', $params ) ) {
+			$coupon->set_code( sanitize_text_field( (string) $params['code'] ) );
+		}
+		if ( array_key_exists( 'discount_type', $params ) ) {
+			$coupon->set_discount_type( sanitize_text_field( (string) $params['discount_type'] ) );
+		}
+		if ( array_key_exists( 'amount', $params ) ) {
+			$coupon->set_amount( $this->coupon_decimal_value( $params['amount'] ) );
+		}
+		if ( array_key_exists( 'usage_limit', $params ) ) {
+			$coupon->set_usage_limit( $this->coupon_integer_value( $params['usage_limit'] ) );
+		}
+		if ( ! empty( $params['expiry_date'] ) ) {
+			$coupon->set_date_expires( sanitize_text_field( (string) $params['expiry_date'] ) );
+		}
+		if ( array_key_exists( 'minimum_amount', $params ) ) {
+			$coupon->set_minimum_amount( $this->coupon_decimal_value( $params['minimum_amount'] ) );
+		}
+		if ( array_key_exists( 'maximum_amount', $params ) ) {
+			$coupon->set_maximum_amount( $this->coupon_decimal_value( $params['maximum_amount'] ) );
+		}
+		if ( array_key_exists( 'individual_use', $params ) ) {
+			$coupon->set_individual_use( $this->coupon_boolean_value( $params['individual_use'] ) );
+		}
+		if ( array_key_exists( 'free_shipping', $params ) ) {
+			$coupon->set_free_shipping( $this->coupon_boolean_value( $params['free_shipping'] ) );
+		}
+		if ( array_key_exists( 'exclude_sale_items', $params ) ) {
+			$coupon->set_exclude_sale_items( $this->coupon_boolean_value( $params['exclude_sale_items'] ) );
+		}
+		if ( array_key_exists( 'usage_limit_per_user', $params ) ) {
+			$coupon->set_usage_limit_per_user( $this->coupon_integer_value( $params['usage_limit_per_user'] ) );
+		}
+		if ( array_key_exists( 'product_ids', $params ) ) {
+			$coupon->set_product_ids( $this->coupon_normalize_id_list( $params['product_ids'] ) );
+		}
+		if ( array_key_exists( 'excluded_product_ids', $params ) && method_exists( $coupon, 'set_excluded_product_ids' ) ) {
+			$coupon->set_excluded_product_ids( $this->coupon_normalize_id_list( $params['excluded_product_ids'] ) );
+		}
+		if ( array_key_exists( 'product_categories', $params ) ) {
+			$coupon->set_product_categories( $this->coupon_normalize_id_list( $params['product_categories'] ) );
+		}
+		if ( array_key_exists( 'excluded_product_categories', $params ) && method_exists( $coupon, 'set_excluded_product_categories' ) ) {
+			$coupon->set_excluded_product_categories( $this->coupon_normalize_id_list( $params['excluded_product_categories'] ) );
+		}
+		if ( array_key_exists( 'email_restrictions', $params ) ) {
+			$coupon->set_email_restrictions( $this->coupon_normalize_string_list( $params['email_restrictions'] ) );
+		}
+	}
+
+	/**
+	 * Build a stable coupon readback payload.
+	 */
+	private function coupon_snapshot( \WC_Coupon $coupon ): array {
+		$data = array(
+			'id'                   => $coupon->get_id(),
+			'code'                 => $coupon->get_code(),
+			'discount_type'        => $coupon->get_discount_type(),
+			'amount'               => $coupon->get_amount(),
+			'usage_count'          => $coupon->get_usage_count(),
+			'usage_limit'          => $coupon->get_usage_limit() ?: 'unlimited',
+			'usage_limit_per_user' => $coupon->get_usage_limit_per_user() ?: 'unlimited',
+			'is_expired'           => $coupon->get_date_expires()
+				&& $coupon->get_date_expires()->getTimestamp() < time(),
+			'date_expires'         => $coupon->get_date_expires()
+				? $coupon->get_date_expires()->date( 'Y-m-d' )
+				: null,
+			'minimum_amount'       => $coupon->get_minimum_amount(),
+			'maximum_amount'       => $coupon->get_maximum_amount(),
+			'individual_use'       => $coupon->get_individual_use(),
+			'free_shipping'        => $coupon->get_free_shipping(),
+			'exclude_sale_items'   => $coupon->get_exclude_sale_items(),
+			'email_restrictions'   => $coupon->get_email_restrictions(),
+			'product_ids'          => $coupon->get_product_ids(),
+			'product_categories'   => $coupon->get_product_categories(),
+			'used_by_count'        => count( $coupon->get_used_by() ),
+		);
+
+		$data['excluded_product_ids'] = method_exists( $coupon, 'get_excluded_product_ids' )
+			? array_values( array_map( 'intval', (array) $coupon->get_excluded_product_ids() ) )
+			: array();
+		$data['excluded_product_categories'] = method_exists( $coupon, 'get_excluded_product_categories' )
+			? array_values( array_map( 'intval', (array) $coupon->get_excluded_product_categories() ) )
+			: array();
+
+		return $data;
+	}
+
+	private function coupon_boolean_value( $value ): bool {
+		if ( is_bool( $value ) ) {
+			return $value;
+		}
+
+		return wc_string_to_bool( (string) $value );
+	}
+
+	private function coupon_decimal_value( $value ): string {
+		if ( null === $value ) {
+			return '';
+		}
+
+		if ( is_string( $value ) && '' === trim( $value ) ) {
+			return '';
+		}
+
+		return (string) wc_format_decimal( wc_clean( $value ) );
+	}
+
+	private function coupon_integer_value( $value ): int {
+		return absint( $value );
+	}
+
+	private function coupon_normalize_id_list( $value ): array {
+		if ( ! is_array( $value ) ) {
+			$value = null === $value || '' === $value
+				? array()
+				: preg_split( '/[\s,]+/', (string) $value );
+		}
+
+		$ids = array_map( 'absint', (array) $value );
+		$ids = array_values( array_filter( $ids ) );
+
+		return array_values( array_unique( $ids ) );
+	}
+
+	private function coupon_normalize_string_list( $value ): array {
+		if ( ! is_array( $value ) ) {
+			$value = null === $value || '' === $value
+				? array()
+				: preg_split( '/[\r\n,]+/', (string) $value );
+		}
+
+		$strings = array_map(
+			static function ( $item ): string {
+				return sanitize_text_field( (string) $item );
+			},
+			(array) $value
+		);
+		$strings = array_values( array_filter( $strings ) );
+
+		return array_values( array_unique( $strings ) );
 	}
 
 
@@ -4439,6 +4534,18 @@ class PressArk_Handler_WooCommerce extends PressArk_Handler_Base {
 		$on_sale_ids = wc_get_product_ids_on_sale();
 		$limit       = min( absint( $params['limit'] ?? 20 ), 100 );
 		$on_sale_ids = array_slice( $on_sale_ids, 0, $limit );
+		$price_decimals = wc_get_price_decimals();
+		$raw_price = static function ( $value ) use ( $price_decimals ): ?float {
+			$value = is_scalar( $value ) ? trim( (string) $value ) : '';
+			if ( '' === $value ) {
+				return null;
+			}
+
+			return round( (float) wc_format_decimal( $value ), $price_decimals );
+		};
+		$format_price = static function ( ?float $value ): ?string {
+			return null === $value ? null : wc_price( $value );
+		};
 
 		$products = array();
 		foreach ( $on_sale_ids as $id ) {
@@ -4446,17 +4553,35 @@ class PressArk_Handler_WooCommerce extends PressArk_Handler_Base {
 			if ( ! $p ) continue;
 
 			$sale_end = $p->get_date_on_sale_to();
+			$regular_price    = $raw_price( $p->get_regular_price() );
+			$sale_price       = $raw_price( $p->get_sale_price() );
+			$price            = $raw_price( $p->get_price() );
+			$discount_amount  = null;
+			$discount_percent = null;
+			$discount_pct     = null;
+
+			if ( null !== $regular_price && null !== $sale_price && $regular_price > 0 && $sale_price < $regular_price ) {
+				$discount_amount  = round( $regular_price - $sale_price, $price_decimals );
+				$discount_percent = round( ( $discount_amount / $regular_price ) * 100, 2 );
+				$discount_pct     = round( $discount_percent ) . '%';
+			}
+
 			$products[] = array(
-				'id'            => $id,
-				'name'          => $p->get_name(),
-				'type'          => $p->get_type(),
-				'regular_price' => wc_price( $p->get_regular_price() ),
-				'sale_price'    => wc_price( $p->get_sale_price() ),
-				'discount_pct'  => $p->get_regular_price() > 0
-					? round( ( 1 - ( $p->get_sale_price() / $p->get_regular_price() ) ) * 100 ) . '%'
-					: null,
-				'sale_ends'     => $sale_end ? $sale_end->date( 'Y-m-d' ) : null,
-				'days_left'     => $sale_end
+				'id'                => $id,
+				'name'              => $p->get_name(),
+				'type'              => $p->get_type(),
+				'price'             => $price,
+				'price_formatted'   => $format_price( $price ),
+				'regular_price'     => $format_price( $regular_price ),
+				'regular_price_raw' => $regular_price,
+				'sale_price'        => $format_price( $sale_price ),
+				'sale_price_raw'    => $sale_price,
+				'on_sale'           => (bool) $p->is_on_sale(),
+				'discount_amount'   => $discount_amount,
+				'discount_percent'  => $discount_percent,
+				'discount_pct'      => $discount_pct,
+				'sale_ends'         => $sale_end ? $sale_end->date( 'Y-m-d' ) : null,
+				'days_left'         => $sale_end
 					? max( 0, (int) ceil( ( $sale_end->getTimestamp() - time() ) / 86400 ) )
 					: null,
 			);
@@ -4468,10 +4593,12 @@ class PressArk_Handler_WooCommerce extends PressArk_Handler_Base {
 		);
 
 		return array(
-			'success'       => true,
-			'total_on_sale' => count( wc_get_product_ids_on_sale() ),
-			'shown'         => count( $products ),
-			'products'      => $products,
+			'success'        => true,
+			'currency'       => get_woocommerce_currency(),
+			'price_decimals' => $price_decimals,
+			'total_on_sale'  => count( wc_get_product_ids_on_sale() ),
+			'shown'          => count( $products ),
+			'products'       => $products,
 			'note'          => __( 'Sorted by sale end date — soonest expiring first.', 'pressark' ),
 		);
 	}
@@ -5647,15 +5774,71 @@ class PressArk_Handler_WooCommerce extends PressArk_Handler_Base {
 	 */
 	public function preview_manage_coupon( array $params, array $action ): array {
 		$coupon_op = $params['operation'] ?? '';
-		return array(
-			'changes' => array(
-				array(
-					'field'  => ucfirst( $coupon_op ) . ' Coupon',
-					'before' => 'delete' === $coupon_op ? ( '#' . ( $params['coupon_id'] ?? '?' ) ) : '—',
-					'after'  => 'delete' === $coupon_op ? __( 'Deleted', 'pressark' ) : ( $params['code'] ?? __( 'Coupon', 'pressark' ) ) . ( ! empty( $params['amount'] ) ? ' (' . $params['amount'] . ( 'percent' === ( $params['discount_type'] ?? 'percent' ) ? '%' : '' ) . ' off)' : '' ),
-				),
+		$changes   = array(
+			array(
+				'field'  => ucfirst( $coupon_op ) . ' Coupon',
+				'before' => 'delete' === $coupon_op ? ( '#' . ( $params['coupon_id'] ?? '?' ) ) : '—',
+				'after'  => 'delete' === $coupon_op ? __( 'Deleted', 'pressark' ) : ( $params['code'] ?? __( 'Coupon', 'pressark' ) ) . ( ! empty( $params['amount'] ) ? ' (' . $params['amount'] . ( 'percent' === ( $params['discount_type'] ?? 'percent' ) ? '%' : '' ) . ' off)' : '' ),
 			),
 		);
+		$text_map  = array(
+			'minimum_amount'       => __( 'Minimum spend', 'pressark' ),
+			'maximum_amount'       => __( 'Maximum spend', 'pressark' ),
+			'usage_limit'          => __( 'Usage limit', 'pressark' ),
+			'usage_limit_per_user' => __( 'Per-user limit', 'pressark' ),
+		);
+		$bool_map  = array(
+			'individual_use'     => __( 'Individual use only', 'pressark' ),
+			'free_shipping'      => __( 'Free shipping', 'pressark' ),
+			'exclude_sale_items' => __( 'Exclude sale items', 'pressark' ),
+		);
+		$list_map  = array(
+			'product_ids'                 => __( 'Allowed products', 'pressark' ),
+			'excluded_product_ids'        => __( 'Excluded products', 'pressark' ),
+			'product_categories'          => __( 'Allowed categories', 'pressark' ),
+			'excluded_product_categories' => __( 'Excluded categories', 'pressark' ),
+			'email_restrictions'          => __( 'Email restrictions', 'pressark' ),
+		);
+
+		if ( in_array( $coupon_op, array( 'create', 'edit' ), true ) ) {
+			foreach ( $text_map as $field => $label ) {
+				if ( array_key_exists( $field, $params ) ) {
+					$changes[] = array(
+						'field'  => $label,
+						'before' => '—',
+						'after'  => (string) $params[ $field ],
+					);
+				}
+			}
+
+			foreach ( $bool_map as $field => $label ) {
+				if ( array_key_exists( $field, $params ) ) {
+					$changes[] = array(
+						'field'  => $label,
+						'before' => '—',
+						'after'  => $this->coupon_boolean_value( $params[ $field ] ) ? 'true' : 'false',
+					);
+				}
+			}
+
+			foreach ( $list_map as $field => $label ) {
+				if ( ! array_key_exists( $field, $params ) ) {
+					continue;
+				}
+
+				$value = 'email_restrictions' === $field
+					? $this->coupon_normalize_string_list( $params[ $field ] )
+					: $this->coupon_normalize_id_list( $params[ $field ] );
+
+				$changes[] = array(
+					'field'  => $label,
+					'before' => '—',
+					'after'  => empty( $value ) ? '[]' : implode( ', ', array_map( 'strval', $value ) ),
+				);
+			}
+		}
+
+		return array( 'changes' => $changes );
 	}
 
 	/**
