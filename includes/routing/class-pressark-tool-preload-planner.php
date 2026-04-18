@@ -68,7 +68,7 @@ class PressArk_Tool_Preload_Planner {
 		$planning_decision['preloaded_groups']  = $groups;
 		$planning_decision['max_discover_calls']= 0;
 
-		if ( defined( 'PRESSARK_DEBUG_ROUTE' ) && PRESSARK_DEBUG_ROUTE ) {
+		if ( defined( 'PRESSARK_DEBUG_ROUTE' ) && PRESSARK_DEBUG_ROUTE && class_exists( 'PressArk_Planning_Policy' ) && PressArk_Planning_Policy::route_debug_env_ok() ) {
 			$log_path = defined( 'PRESSARK_DEBUG_ROUTE_LOG' ) ? (string) PRESSARK_DEBUG_ROUTE_LOG : '/tmp/pressark-route.log';
 			@file_put_contents(
 				$log_path,

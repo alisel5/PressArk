@@ -6545,7 +6545,7 @@ class PressArk_Agent {
 			),
 			'inspector' => array(),
 		);
-		if ( defined( 'PRESSARK_DEBUG_ROUTE' ) && PRESSARK_DEBUG_ROUTE ) {
+		if ( defined( 'PRESSARK_DEBUG_ROUTE' ) && PRESSARK_DEBUG_ROUTE && class_exists( 'PressArk_Planning_Policy' ) && PressArk_Planning_Policy::route_debug_env_ok() ) {
 			$log_path = defined( 'PRESSARK_DEBUG_ROUTE_LOG' ) ? (string) PRESSARK_DEBUG_ROUTE_LOG : '/tmp/pressark-route.log';
 			@file_put_contents(
 				$log_path,

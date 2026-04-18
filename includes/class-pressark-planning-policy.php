@@ -197,7 +197,7 @@ class PressArk_Planning_Policy {
 			|| ( $async_score >= $this->async_hard_threshold() && $writes_likely )
 			|| ( $needs_discovery && $writes_likely && $risk_score >= 5 );
 
-		if ( defined( 'PRESSARK_DEBUG_ROUTE' ) && PRESSARK_DEBUG_ROUTE ) {
+		if ( defined( 'PRESSARK_DEBUG_ROUTE' ) && PRESSARK_DEBUG_ROUTE && self::route_debug_env_ok() ) {
 			$log_path = defined( 'PRESSARK_DEBUG_ROUTE_LOG' ) ? (string) PRESSARK_DEBUG_ROUTE_LOG : '/tmp/pressark-route.log';
 			@file_put_contents(
 				$log_path,
@@ -641,5 +641,25 @@ class PressArk_Planning_Policy {
 		return class_exists( 'PressArk_Task_Queue' )
 			? (int) PressArk_Task_Queue::ASYNC_THRESHOLD
 			: 3;
+	}
+
+	/**
+	 * Belt-and-suspenders check for route debug logging: only emit when the
+	 * PRESSARK_DEBUG_ROUTE constant *and* a dev environment marker are set.
+	 * Keeps prod quiet even if someone flips the constant by accident.
+	 */
+	public static function route_debug_env_ok(): bool {
+		if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
+			return true;
+		}
+		$host = strtolower( (string) ( $_SERVER['HTTP_HOST'] ?? '' ) );
+		if ( '' === $host ) {
+			return false;
+		}
+		return 'localhost' === $host
+			|| 0 === strpos( $host, '127.0.0.1' )
+			|| str_ends_with( $host, '.local' )
+			|| str_ends_with( $host, '.test' )
+			|| preg_match( '/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/', $host ) === 1;
 	}
 }

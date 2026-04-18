@@ -1587,7 +1587,7 @@ class PressArk_Orchestration_Service {
 	 * @return WP_REST_Response
 	 */
 	public function handle_chat( WP_REST_Request $request ): WP_REST_Response {
-		if ( defined( 'PRESSARK_DEBUG_ROUTE' ) && PRESSARK_DEBUG_ROUTE ) {
+		if ( defined( 'PRESSARK_DEBUG_ROUTE' ) && PRESSARK_DEBUG_ROUTE && class_exists( 'PressArk_Planning_Policy' ) && PressArk_Planning_Policy::route_debug_env_ok() ) {
 			$log_path = defined( 'PRESSARK_DEBUG_ROUTE_LOG' ) ? (string) PRESSARK_DEBUG_ROUTE_LOG : '/tmp/pressark-route.log';
 			@file_put_contents(
 				$log_path,
@@ -1641,6 +1641,9 @@ class PressArk_Orchestration_Service {
 
 	private function log_plan_invoke( string $tag, WP_REST_Request $request ): void {
 		if ( ! defined( 'PRESSARK_DEBUG_ROUTE' ) || ! PRESSARK_DEBUG_ROUTE ) {
+			return;
+		}
+		if ( ! class_exists( 'PressArk_Planning_Policy' ) || ! PressArk_Planning_Policy::route_debug_env_ok() ) {
 			return;
 		}
 		$log_path = defined( 'PRESSARK_DEBUG_ROUTE_LOG' ) ? (string) PRESSARK_DEBUG_ROUTE_LOG : '/tmp/pressark-route.log';
