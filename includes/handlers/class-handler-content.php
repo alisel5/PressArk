@@ -271,6 +271,16 @@ class PressArk_Handler_Content extends PressArk_Handler_Base {
 		// Index status.
 		$indexed = $this->is_post_indexed( $post_id );
 
+		// Builder detection — surface the page builder up-front so the model
+		// doesn't have to preflight every edit with elementor_read_page just
+		// to find out whether to use Elementor tools or standard WP tools.
+		// "elementor" when Elementor owns the layout, "classic" otherwise
+		// (block editor / Gutenberg / raw HTML all classify as classic for
+		// routing purposes — they all use standard tools).
+		$builder = ( 'builder' === (string) get_post_meta( $post_id, '_elementor_edit_mode', true ) )
+			? 'elementor'
+			: 'classic';
+
 		return array(
 			'success' => true,
 			'message' => sprintf(
@@ -287,6 +297,7 @@ class PressArk_Handler_Content extends PressArk_Handler_Base {
 				'excerpt'       => $excerpt,
 				'word_count'    => $word_count,
 				'reading_level' => $readability,
+				'builder'       => $builder,
 				'last_modified' => human_time_diff( strtotime( $post->post_modified ) ) . ' ago',
 				'seo'           => array(
 					'title_ok' => strlen( $seo_title ) >= 30 && strlen( $seo_title ) <= 60,

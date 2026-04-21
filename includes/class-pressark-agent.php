@@ -733,6 +733,16 @@ class PressArk_Agent {
 			return false;
 		}
 
+		// ── Any sentence-final "?" anywhere in the response → awaiting user.
+		// The original first-line-only check missed trailing questions like
+		// "Yes, I'm here. What would you like to work on?" which pushed the
+		// agent loop into a grounding-retry even though the model had clearly
+		// asked the user something. Using /m so `$` matches end-of-line inside
+		// multi-line replies; /u so unicode ? variants still match.
+		if ( preg_match( '/\?\s*$/mu', $text ) ) {
+			return true;
+		}
+
 		$lines = preg_split( '/\r\n|\r|\n/', $text );
 		$lead  = '';
 		foreach ( (array) $lines as $line ) {
@@ -1296,6 +1306,58 @@ class PressArk_Agent {
 			$tokens[] = (string) $post_id;
 		}
 
+		if ( 'read_resource' === sanitize_key( $tool_name ) ) {
+			$tokens = array_merge( $tokens, $this->extract_read_resource_target_tokens( $args ) );
+		}
+
+		return array_values( array_unique( array_filter( $tokens ) ) );
+	}
+
+	private function extract_read_resource_target_tokens( array $args ): array {
+		$uri = sanitize_text_field( (string) ( $args['uri'] ?? '' ) );
+		if ( '' === $uri ) {
+			return array();
+		}
+
+		if (
+			! class_exists( 'PressArk_Tool_Result_Artifacts' )
+			|| ! method_exists( 'PressArk_Tool_Result_Artifacts', 'is_tool_result_uri' )
+			|| ! PressArk_Tool_Result_Artifacts::is_tool_result_uri( $uri )
+			|| ! method_exists( 'PressArk_Tool_Result_Artifacts', 'read_resource' )
+		) {
+			return array();
+		}
+
+		$artifact = PressArk_Tool_Result_Artifacts::read_resource(
+			$uri,
+			function_exists( 'get_current_user_id' ) ? (int) get_current_user_id() : 0
+		);
+		if ( empty( $artifact['success'] ) ) {
+			return array();
+		}
+
+		$meta = class_exists( 'PressArk_Read_Metadata' )
+			? PressArk_Read_Metadata::sanitize_snapshot( $artifact['data']['meta'] ?? array() )
+			: ( is_array( $artifact['data']['meta'] ?? null ) ? (array) $artifact['data']['meta'] : array() );
+		if ( empty( $meta ) ) {
+			return array();
+		}
+
+		$tokens = array();
+		foreach ( (array) ( $meta['target_post_ids'] ?? array() ) as $target_post_id ) {
+			$target_post_id = absint( $target_post_id );
+			if ( $target_post_id > 0 ) {
+				$tokens[] = (string) $target_post_id;
+			}
+		}
+
+		foreach ( (array) ( $meta['resource_uris'] ?? array() ) as $resource_uri ) {
+			$resource_uri = $this->normalize_plan_match_token( (string) $resource_uri );
+			if ( '' !== $resource_uri ) {
+				$tokens[] = $resource_uri;
+			}
+		}
+
 		return array_values( array_unique( array_filter( $tokens ) ) );
 	}
 
@@ -1427,6 +1489,17 @@ class PressArk_Agent {
 			if ( false !== strpos( $tool_haystack, str_replace( '_', ' ', $expected_tool ) ) ) {
 				return true;
 			}
+
+			// Step has an explicit `tool_name` contract and we already tried
+			// both strict and fuzzy matching — neither passed. Reject here
+			// instead of falling through to keyword matching, which is a
+			// legacy fallback for steps that never declared a `tool_name`.
+			// Without this guard, e.g. a step with tool_name=get_products_on_sale
+			// would accept a bulk_edit_products call because both share the
+			// keyword "products" (and the bulk_edit args carry "sale"), which
+			// is exactly the silent-mismatch bug that lets the model jump to
+			// a pending step without updating the plan.
+			return false;
 		}
 
 		$keywords = $this->extract_step_keyword_tokens( $current_step );
@@ -1703,39 +1776,35 @@ class PressArk_Agent {
 			return null;
 		}
 
-		// Grounding-phase exemption: when no plan steps exist yet, allow
-		// meta tools (discover_tools / load_tools / load_tool_group) and any
-		// read-only tool through. The grounding directive explicitly tells
-		// the model to inspect with read tools FIRST, then build the plan
-		// from those reads — without this exemption the model is stuck in a
-		// catch-22 (can't read before update_plan, can't write a useful plan
-		// without having read anything). In plan mode the tool surface is
-		// already filtered to read-only + meta tools so this is safe; once
-		// the model calls update_plan and an in-progress step exists, the
-		// strict step-matching guard below kicks back in.
-		$existing_plan_steps = $checkpoint->get_plan_steps();
-		if ( empty( $existing_plan_steps ) ) {
-			$contract = $this->resolve_tool_contract( $tool_name, $args );
-			if (
-				in_array( $tool_name, array( 'discover_tools', 'load_tools', 'load_tool_group' ), true )
-				|| ! empty( $contract['readonly'] )
-			) {
-				return null;
-			}
+		// Read-only and meta tools are never gated by the plan-guard,
+		// regardless of plan state. Reads are grounding actions — the model
+		// must be free to branch, re-read, or re-verify at any point in the
+		// chain without first pivoting the plan. Meta tools (discover_tools /
+		// load_tools / load_tool_group) are session-management, not plan
+		// steps. Only write tools (preview/confirm capability) go through
+		// the step-matching guard below, because writes are the ones that
+		// must be mirrored on the plan ledger so preview/keep can mark the
+		// right step completed without triggering a duplicate write.
+		$contract = $this->resolve_tool_contract( $tool_name, $args );
+		if (
+			in_array( $tool_name, array( 'discover_tools', 'load_tools', 'load_tool_group' ), true )
+			|| ! empty( $contract['readonly'] )
+		) {
+			return null;
 		}
 
 		if ( ! $this->has_active_plan_step( $checkpoint ) ) {
-			return 'You must call update_plan first and set exactly one step to in_progress';
+			return 'Re-emit BOTH `update_plan` and this tool in the SAME assistant response as parallel tool_calls (not sequential rounds). Your `update_plan` must set exactly ONE step to `in_progress` whose tool matches the one you are calling — otherwise this write is rejected again, and without that plan step the harness cannot track the write through preview/keep, risking a duplicate write after the user confirms.';
 		}
 
 		$current_step = $this->get_in_progress_step( $checkpoint );
 		if ( empty( $current_step ) ) {
-			return 'You must call update_plan first and set exactly one step to in_progress';
+			return 'Re-emit BOTH `update_plan` and this tool in the SAME assistant response as parallel tool_calls (not sequential rounds). Your `update_plan` must set exactly ONE step to `in_progress` whose tool matches the one you are calling — otherwise this write is rejected again, and without that plan step the harness cannot track the write through preview/keep, risking a duplicate write after the user confirms.';
 		}
 
 		if ( ! $this->tool_matches_current_step( $tool_name, $args, $current_step ) ) {
 			$current_label = sanitize_text_field( (string) ( $current_step['content'] ?? 'the current step' ) );
-			return 'You are on step "' . $current_label . '" - finish it or update_plan to change it';
+			return 'Step "' . $current_label . '" is still in_progress and the tool you emitted does not match it. Recover by emitting update_plan (advance the plan to the correct step) AND your intended tool together in the SAME response as parallel tool_calls — NOT in two separate rounds. Solo update_plan or solo write will waste another round.';
 		}
 
 		return null;
@@ -2047,8 +2116,8 @@ class PressArk_Agent {
 
 	private function build_wc_price_intent_retry_message( string $mode ): string {
 		return match ( $mode ) {
-			'sale' => __( 'This request explicitly asks for a sale. Use sale_price for the price change and preserve regular_price unless the user also asked to change the base price.', 'pressark' ),
-			'regular' => __( 'This request changes the current or regular price. Use regular_price, price_delta, or price_adjust_pct instead of sale_price.', 'pressark' ),
+			'sale' => __( 'This request explicitly asks for a sale. For a percentage-off sale (e.g. "apply a 10% sale"), use sale_adjust_pct (negative, e.g. -10). For a specific sale amount, use sale_price. Preserve regular_price unless the user also asked to change the base price.', 'pressark' ),
+			'regular' => __( 'This request changes the current or regular price. Use regular_price, price_delta, or price_adjust_pct instead of sale_price / sale_adjust_pct.', 'pressark' ),
 			'clear_sale' => __( 'This request removes a sale. Use clear_sale=true and preserve the regular_price.', 'pressark' ),
 			default => __( 'This price request needs an explicit WooCommerce price field that matches the user intent.', 'pressark' ),
 		};
@@ -2085,7 +2154,7 @@ class PressArk_Agent {
 
 	private static function collect_supplied_wc_price_fields( array $payload ): array {
 		$fields = array();
-		foreach ( array( 'regular_price', 'sale_price', 'clear_sale', 'sale_from', 'sale_to', 'price_delta', 'price_adjust_pct' ) as $field ) {
+		foreach ( array( 'regular_price', 'sale_price', 'sale_adjust_pct', 'clear_sale', 'sale_from', 'sale_to', 'price_delta', 'price_adjust_pct' ) as $field ) {
 			if ( array_key_exists( $field, $payload ) && self::wc_price_field_is_supplied( $field, $payload[ $field ] ) ) {
 				$fields[] = $field;
 			}
@@ -2178,12 +2247,18 @@ class PressArk_Agent {
 				continue;
 			}
 
-			$has_sale_price     = in_array( 'sale_price', $fields, true );
-			$has_clear_sale     = in_array( 'clear_sale', $fields, true );
-			$has_regular_driver = ! empty( array_intersect( $regular_drivers, $fields ) );
+			$has_sale_price       = in_array( 'sale_price', $fields, true );
+			$has_sale_adjust_pct  = in_array( 'sale_adjust_pct', $fields, true );
+			$has_clear_sale       = in_array( 'clear_sale', $fields, true );
+			$has_regular_driver   = ! empty( array_intersect( $regular_drivers, $fields ) );
 
+			// "sale" intent is satisfied by either sale_price (absolute) or
+			// sale_adjust_pct (canonical percentage-off). Before this, only
+			// sale_price counted — which meant a model emitting the cleaner
+			// sale_adjust_pct:-10 got rejected by the intent guard even though
+			// it was the correct field for "apply a 10% sale".
 			$violates_mode = match ( $price_mode ) {
-				'sale' => ! $has_sale_price,
+				'sale' => ! $has_sale_price && ! $has_sale_adjust_pct,
 				'regular' => ! $has_regular_driver,
 				'clear_sale' => ! $has_clear_sale,
 				default => false,
@@ -2391,7 +2466,15 @@ class PressArk_Agent {
 			return $data;
 		}
 
-		if ( $checkpoint && $this->planning_requires_grounded_reads() && ! $this->checkpoint_has_grounded_plan_context( $checkpoint ) ) {
+		// Skip the grounding-context exploring fallback when the early-exit has
+		// already declared plan_ready via $this->plan_just_proposed. In that path
+		// update_plan has already stored real plan steps on the checkpoint; the
+		// model may have parallel-emitted update_plan with a meta tool like
+		// load_tools (legitimate R1 pattern) which does not populate read_state,
+		// selected_target, or entities. Without this bypass the flow dead-ends
+		// with type=final_response/status=exploring and no plan_ready card renders.
+		$early_exit_plan_ready = 'plan_ready' === (string) ( $data['exit_reason'] ?? '' );
+		if ( ! $early_exit_plan_ready && $checkpoint && $this->planning_requires_grounded_reads() && ! $this->checkpoint_has_grounded_plan_context( $checkpoint ) ) {
 			$checkpoint->set_plan_phase( 'exploring' );
 			if ( method_exists( $checkpoint, 'set_plan_status' ) ) {
 				$checkpoint->set_plan_status( 'exploring' );
@@ -3995,6 +4078,17 @@ class PressArk_Agent {
 					$confirm_calls[] = $tc;
 				}
 			}
+			// PATRACE
+			pressark_trace(
+				'TOOL_BUCKETS',
+				array(
+					'run_id'        => $this->run_id,
+					'round'         => $round,
+					'read_calls'    => array_values( array_map( static fn( array $call ): string => sanitize_key( (string) ( $call['name'] ?? '' ) ), $read_calls ) ),
+					'preview_calls' => array_values( array_map( static fn( array $call ): string => sanitize_key( (string) ( $call['name'] ?? '' ) ), $preview_calls ) ),
+					'confirm_calls' => array_values( array_map( static fn( array $call ): string => sanitize_key( (string) ( $call['name'] ?? '' ) ), $confirm_calls ) ),
+				)
+			);
 
 			// ── CASE A: All reads — execute and continue loop ────────────────
 			if (
@@ -4153,8 +4247,30 @@ class PressArk_Agent {
 				$emit_fn( 'step', array( 'status' => 'preparing_preview', 'label' => 'Preparing preview', 'tool' => $preview_calls[0]['name'] ) );
 
 				$preview_payloads = $this->strip_internal_tool_call_metadata( $preview_calls );
+				// PATRACE
+				pressark_trace(
+					'PREVIEW_SESSION_START',
+					array(
+						'run_id'       => $this->run_id,
+						'round'        => $round,
+						'tool_names'   => array_values( array_map( static fn( array $call ): string => sanitize_key( (string) ( $call['name'] ?? '' ) ), $preview_payloads ) ),
+						'tool_use_ids' => array_values( array_map( static fn( array $call ): string => sanitize_text_field( (string) ( $call['id'] ?? '' ) ), $preview_payloads ) ),
+					)
+				);
 				$preview = new PressArk_Preview();
 				$session = $preview->create_session( $preview_payloads, $preview_payloads[0]['arguments'] ?? array() );
+				// PATRACE
+				pressark_trace(
+					'PREVIEW_SESSION_RESULT',
+					array(
+						'run_id'             => $this->run_id,
+						'round'              => $round,
+						'success'            => ! empty( $session['success'] ),
+						'preview_session_id' => sanitize_text_field( (string) ( $session['session_id'] ?? '' ) ),
+						'diff_count'         => is_array( $session['diff'] ?? null ) ? count( (array) $session['diff'] ) : 0,
+						'message'            => sanitize_text_field( (string) ( $session['message'] ?? '' ) ),
+					)
+				);
 				if ( empty( $session['success'] ) && isset( $session['message'] ) ) {
 					$preview_failures = $this->build_preview_failure_tool_results(
 						$preview_payloads,
@@ -4176,6 +4292,17 @@ class PressArk_Agent {
 					$this->append_tool_results( $messages, $preview_results, $provider );
 					$this->sync_replay_snapshot( $checkpoint, $messages );
 				}
+				// PATRACE
+				pressark_trace(
+					'AGENT_PREVIEW_RETURN',
+					array(
+						'run_id'             => $this->run_id,
+						'round'              => $round,
+						'preview_session_id' => sanitize_text_field( (string) ( $session['session_id'] ?? '' ) ),
+						'pending_actions'    => count( $preview_calls ),
+						'tool_names'         => array_values( array_map( static fn( array $call ): string => sanitize_key( (string) ( $call['name'] ?? '' ) ), $preview_calls ) ),
+					)
+				);
 
 				return $this->build_result( array(
 					'type'               => 'preview',
@@ -6566,16 +6693,19 @@ class PressArk_Agent {
 				$sections['stable'],
 				$sections['labels']['stable'],
 				'soft_plan_mode',
-				"## Soft Plan Mode\nStart by exploring the current state with relevant read tools before you commit to a plan or any write. Once the reads have grounded the request, briefly state the contained plan you will follow and then continue automatically. Trust the soft-plan route once it has been chosen, and do not stop for a hard plan just because the work spans several contained steps, previews, or closely related edits. Read the current target state before any write and use native WordPress/WooCommerce tools for domain data. For WooCommerce price work, explicit sale requests map to sale_price, increase/decrease/current-price or regular-price requests map to regular_price or a relative regular_price adjustment, and ambiguous wording about sale price vs regular price requires a brief clarification before any price write. Preserve regular_price when removing a sale unless the user explicitly asked to change it, and if a tool fails or verification disagrees, stop repeating the same fix and choose a materially different next step. Escalate to a hard plan only if the work turns destructive or the intended write target becomes clearly broad or ambiguous."
+				"## Soft Plan Mode\nStart by grounding the current state with relevant read tools, but when the request clearly needs tracked multi-step work you should emit update_plan in the SAME response as your first grounding read(s) instead of spending a round on standalone exploratory tool calls first. Once the reads have grounded the request, briefly state the contained plan you will follow and then continue automatically. Trust the soft-plan route once it has been chosen, and do not stop for a hard plan just because the work spans several contained steps, previews, or closely related edits. Read the current target state before any write and use native WordPress/WooCommerce tools for domain data. For new posts and pages, default to create_post unless the user explicitly asks for Elementor or the task is specifically about Elementor. For WooCommerce price work, explicit sale requests map to sale_price, increase/decrease/current-price or regular-price requests map to regular_price or a relative regular_price adjustment, and ambiguous wording about sale price vs regular price requires a brief clarification before any price write. Preserve regular_price when removing a sale unless the user explicitly asked to change it, and if a tool fails or verification disagrees, stop repeating the same fix and choose a materially different next step. Escalate to a hard plan only if the work turns destructive or the intended write target becomes clearly broad or ambiguous."
 			);
 		}
-		if ( 'none' !== $this->planning_mode ) {
+		$plan_phase_for_contract = method_exists( $checkpoint, 'get_plan_phase' )
+			? (string) $checkpoint->get_plan_phase()
+			: '';
+		if ( 'none' !== $this->planning_mode || 'executing' === $plan_phase_for_contract ) {
 			$this->append_round_prompt_section(
 				$sections['stable'],
 				$sections['labels']['stable'],
 				'plan_execution_contract',
 				'## Plan Execution Contract' . "\n"
-				. 'For tasks with 3+ steps: you may use read-only tools (and discover_tools / load_tools) freely BEFORE calling update_plan to gather grounding context. Once you call update_plan, every subsequent tool call must match the in_progress step (or you must call update_plan again to change steps). Keep exactly one step in_progress at a time. Use activeForm to describe the live step you are working on. Mark non-preview steps completed immediately after real success. For preview-required steps, do not mark them completed until the change was actually applied through the preview/confirm flow. Include tool_name when known so the harness can keep you on the correct step.'
+				. 'MANDATORY parallel emission: ANY write tool call (create_post, edit_content, update_meta, delete_content, bulk writes, Elementor writes, etc.) MUST be emitted in the SAME response as an `update_plan` call that sets exactly one step to in_progress whose tool_name matches that write. Solo writes are rejected by plan_step_guard — that costs a wasted round AND leaves the harness with no plan step to mark completed after preview/keep, which risks the write being re-triggered on the next round as a duplicate. This rule applies even for single-write tasks (a 1-step plan is still required). For multi-step tasks: initialize the plan with update_plan as soon as you know tracked steps are needed, and whenever possible emit update_plan in the SAME response as the first grounding read(s) so the plan is in place from round 1. STEP ADVANCEMENT — when the prior step just finished (e.g., step N was a read that returned its tool_result, and you are about to emit step N+1): emit `update_plan(mark step N completed, step N+1 in_progress) + tool_for_step_N+1` ATOMICALLY in one response. Never emit step N+1 solo just because it feels natural after the read — the plan still shows step N as in_progress and the guard will reject. The update_plan that advances the ledger and the tool that executes the new step belong in the same tool_calls array, always. Once a plan exists, every subsequent tool call must match the in_progress step (or you must call update_plan again to change steps). Keep exactly one step in_progress at a time. Use activeForm to describe the live step you are working on. Mark non-preview steps completed immediately after real success. For preview-required steps, do not mark them completed until the change was actually applied through the preview/confirm flow. Include tool_name when known so the harness can keep you on the correct step.'
 			);
 		}
 		$site_notes      = $this->resolve_site_notes( $message );
@@ -8117,7 +8247,11 @@ class PressArk_Agent {
 			$role    = sanitize_key( (string) ( $message['role'] ?? '' ) );
 			$content = (string) ( $message['content'] ?? '' );
 
-			if ( 'user' === $role && self::is_synthetic_checkpoint_header_message( $content ) ) {
+			// Match synthetic headers regardless of role — they used to be
+			// emitted as role=user but are now role=system. Content pattern
+			// is strict (regex on "[Conversation State (turn N)]" prefix)
+			// so this won't catch anything legitimate.
+			if ( in_array( $role, array( 'user', 'system' ), true ) && self::is_synthetic_checkpoint_header_message( $content ) ) {
 				$changed = true;
 				continue;
 			}
@@ -10232,7 +10366,7 @@ private function compact_loop_messages_legacy( array $messages, int $round = 0, 
 		$groups = array();
 		$mentions_content_surface = self::mentions_content_surface( $msg );
 
-		if ( self::is_explicit_content_read_request( $msg ) ) {
+		if ( self::is_explicit_content_read_request( $msg ) && 'generate' !== $task_type ) {
 			$groups[] = 'blocks';
 			if ( defined( 'ELEMENTOR_VERSION' ) ) {
 				$groups[] = 'elementor';
@@ -10325,7 +10459,7 @@ private function compact_loop_messages_legacy( array $messages, int $round = 0, 
 			$groups
 		) ) );
 
-		if ( self::is_explicit_content_read_request( $msg ) ) {
+		if ( self::is_explicit_content_read_request( $msg ) && 'generate' !== $task_type ) {
 			$normalized[] = 'blocks';
 			if ( defined( 'ELEMENTOR_VERSION' ) ) {
 				$normalized[] = 'elementor';
@@ -10333,7 +10467,7 @@ private function compact_loop_messages_legacy( array $messages, int $round = 0, 
 		}
 
 		if ( 'generate' === $task_type && $mentions_content_surface ) {
-			$normalized = array_values( array_diff( $normalized, array( 'seo' ) ) );
+			$normalized = array_values( array_diff( $normalized, array( 'seo', 'blocks', 'elementor' ) ) );
 		}
 
 		if ( ! self::explicitly_mentions_custom_fields( $msg ) ) {

@@ -1218,6 +1218,10 @@ Use this tool proactively in these scenarios:
 4. When you start working on a task - Mark it as in_progress BEFORE beginning work. Ideally you should only have one todo as in_progress at a time
 5. After completing a task - Mark it as completed and add any new follow-up tasks
 
+## Multi-Step Efficiency
+- If the task clearly needs tracked steps, emit update_plan in the SAME response as the first grounding read(s) whenever possible
+- Do not spend a round on standalone exploratory tool calls first when you already know the task will need a tracked plan
+
 ## Task States
 - pending: Task not yet started
 - in_progress: Currently working on (limit to ONE task at a time)

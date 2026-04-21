@@ -24,6 +24,187 @@ define( 'PRESSARK_PATH', plugin_dir_path( __FILE__ ) );
 define( 'PRESSARK_URL', plugin_dir_url( __FILE__ ) );
 define( 'PRESSARK_BASENAME', plugin_basename( __FILE__ ) );
 
+// PATRACE: remove this helper and all pressark_trace() call sites before production release.
+if ( ! function_exists( 'pressark_trace' ) ) {
+	function pressark_trace( string $tag, array $data = array() ): void {
+		if ( ! defined( 'PRESSARK_DEBUG_TRACE' ) || ! PRESSARK_DEBUG_TRACE ) {
+			return;
+		}
+
+		$parts = array();
+		foreach ( $data as $key => $value ) {
+			if ( is_scalar( $value ) || null === $value ) {
+				$parts[] = $key . '=' . ( null === $value ? 'null' : (string) $value );
+			} else {
+				$json = wp_json_encode( $value, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE );
+				$parts[] = $key . '=' . ( is_string( $json ) ? $json : '' );
+			}
+		}
+
+		$line = '[' . gmdate( 'H:i:s' ) . '] PATRACE ' . $tag;
+		if ( ! empty( $parts ) ) {
+			$line .= ' ' . implode( ' ', array_filter( $parts, static fn( $part ) => '' !== $part ) );
+		}
+
+		@file_put_contents( '/tmp/pressark-trace.log', $line . "\n", FILE_APPEND );
+	}
+}
+
+// ---------------------------------------------------------------------------
+// DEBUG CODE — HTTP request/response logger for pressark/v1/* REST routes.
+// Remove this whole block (along with pressark_trace helper above) when
+// investigation closes. Gated by PRESSARK_DEBUG_TRACE.
+//
+// Writes to /tmp/pressark-http.log. Each REST call emits two lines — HTTP_REQ
+// on pre-dispatch and HTTP_RES on post-dispatch. If the request 500s from a
+// PHP Fatal that bypasses the handler's try/catch, HTTP_FATAL is emitted
+// from shutdown() with error_get_last() details — this is what catches the
+// "Unexpected end of JSON input" truncation-class bugs.
+// ---------------------------------------------------------------------------
+if ( ! function_exists( 'pressark_http_trace_write' ) ) {
+	function pressark_http_trace_write( string $line ): void {
+		if ( ! defined( 'PRESSARK_DEBUG_TRACE' ) || ! PRESSARK_DEBUG_TRACE ) {
+			return;
+		}
+		@file_put_contents( '/tmp/pressark-http.log', $line . "\n", FILE_APPEND );
+	}
+
+	function pressark_http_trace_is_ours( string $route ): bool {
+		return str_starts_with( ltrim( $route, '/' ), 'pressark/v1' );
+	}
+
+	if ( defined( 'PRESSARK_DEBUG_TRACE' ) && PRESSARK_DEBUG_TRACE ) {
+		// Incoming request — before any PressArk handler runs.
+		add_filter( 'rest_pre_dispatch', function ( $result, $server, $request ) {
+			if ( ! ( $request instanceof WP_REST_Request ) ) {
+				return $result;
+			}
+			$route = (string) $request->get_route();
+			if ( ! pressark_http_trace_is_ours( $route ) ) {
+				return $result;
+			}
+			$body       = (string) $request->get_body();
+			$body_bytes = strlen( $body );
+			$preview    = $body_bytes > 512 ? substr( $body, 0, 512 ) . '…' : $body;
+			$preview    = str_replace( array( "\r", "\n" ), ' ', $preview );
+			pressark_http_trace_write( sprintf(
+				'[%s] PATRACE HTTP_REQ method=%s route=%s body_bytes=%d body=%s',
+				gmdate( 'H:i:s' ),
+				(string) $request->get_method(),
+				$route,
+				$body_bytes,
+				$preview
+			) );
+			$GLOBALS['pressark_http_trace_active_route'] = $route;
+			return $result;
+		}, 10, 3 );
+
+		// Outgoing response — after the handler returns, before WP serializes.
+		add_filter( 'rest_post_dispatch', function ( $response, $server, $request ) {
+			if ( ! ( $request instanceof WP_REST_Request ) ) {
+				return $response;
+			}
+			$route = (string) $request->get_route();
+			if ( ! pressark_http_trace_is_ours( $route ) ) {
+				return $response;
+			}
+			$status     = 0;
+			$data_bytes = 0;
+			$data_body  = '';
+			if ( $response instanceof WP_REST_Response ) {
+				$status = (int) $response->get_status();
+				$data   = $response->get_data();
+				$json   = wp_json_encode( $data, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE );
+				if ( false === $json ) {
+					$data_body  = '<JSON_ENCODE_FAILED err=' . json_last_error_msg() . '>';
+					$data_bytes = -1;
+				} else {
+					$data_bytes = strlen( $json );
+					$data_body  = $data_bytes > 1024 ? substr( $json, 0, 1024 ) . '…' : $json;
+				}
+			} elseif ( is_wp_error( $response ) ) {
+				$err_data = $response->get_error_data();
+				$status   = is_array( $err_data ) && isset( $err_data['status'] ) ? (int) $err_data['status'] : 500;
+				$data_body = sprintf(
+					'WP_ERROR code=%s message=%s',
+					(string) $response->get_error_code(),
+					(string) $response->get_error_message()
+				);
+				$data_bytes = strlen( $data_body );
+			} else {
+				$data_body  = '<unknown response type ' . gettype( $response ) . '>';
+				$data_bytes = -1;
+			}
+			pressark_http_trace_write( sprintf(
+				'[%s] PATRACE HTTP_RES route=%s status=%d body_bytes=%d body=%s',
+				gmdate( 'H:i:s' ),
+				$route,
+				$status,
+				$data_bytes,
+				$data_body
+			) );
+			unset( $GLOBALS['pressark_http_trace_active_route'] );
+			return $response;
+		}, 10, 3 );
+
+		// Fatal canary — bypasses WP's do_action('shutdown') chain entirely
+		// because that chain can be short-circuited by WP's fatal-error
+		// recovery mode (wp_die → die), leaving add_action('shutdown') hooks
+		// at high priorities unfired. register_shutdown_function is PHP-level
+		// and always runs as long as the PHP process itself doesn't segfault.
+		register_shutdown_function( function () {
+			// Unconditional ping — proves the shutdown function itself is running.
+			// If /tmp/pressark-shutdown.ping doesn't grow on a /preview/keep crash,
+			// PHP never reached shutdown (segfault, SIGKILL, or a more severe
+			// termination path that skips register_shutdown_function).
+			@file_put_contents(
+				'/tmp/pressark-shutdown.ping',
+				gmdate( 'H:i:s' ) . ' uri=' . ( $_SERVER['REQUEST_URI'] ?? '?' ) . ' active_route=' . ( $GLOBALS['pressark_http_trace_active_route'] ?? '<unset>' ) . "\n",
+				FILE_APPEND
+			);
+
+			$err = error_get_last();
+			$active_route = isset( $GLOBALS['pressark_http_trace_active_route'] )
+				? (string) $GLOBALS['pressark_http_trace_active_route']
+				: '';
+			if ( '' === $active_route ) {
+				// Not a pressark route (or already fully handled) — skip.
+				return;
+			}
+			if ( ! $err ) {
+				// Request started but rest_post_dispatch never logged HTTP_RES
+				// and no PHP error was captured. Most likely an exit()/die()
+				// without a real error, but we still want the trace entry.
+				pressark_http_trace_write( sprintf(
+					'[%s] PATRACE HTTP_SHUTDOWN_NO_ERR route=%s — no error_get_last(), HTTP_RES missing (exit/die without fatal?)',
+					gmdate( 'H:i:s' ),
+					$active_route
+				) );
+				return;
+			}
+			$fatal_types = array(
+				E_ERROR,
+				E_PARSE,
+				E_CORE_ERROR,
+				E_COMPILE_ERROR,
+				E_USER_ERROR,
+				E_RECOVERABLE_ERROR,
+			);
+			$is_fatal = in_array( (int) $err['type'], $fatal_types, true );
+			pressark_http_trace_write( sprintf(
+				'[%s] PATRACE %s route=%s type=%d message=%s file=%s line=%d',
+				gmdate( 'H:i:s' ),
+				$is_fatal ? 'HTTP_FATAL' : 'HTTP_SHUTDOWN_NONFATAL',
+				$active_route,
+				(int) $err['type'],
+				str_replace( array( "\r", "\n" ), ' ', (string) $err['message'] ),
+				(string) $err['file'],
+				(int) $err['line']
+			) );
+		} );
+	}
+}
+
 /**
  * Only auto-enable Freemius sandbox defaults on local/dev installs.
  *

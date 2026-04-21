@@ -181,6 +181,16 @@ class PressArk_Admin {
 			'autoload'          => false,
 		) );
 
+		// Custom endpoint for BYOK provider='other'. OpenAI-compatible full URL
+		// ending in /chat/completions. Used for local proxies (e.g. midsentence)
+		// or self-hosted OAI-compat gateways.
+		register_setting( 'pressark_settings', 'pressark_byok_api_url', array(
+			'type'              => 'string',
+			'sanitize_callback' => 'esc_url_raw',
+			'default'           => '',
+			'autoload'          => false,
+		) );
+
 		add_settings_section(
 			'pressark_byok_section',
 			__( 'Bring Your Own Key (BYOK)', 'pressark' ),
@@ -216,6 +226,14 @@ class PressArk_Admin {
 			'pressark_byok_model',
 			__( 'BYOK Model', 'pressark' ),
 			array( $this, 'render_byok_model_field' ),
+			'pressark',
+			'pressark_byok_section'
+		);
+
+		add_settings_field(
+			'pressark_byok_api_url',
+			__( 'Custom Endpoint URL', 'pressark' ),
+			array( $this, 'render_byok_api_url_field' ),
 			'pressark',
 			'pressark_byok_section'
 		);
@@ -1943,6 +1961,7 @@ class PressArk_Admin {
 			'anthropic'  => __( 'Anthropic', 'pressark' ),
 			'deepseek'   => __( 'DeepSeek', 'pressark' ),
 			'gemini'     => __( 'Google Gemini', 'pressark' ),
+			'other'      => __( 'Other (custom endpoint)', 'pressark' ),
 		);
 		echo '<select name="pressark_byok_provider">';
 		foreach ( $providers as $key => $label ) {
@@ -1954,6 +1973,26 @@ class PressArk_Admin {
 			);
 		}
 		echo '</select>';
+		echo '<p class="description">' . esc_html__( 'Choose "Other" to route through a custom OpenAI-compatible endpoint (e.g. a local proxy like midsentence). Set the URL in the "Custom Endpoint URL" field below.', 'pressark' ) . '</p>';
+	}
+
+	/**
+	 * Render the custom endpoint URL field for BYOK provider="other".
+	 *
+	 * Expected format: full chat-completions URL, e.g.
+	 *   http://host.docker.internal:8766/v1/chat/completions
+	 *   https://my-gateway.example.com/v1/chat/completions
+	 *
+	 * Only used when BYOK Provider = Other. OpenAI-compatible body format required.
+	 */
+	public function render_byok_api_url_field(): void {
+		$value = get_option( 'pressark_byok_api_url', '' );
+		printf(
+			'<input type="url" name="pressark_byok_api_url" value="%s" class="regular-text" placeholder="%s" />',
+			esc_attr( $value ),
+			esc_attr__( 'http://host.docker.internal:8766/v1/chat/completions', 'pressark' )
+		);
+		echo '<p class="description">' . esc_html__( 'Only used when BYOK Provider is set to "Other". Must be a full OpenAI-compatible chat-completions URL. Your BYOK API Key is forwarded as Authorization: Bearer <key>.', 'pressark' ) . '</p>';
 	}
 
 	public function render_byok_api_key_field(): void {

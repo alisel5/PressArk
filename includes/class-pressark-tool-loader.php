@@ -740,6 +740,12 @@ class PressArk_Tool_Loader {
 	private function get_always_load_tool_names(): array {
 		$always = PressArk_Operation_Registry::tool_names_by_loading_intent( 'always_load' );
 
+		// Generic page/post creation should not require a separate load_tools(core)
+		// round before the model can propose the default create_post path.
+		if ( PressArk_Operation_Registry::exists( 'create_post' ) ) {
+			$always[] = 'create_post';
+		}
+
 		foreach ( self::UNIVERSAL_TOOLS as $fallback_tool ) {
 			if ( PressArk_Operation_Registry::exists( $fallback_tool )
 				&& PressArk_Operation_Registry::is_always_load_tool( $fallback_tool )

@@ -500,6 +500,29 @@ class PressArk_Handler_WooCommerce extends PressArk_Handler_Base {
 			}
 		}
 
+		// `sale_adjust_pct` — apply a percentage-off sale. Sets sale_price
+		// to regular_price × (1 + pct/100), keeping regular_price intact.
+		// This is the canonical primitive for "apply a 10% sale": the user
+		// sees "Sale!" with regular_price crossed out and the discounted
+		// price active. Without this, the model had to either reduce
+		// regular_price (permanent discount, not a "sale") or compute
+		// per-product absolute sale_price values, which drifted in the
+		// field combinations that produced the $0.00-everywhere bug.
+		if ( isset( $changes['sale_adjust_pct'] ) && ! isset( $changes['sale_price'] ) ) {
+			$reg_price = (float) $product->get_regular_price();
+			if ( $reg_price <= 0 ) {
+				$reg_price = (float) $product->get_price();
+			}
+			$pct = (float) $changes['sale_adjust_pct'];
+			if ( $reg_price > 0 && $pct < 0 && $pct > -100 ) {
+				$new_sale = max( 0, round( $reg_price * ( 1 + ( $pct / 100 ) ), wc_get_price_decimals() ) );
+				if ( $new_sale > 0 && $new_sale < $reg_price ) {
+					$product->set_sale_price( (string) $new_sale );
+					$changed_list[] = sprintf( 'sale_price (%+.2f%% of regular_price => %.2f)', $pct, $new_sale );
+				}
+			}
+		}
+
 		// ── Array / taxonomy fields ──────────────────────────────────────
 		if ( isset( $changes['category_ids'] ) ) {
 			$product->set_category_ids( array_map( 'absint', (array) $changes['category_ids'] ) );
@@ -552,7 +575,7 @@ class PressArk_Handler_WooCommerce extends PressArk_Handler_Base {
 			return array(
 				'success' => false,
 				'message' => __( 'No product changes specified.', 'pressark' ),
-				'hint'    => __( 'Available fields: name, regular_price, sale_price, clear_sale (canonical sale removal), price_delta, price_adjust_pct, sale_from, sale_to, sku, stock_quantity, stock_adjust, stock_status, manage_stock, description, short_description, weight, length, width, height, tax_status, tax_class, featured, virtual, downloadable, category_ids, tag_ids, image_id, gallery_image_ids, and more.', 'pressark' ),
+				'hint'    => __( 'Available fields: name, regular_price, sale_price, sale_adjust_pct (percentage-off sale — canonical "apply N% sale"), clear_sale (canonical sale removal), price_delta, price_adjust_pct (permanent regular_price %), sale_from, sale_to, sku, stock_quantity, stock_adjust, stock_status, manage_stock, description, short_description, weight, length, width, height, tax_status, tax_class, featured, virtual, downloadable, category_ids, tag_ids, image_id, gallery_image_ids, and more.', 'pressark' ),
 			);
 		}
 
@@ -5028,7 +5051,7 @@ class PressArk_Handler_WooCommerce extends PressArk_Handler_Base {
 	private function normalize_product_changes( array $changes ): array {
 		$changes = $this->normalize_price_and_stock_aliases( $changes );
 
-		foreach ( array( 'regular_price', 'sale_price', 'price_delta', 'price_adjust_pct' ) as $field ) {
+		foreach ( array( 'regular_price', 'sale_price', 'price_delta', 'price_adjust_pct', 'sale_adjust_pct' ) as $field ) {
 			if ( array_key_exists( $field, $changes ) ) {
 				$changes[ $field ] = $this->normalize_wc_decimal_value( $changes[ $field ] );
 			}
@@ -5044,7 +5067,7 @@ class PressArk_Handler_WooCommerce extends PressArk_Handler_Base {
 	private function normalize_variation_changes( array $changes ): array {
 		$changes = $this->normalize_price_and_stock_aliases( $changes );
 
-		foreach ( array( 'regular_price', 'sale_price', 'price_delta', 'price_adjust_pct' ) as $field ) {
+		foreach ( array( 'regular_price', 'sale_price', 'price_delta', 'price_adjust_pct', 'sale_adjust_pct' ) as $field ) {
 			if ( array_key_exists( $field, $changes ) ) {
 				$changes[ $field ] = $this->normalize_wc_decimal_value( $changes[ $field ] );
 			}
@@ -5084,26 +5107,64 @@ class PressArk_Handler_WooCommerce extends PressArk_Handler_Base {
 			}
 		}
 
-		if ( empty( $ambiguous_fields ) ) {
-			return null;
+		if ( ! empty( $ambiguous_fields ) ) {
+			$field_labels = array_map(
+				static function ( string $field ): string {
+					return '"' . $field . '"';
+				},
+				$ambiguous_fields
+			);
+
+			return array(
+				'code'    => 'ambiguous_price_field',
+				'message' => sprintf(
+					/* translators: %s: comma-separated unexpected field names */
+					__( 'Unexpected WooCommerce price field(s): %s. Do not use plain price for WooCommerce writes.', 'pressark' ),
+					implode( ', ', $field_labels )
+				),
+				'hint'    => __( 'Choose one explicit field instead: regular_price for the base price, sale_price for a sale amount, or clear_sale=true to remove a sale. clear_sale is the canonical sale-removal path.', 'pressark' ),
+			);
 		}
 
-		$field_labels = array_map(
-			static function ( string $field ): string {
-				return '"' . $field . '"';
-			},
-			$ambiguous_fields
-		);
+		// Price fields are mutually exclusive — combining them is how R091
+		// produced "sale_price=0 + price_adjust_pct=-10" which gave every
+		// product a $0.00 sale price. Reject combos before any writer fires
+		// so the model gets a clear error and can retry with one approach.
+		$price_fields = array();
+		foreach ( array( 'regular_price', 'sale_price', 'price_delta', 'price_adjust_pct', 'sale_adjust_pct' ) as $field ) {
+			if ( array_key_exists( $field, $data ) ) {
+				$price_fields[] = $field;
+			}
+		}
+		if ( count( $price_fields ) > 1 ) {
+			return array(
+				'code'    => 'conflicting_price_fields',
+				'message' => sprintf(
+					/* translators: %s: comma-separated price field names */
+					__( 'Price fields are mutually exclusive. Got: %s. Pick ONE.', 'pressark' ),
+					implode( ', ', $price_fields )
+				),
+				'hint'    => __( 'For a percentage-off SALE (keeps regular_price intact, shows as "Sale!"), use ONLY sale_adjust_pct (e.g. -10 for 10% off the regular price, stored as sale_price). To permanently change regular price by a percentage, use ONLY price_adjust_pct. For a specific sale amount per product, use ONLY sale_price. To remove an existing sale, use clear_sale=true. Never combine them; never set sale_price=0.', 'pressark' ),
+			);
+		}
 
-		return array(
-			'code'    => 'ambiguous_price_field',
-			'message' => sprintf(
-				/* translators: %s: comma-separated unexpected field names */
-				__( 'Unexpected WooCommerce price field(s): %s. Do not use plain price for WooCommerce writes.', 'pressark' ),
-				implode( ', ', $field_labels )
-			),
-			'hint'    => __( 'Choose one explicit field instead: regular_price for the base price, sale_price for a sale amount, or clear_sale=true to remove a sale. clear_sale is the canonical sale-removal path.', 'pressark' ),
-		);
+		// sale_price=0 is almost always a mistake — it gives the product away.
+		// If the model wants "remove the sale", use clear_sale. If it wants a
+		// percentage-off, use price_adjust_pct. Both of those are clearer than
+		// zero. Reject and teach the correct pattern.
+		if ( array_key_exists( 'sale_price', $data ) ) {
+			$raw = $data['sale_price'];
+			$is_zero = ( is_numeric( $raw ) && 0.0 === (float) $raw ) || '0' === trim( (string) $raw ) || '0.00' === trim( (string) $raw );
+			if ( $is_zero ) {
+				return array(
+					'code'    => 'sale_price_zero',
+					'message' => __( 'sale_price=0 would make the product free. This is almost always a mistake.', 'pressark' ),
+					'hint'    => __( 'To remove an existing sale, use clear_sale=true (keeps regular_price intact). For a percentage-off sale across products, use price_adjust_pct (e.g. -10 for 10% off regular_price). For a specific sale amount, use sale_price with the actual target price.', 'pressark' ),
+				);
+			}
+		}
+
+		return null;
 	}
 
 	private function ambiguous_wc_price_write_response( array $data ): ?array {

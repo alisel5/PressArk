@@ -767,22 +767,107 @@ class PressArk_Preview {
 			}
 		}
 
-		$draft_id = wp_insert_post( array(
+		$insert_args = array(
 			'post_title'   => $args['title'] ?? $args['post_title'] ?? 'New Post',
 			'post_content' => $args['content'] ?? $args['post_content'] ?? '',
 			'post_status'  => 'auto-draft',
 			'post_type'    => $args['post_type'] ?? 'post',
 			'meta_input'   => array( '_pressark_preview_draft' => '1' ),
-		) );
+		);
+
+		// Preserve the slug the model requested. Without this, WordPress
+		// auto-derives post_name from post_title on publish, ignoring the
+		// model's slug arg.
+		if ( ! empty( $args['slug'] ) ) {
+			$insert_args['post_name'] = sanitize_title( (string) $args['slug'] );
+		}
+
+		if ( ! empty( $args['excerpt'] ) ) {
+			$insert_args['post_excerpt'] = sanitize_textarea_field( (string) $args['excerpt'] );
+		}
+
+		$draft_id = wp_insert_post( $insert_args );
+
+		// Apply SEO/social meta and page template onto the draft so they
+		// survive the preview → keep promotion. Mirrors the direct-create
+		// path in PressArk_Handler_Content::create_post().
+		if ( $draft_id && ! is_wp_error( $draft_id ) ) {
+			if ( 'page' === ( $args['post_type'] ?? '' ) && ! empty( $args['page_template'] ) ) {
+				update_post_meta( (int) $draft_id, '_wp_page_template', sanitize_text_field( (string) $args['page_template'] ) );
+			}
+
+			if ( class_exists( 'PressArk_SEO_Resolver' ) ) {
+				foreach ( array( 'meta_title', 'meta_description', 'og_title', 'og_description', 'focus_keyword' ) as $seo_key ) {
+					if ( ! empty( $args[ $seo_key ] ) ) {
+						PressArk_SEO_Resolver::write(
+							(int) $draft_id,
+							$seo_key,
+							sanitize_text_field( (string) $args[ $seo_key ] )
+						);
+					}
+				}
+				if ( ! empty( $args['og_image'] ) ) {
+					PressArk_SEO_Resolver::write(
+						(int) $draft_id,
+						'og_image',
+						esc_url_raw( (string) $args['og_image'] )
+					);
+				}
+			}
+		}
+
+		// Surface every field the draft actually carries, not just the content
+		// preview. Before the SEO/slug preservation fix, only content rendered
+		// because that was the only field we wrote; now slug, excerpt, SEO/OG
+		// fields are persisted to the draft and must show in the diff so the
+		// user knows what will land — matching update_meta's per-field preview
+		// shape.
+		$diff_items = array(
+			array(
+				'field' => 'Content preview',
+				'old'   => '(new post)',
+				'new'   => wp_trim_words( $args['content'] ?? $args['post_content'] ?? '', 30 ),
+			),
+		);
+
+		if ( ! empty( $args['slug'] ) ) {
+			$diff_items[] = array(
+				'field' => 'Slug',
+				'old'   => '(auto-generated from title)',
+				'new'   => sanitize_title( (string) $args['slug'] ),
+			);
+		}
+
+		if ( ! empty( $args['excerpt'] ) ) {
+			$diff_items[] = array(
+				'field' => 'Excerpt',
+				'old'   => '(empty)',
+				'new'   => (string) $args['excerpt'],
+			);
+		}
+
+		$seo_field_labels = array(
+			'meta_title'       => 'SEO Title',
+			'meta_description' => 'SEO Description',
+			'og_title'         => 'Open Graph Title',
+			'og_description'   => 'Open Graph Description',
+			'og_image'         => 'Open Graph Image',
+			'focus_keyword'    => 'Focus Keyword',
+		);
+		foreach ( $seo_field_labels as $key => $label ) {
+			if ( ! empty( $args[ $key ] ) ) {
+				$diff_items[] = array(
+					'field' => $label,
+					'old'   => '(empty)',
+					'new'   => (string) $args[ $key ],
+				);
+			}
+		}
 
 		$diff_entry = array(
 			'type'  => 'new_post',
 			'label' => 'New: ' . ( $args['title'] ?? $args['post_title'] ?? 'Untitled' ),
-			'items' => array( array(
-				'field' => 'Content preview',
-				'old'   => '(new post)',
-				'new'   => wp_trim_words( $args['content'] ?? $args['post_content'] ?? '', 30 ),
-			) ),
+			'items' => $diff_items,
 		);
 
 		return array(

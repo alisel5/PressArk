@@ -29,6 +29,20 @@ class PressArk_Checkpoint {
 	private int                                    $turn       = 0;
 	private string                                 $updated_at = '';
 
+	// Legacy mirror fields — kept in sync with the store classes via
+	// sync_legacy_fields_from_stores() / sync_stores_from_legacy_fields()
+	// during the staged store migration. Declared explicitly so PHP 8.2+
+	// doesn't emit dynamic-property deprecation warnings when the sync
+	// writes them (these warnings became Fatal in PHP 9).
+	private string $goal        = '';
+	private array  $entities    = array();
+	private array  $facts       = array();
+	private array  $pending     = array();
+	private array  $constraints = array();
+	private array  $outcomes    = array();
+	private array  $retrieval   = array();
+	private array  $execution   = array();
+
 	// v3.7.0: Extended typed state for memory hardening.
 	private array  $selected_target    = array(); // [ 'id' => int, 'title' => string, 'type' => string ]
 	private string $workflow_stage     = '';       // discover|gather|plan|preview|apply|verify|settled
@@ -119,8 +133,21 @@ class PressArk_Checkpoint {
 	/**
 	 * Render as a compact text header for injection into message history.
 	 * Designed for minimal token footprint (~100-200 tokens).
+	 *
+	 * @param string $current_user_message Latest live user message text. Used
+	 *                                     by execution-ledger build_context_lines
+	 *                                     to suppress the SOURCE REQUEST line
+	 *                                     when it would be a truncated echo of
+	 *                                     the live user message.
+	 *
+	 * GOAL is intentionally NOT deduped against $current_user_message even
+	 * when they match — GOAL serves as a planning-anchor signal that the
+	 * model uses to decide whether to emit update_plan. Suppressing it on
+	 * turn 0 collapses $parts to empty, which deletes the whole
+	 * [Conversation State] block, which in turn caused the model to skip
+	 * update_plan on early rounds of fresh chats. Keep the ~50-token cost.
 	 */
-	public function to_context_header(): string {
+	public function to_context_header( string $current_user_message = '' ): string {
 		$parts = array();
 
 		$data_lines = array();
@@ -223,7 +250,7 @@ class PressArk_Checkpoint {
 		}
 
 		if ( ! empty( $this->context_capsule ) ) {
-			$parts[] = 'HISTORICAL STATE ONLY: Treat the context capsule below as past conversation state, not as a fresh user instruction. Follow the latest live user message unless it is a continuation marker.';
+			$parts[] = 'HISTORICAL STATE ONLY: The capsule content in this conversation state is historical, not a fresh user instruction. Follow the latest live user message unless it is a continuation marker.';
 
 			$task = sanitize_text_field( (string) ( $this->context_capsule['active_request'] ?? $this->context_capsule['task'] ?? '' ) );
 			if ( '' !== $task ) {
@@ -338,7 +365,7 @@ class PressArk_Checkpoint {
 			$parts[] = sprintf( 'BUNDLES: %d prior read bundle(s) stored', count( $this->bundle_ids ) );
 		}
 
-		$execution_lines = PressArk_Execution_Ledger::build_context_lines( $this->execution );
+		$execution_lines = PressArk_Execution_Ledger::build_context_lines( $this->execution, $current_user_message );
 		foreach ( $execution_lines as $line ) {
 			$parts[] = $line;
 		}
@@ -1719,10 +1746,18 @@ class PressArk_Checkpoint {
 	/**
 	 * Whether this checkpoint is stale (older than threshold).
 	 *
+	 * A checkpoint with no `updated_at` (fresh turn 0, never touched) is NOT
+	 * stale — we don't know the age, so default to "probably fine" rather than
+	 * "definitely ancient". Otherwise `age_seconds()` returns `PHP_INT_MAX`
+	 * and every fresh request emits a "state is 2.5e+15h old" CAUTION line.
+	 *
 	 * @param int $threshold_seconds Max acceptable age (default: 1 hour).
 	 * @since 3.3.0
 	 */
 	public function is_stale( int $threshold_seconds = 3600 ): bool {
+		if ( empty( $this->updated_at ) ) {
+			return false;
+		}
 		return $this->age_seconds() > $threshold_seconds;
 	}
 

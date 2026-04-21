@@ -240,7 +240,19 @@ class PressArk_History_Manager {
 		// v3.3.0: Only prepend checkpoint if it adds information beyond
 		// what's in the recent messages. Estimate header tokens and skip
 		// if the header would exceed 25% of the budget for its tier.
-		$header = $checkpoint->to_context_header();
+		//
+		// Pass the latest live user message into the header builder so GOAL /
+		// SOURCE REQUEST lines can self-suppress when they'd just echo it
+		// verbatim (turn-0 case: checkpoint.goal === incoming prompt).
+		$last_user_message = '';
+		for ( $i = count( $recent ) - 1; $i >= 0; $i-- ) {
+			if ( ( $recent[ $i ]['role'] ?? '' ) === 'user' ) {
+				$last_user_message = (string) ( $recent[ $i ]['content'] ?? '' );
+				break;
+			}
+		}
+
+		$header = $checkpoint->to_context_header( $last_user_message );
 		if ( $header ) {
 			$header_tokens  = self::estimate_tokens( $header );
 			$max_header     = (int) ( $budget * 0.25 );
@@ -250,8 +262,12 @@ class PressArk_History_Manager {
 				$header = self::truncate_to_tokens( $header, $max_header );
 			}
 
+			// Role=system (not user) so the synthetic checkpoint block
+			// doesn't masquerade as a second user turn. Prior behavior
+			// (role=user) produced back-to-back user messages and tripped
+			// the "earliest user message" finder in the compaction loop.
 			array_unshift( $recent, array(
-				'role'    => 'user',
+				'role'    => 'system',
 				'content' => $header,
 			) );
 		}

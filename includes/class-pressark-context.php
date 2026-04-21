@@ -45,13 +45,42 @@ class PressArk_Context {
 		return array(
 			'editor'      => $classic_ed ? 'classic' : 'gutenberg',
 			'theme_type'  => $is_fse ? 'fse' : ( $has_json ? 'hybrid' : 'classic' ),
-			'builder'     => $has_elmt ? 'elementor' : ( $is_fse ? 'site_editor' : 'none' ),
+			// `builder` means the PRIMARY page builder in use, not "installed".
+			// Having Elementor activated ≠ using it. The homepage is the cheap,
+			// authoritative signal: if it's built with Elementor, treat the site
+			// as an Elementor site. Otherwise `classic` even when the plugin
+			// is present. Previously this returned "elementor" whenever the
+			// plugin was defined, which steered the model to elementor_*
+			// preflights on classic pages — sys[0]'s "builder=elementor → elementor_* tools"
+			// routing rule then forced wasted rounds.
+			'builder'     => $is_fse
+				? 'site_editor'
+				: ( ( $has_elmt && self::homepage_uses_elementor() ) ? 'elementor' : 'classic' ),
 			'menus'       => $has_fse_nav ? 'wp_navigation' : 'wp_nav_menus',
 			'templates'   => $is_fse ? 'block_templates' : 'php_templates',
 			'styles'      => $has_json ? 'theme_json' : ( $has_elmt ? 'elementor_kit' : 'customizer' ),
 			'widgets'     => $is_fse ? 'block_template_parts' : 'widget_areas',
 			'environment' => function_exists( 'wp_get_environment_type' ) ? wp_get_environment_type() : 'production',
 		);
+	}
+
+	/**
+	 * Is the static homepage built with Elementor?
+	 *
+	 * Cheap check — one get_post_meta call on `page_on_front`. Used as the
+	 * authoritative signal for the site-level `builder` field, on the
+	 * assumption that if a user took the time to build their homepage in
+	 * Elementor then Elementor is their primary tool.
+	 */
+	private static function homepage_uses_elementor(): bool {
+		if ( 'page' !== get_option( 'show_on_front' ) ) {
+			return false;
+		}
+		$front_id = (int) get_option( 'page_on_front', 0 );
+		if ( $front_id <= 0 ) {
+			return false;
+		}
+		return 'builder' === (string) get_post_meta( $front_id, '_elementor_edit_mode', true );
 	}
 
 	/**

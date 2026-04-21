@@ -1905,6 +1905,13 @@ class PressArk_Operation_Registry {
 				'defer'         => 'always_load',
 			),
 
+			'get_random_content' => array(
+				'search_hint'   => 'random post page product content pick sample',
+				'cache_ttl'     => 0,
+				'tags'          => array( 'content', 'read' ),
+				'defer'         => 'always_load',
+			),
+
 			'get_site_overview' => array(
 				'search_hint'   => 'site overview info wordpress version theme plugins',
 				'cache_ttl'     => 600,
@@ -2909,7 +2916,8 @@ class PressArk_Operation_Registry {
 			'sale_from'         => array( 'type' => 'string', 'description' => 'Sale start date/time for an active sale. Do not send this when clear_sale=true.' ),
 			'sale_to'           => array( 'type' => 'string', 'description' => 'Sale end date/time for an active sale. Do not send this when clear_sale=true.' ),
 			'price_delta'       => array( 'type' => 'number', 'description' => 'Relative price change added to the current regular price.' ),
-			'price_adjust_pct'  => array( 'type' => 'number', 'description' => 'Relative percentage applied to the current regular price.' ),
+			'price_adjust_pct'  => array( 'type' => 'number', 'description' => 'Relative percentage applied to the current regular price. Use this to permanently change the base price, NOT for applying a sale.' ),
+			'sale_adjust_pct'   => array( 'type' => 'number', 'description' => 'Canonical "apply an N% sale" field. Negative percentage (e.g. -10 for 10% off) that computes sale_price as regular_price * (1 + pct/100) per product, keeping regular_price intact. Use this for "apply/add/set a sale of N%" requests. Mutually exclusive with sale_price, regular_price, price_delta, and price_adjust_pct.' ),
 			'sku'               => array( 'type' => 'string', 'description' => 'SKU.' ),
 			'manage_stock'      => array( 'type' => 'boolean', 'description' => 'Whether WooCommerce manages stock.' ),
 			'stock_quantity'    => array( 'type' => 'integer', 'description' => 'Absolute stock quantity.', 'minimum' => 0 ),
@@ -3003,14 +3011,19 @@ class PressArk_Operation_Registry {
 			'properties'    => self::product_change_properties(),
 			'one_of'        => array(
 				array(
-					'fields'  => array( 'regular_price', 'price_delta', 'price_adjust_pct' ),
+					'fields'  => array( 'regular_price', 'price_delta', 'price_adjust_pct', 'sale_price', 'sale_adjust_pct' ),
 					'mode'    => 'at_most_one',
-					'message' => 'Use at most one price driver: regular_price, price_delta, or price_adjust_pct.',
+					'message' => 'Price fields are mutually exclusive. Pick one: regular_price / price_delta / price_adjust_pct to change the base price, OR sale_price / sale_adjust_pct to set a sale. For a percentage-off sale use sale_adjust_pct (e.g. -10 for 10% off). Use clear_sale=true to remove an existing sale.',
 				),
 				array(
 					'fields'  => array( 'sale_price', 'clear_sale' ),
 					'mode'    => 'at_most_one',
 					'message' => 'Use sale_price to set/change a sale amount or clear_sale to remove the sale, not both.',
+				),
+				array(
+					'fields'  => array( 'sale_adjust_pct', 'clear_sale' ),
+					'mode'    => 'at_most_one',
+					'message' => 'Use sale_adjust_pct to apply a percentage-off sale or clear_sale to remove the sale, not both.',
 				),
 				array(
 					'fields'  => array( 'clear_sale', 'sale_from' ),

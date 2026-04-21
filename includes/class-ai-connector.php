@@ -128,10 +128,23 @@ class PressArk_AI_Connector {
 	/**
 	 * Resolve the chat-completions endpoint for the current provider, honoring
 	 * the simulator override when active.
+	 *
+	 * For provider='other' (custom endpoint), reads pressark_byok_api_url. The
+	 * URL is treated as a full chat-completions endpoint (e.g. a local proxy
+	 * like midsentence at http://host.docker.internal:8766/v1/chat/completions).
+	 * If the setting is empty, falls back to openrouter so the plugin keeps
+	 * working rather than erroring at call time.
 	 */
 	private static function resolve_endpoint( string $provider ): string {
 		if ( self::simulator_active() ) {
 			return self::simulator_endpoint();
+		}
+		if ( 'other' === $provider ) {
+			$custom = trim( (string) get_option( 'pressark_byok_api_url', '' ) );
+			if ( '' !== $custom ) {
+				return $custom;
+			}
+			return self::ENDPOINTS['openrouter'];
 		}
 		return self::ENDPOINTS[ $provider ] ?? self::ENDPOINTS['openrouter'];
 	}
@@ -1485,6 +1498,7 @@ Examples of parallel calls (call together):
 - "Tell me about this product's SEO" → get_product + analyze_seo together
 - "Compare two pages" → read_content(id=X) + read_content(id=Y) together
 - "How's my store doing?" → revenue_report + stock_report + customer_insights together
+- Advancing a plan mid-chain (prior step's tool_result just landed, ready for next step): update_plan(mark step N completed, step N+1 in_progress) + tool_for_step_N+1 together in ONE response. update_plan is NOT a sequential dependency — the plan_step_guard clears within the same tool_calls array. Emitting the next-step tool solo will be rejected and cost a wasted round.
 
 Examples of sequential calls (depend on each other):
 - "Find posts about X then edit the first one" → search_content first, then read_content, then edit_content
@@ -1521,7 +1535,13 @@ AGENTPROMPT;
 
 ## Elementor Rules
 
-Before editing any page, call elementor_read_page. If uses_elementor=true, use Elementor tools exclusively — NEVER use edit_content on Elementor pages (corrupts builder data).
+Classic WordPress tools are the default for ALL content work. Elementor's edit/create tools are fragile — they can drop settings, corrupt `_elementor_data`, and produce layouts that differ from the intent. Only reach for them when a page's structure is already Elementor-owned and there is no classic alternative.
+
+Creation: always use `create_post` (and `update_meta` for SEO). NEVER use `elementor_create_page` unless the user explicitly asks for Elementor (e.g. "build me an Elementor landing page", "create a page with Elementor"). A user asking for "a new page" / "a landing page" / "a blog post" with no mention of Elementor means classic create_post.
+
+Editing existing pages: read the target first with `read_content` — its `data.builder` field tells you the routing. If `builder="classic"`, stay on classic tools (`edit_content`, `update_meta`, etc.) and do NOT load or call any `elementor_*` tool. If `builder="elementor"`, you cannot use `edit_content` (it corrupts builder data) — switch to Elementor tools for that page, warn the user that Elementor writes can behave unexpectedly and offer the option to make the change in the Elementor editor directly, then call `elementor_read_page` to inspect the structure before any write.
+
+Do not call `elementor_read_page` as a preflight on every page. The `builder` field from `read_content` is the routing signal — it's there so you don't waste a round on Elementor detection for classic pages.
 
 Layout: layout_type is "flexbox_containers" (3.12+) or "sections" (legacy). Containers hold widgets directly; sections need columns.
 
@@ -1562,7 +1582,7 @@ Products: ALWAYS use edit_product — never edit_content or update_meta on produ
 When the admin is editing a product, "this product", "that product", or a product request with no other clear target refers to the current editor product ID from context. Do NOT use plain "price" for WooCommerce writes. For products, variations, and bulk WooCommerce writes, choose the explicit field that matches intent: regular_price for the base price, sale_price for a sale amount, or clear_sale=true to remove a sale.
 For product price or sale changes, call get_product first unless the latest verified product read is already in context. When the user explicitly asks to apply or start a sale, set sale_price and preserve regular_price unless they also asked to change the base price. When the user asks to increase, decrease, raise, lower, or change the current/regular price, treat that as a regular_price change or a relative regular_price adjustment. If the wording does not clearly specify sale price vs regular price, ask a brief clarification before any price write. When the user says remove/end/clear a sale, preserve regular_price and use clear_sale=true. Empty sale_price is legacy compatibility only and must not be the planned strategy. Never set a price to 0 unless the user explicitly wants a free product. After save, trust the returned/read-back pricing state (regular_price, sale_price, active price, on_sale, sale_from, sale_to) instead of assuming the submitted fields became customer-visible.
 If two price-affecting writes on the same product remain uncertain, stop retrying WooCommerce price writes for that product and explain/escalate instead of issuing a third similar write.
-Broad catalog changes should prefer bulk_edit_products with scope="all" or scope="matching" plus shared changes, instead of enumerating products one by one. For relative price changes like "add 10 USD" or "raise prices by 5%", use changes.price_delta or changes.price_adjust_pct. Bulk results include per-product product types; if variable parents are hit, do not claim their child variation prices were updated. Use bulk_edit_variations when child variation prices need changing.
+Broad catalog changes should prefer bulk_edit_products with scope="all" or scope="matching" plus shared changes, instead of enumerating products one by one. For sale discounts ("apply a 10% sale", "start a 20% sale"), use changes.sale_adjust_pct (e.g. -10 for 10% off — canonical sale-percentage primitive; stores as sale_price and preserves regular_price). For regular_price adjustments ("raise prices by 5%", "add 10 USD"), use changes.price_adjust_pct or changes.price_delta. Bulk results include per-product product types; if variable parents are hit, do not claim their child variation prices were updated. Use bulk_edit_variations when child variation prices need changing.
 
 Product-led content: when the user asks for a blog post, page, email, or CTA about a product and the product is unspecified or random, first pick a real product with get_random_content(post_type="product") or another WooCommerce read. If that result already includes the real URL plus enough product grounding to write accurately, you may draft from it directly; otherwise call get_product before drafting. Never invent product facts from brand/site profile alone.
 

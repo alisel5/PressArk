@@ -56,8 +56,10 @@ class PressArk_Tool_Preload_Planner {
 		);
 
 		$existing_mode = sanitize_key( (string) ( $planning_decision['mode'] ?? '' ) );
+		$preserve_direct_execution = in_array( 'continuation_execute_resume', $reason_codes, true )
+			|| in_array( 'approved_plan_execution', $reason_codes, true );
 		$escalated     = false;
-		if ( '' === $existing_mode || 'none' === $existing_mode ) {
+		if ( ! $preserve_direct_execution && ( '' === $existing_mode || 'none' === $existing_mode ) ) {
 			$planning_decision['mode']              = 'hard_plan';
 			$planning_decision['approval_required'] = true;
 			$escalated                              = true;

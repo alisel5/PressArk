@@ -466,12 +466,19 @@ class PressArk_Execution_Ledger {
 	 *
 	 * @return string[] Text lines ready to append to the checkpoint header.
 	 */
-	public static function build_context_lines( array $ledger ): array {
+	public static function build_context_lines( array $ledger, string $current_user_message = '' ): array {
 		$ledger = self::sanitize( $ledger );
 		$lines  = array();
 
 		if ( ! empty( $ledger['source_message'] ) ) {
-			$lines[] = 'SOURCE REQUEST: ' . self::compact_text( (string) $ledger['source_message'], 180 );
+			// Skip when the source message is literally the same text as the
+			// live user message already in msgs[] — avoids a truncated echo
+			// of a prompt the model just received in full.
+			$source_trim = trim( (string) $ledger['source_message'] );
+			$current_trim = trim( $current_user_message );
+			if ( '' === $current_trim || $source_trim !== $current_trim ) {
+				$lines[] = 'SOURCE REQUEST: ' . self::compact_text( (string) $ledger['source_message'], 180 );
+			}
 		}
 
 		if ( ! empty( $ledger['current_target']['post_id'] ) || ! empty( $ledger['current_target']['post_title'] ) ) {
@@ -502,7 +509,11 @@ class PressArk_Execution_Ledger {
 			$lines[] = 'REMAINING TASKS: ' . implode( '; ', $pending );
 		}
 		if ( ! empty( $blocked ) ) {
-			$lines[] = 'BLOCKED TASKS: ' . implode( '; ', $blocked );
+			// Internal status is `blocked` (dependency-waiting per resolve_blocked),
+			// but the external label is UPCOMING — "blocked" implies an obstacle
+			// the model should investigate, when really these tasks are just
+			// queued behind unmet deps.
+			$lines[] = 'UPCOMING TASKS: ' . implode( '; ', $blocked );
 		}
 		if ( ! empty( $uncertain ) ) {
 			$lines[] = 'UNCERTAIN TASKS: ' . implode( '; ', $uncertain ) . ' â€” verify with a read tool before reporting completion.';

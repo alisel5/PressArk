@@ -2722,6 +2722,17 @@ class PressArk_Orchestration_Service {
 
 			// Persist run state on approval boundaries.
 			$result_type = $result['type'] ?? 'final_response';
+			// PATRACE
+			pressark_trace(
+				'STREAM_RESULT_TYPE',
+				array(
+					'run_id'             => sanitize_text_field( (string) ( $ctx['run_id'] ?? '' ) ),
+					'chat_id'            => (int) ( $ctx['chat_id'] ?? 0 ),
+					'result_type'        => sanitize_key( (string) $result_type ),
+					'preview_session_id' => sanitize_text_field( (string) ( $result['preview_session_id'] ?? '' ) ),
+					'pending_actions'    => count( (array) ( $result['pending_actions'] ?? array() ) ),
+				)
+			);
 
 			if ( 'preview' === $result_type ) {
 				$pause_state = PressArk_Run_Store::build_pause_state( $result, 'preview' );
@@ -2832,6 +2843,18 @@ class PressArk_Orchestration_Service {
 						'reply'            => $result['reply'] ?? '',
 					) );
 				}
+				// PATRACE
+				pressark_trace(
+					'STREAM_DONE_EMIT',
+					array(
+						'run_id'             => sanitize_text_field( (string) ( $ctx['run_id'] ?? '' ) ),
+						'chat_id'            => (int) ( $ctx['chat_id'] ?? 0 ),
+						'result_type'        => sanitize_key( (string) ( $response_data['type'] ?? 'final_response' ) ),
+						'preview_session_id' => sanitize_text_field( (string) ( $response_data['preview_session_id'] ?? '' ) ),
+						'pending_actions'    => count( (array) ( $response_data['pending_actions'] ?? array() ) ),
+						'cancelled'          => ! empty( $response_data['cancelled'] ),
+					)
+				);
 				$emitter->emit( 'done', $response_data );
 			}
 
